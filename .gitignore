@@ -1,0 +1,16 @@
+# Database
+session.db
+*.db-shm
+*.db-wal
+
+# Binaries
+/tether
+/harness
+
+# Go
+*.exe
+*.test
+
+# IDE
+.idea/
+.vscode/
