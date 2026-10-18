@@ -1,107 +1,45 @@
-<p align="center">
-  <img src="https://raw.githubusercontent.com/crossparties/tether/main/docs/assets/banner.png" alt="Tether Banner" width="700" onerror="this.style.display='none'"/>
-</p>
-
 # ⚓ Tether
 
-<p align="center">
-  <strong>The Local-First Deterministic Substrate & Proactive Governance Engine for AI Coding Agents</strong>
-</p>
+**The Local-First Memory & Safety Substrate for AI Coding Agents**
 
-<p align="center">
-  <a href="https://github.com/crossparties/tether/releases"><img src="https://img.shields.io/github/v/release/crossparties/tether?color=brightgreen&label=version" alt="Release"></a>
-  <a href="https://golang.org"><img src="https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go" alt="Go Version"></a>
-  <a href="https://sqlite.org"><img src="https://img.shields.io/badge/Storage-Pure%20Go%20SQLite%20WAL-003B57?logo=sqlite" alt="SQLite"></a>
-  <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-JSON--RPC%202.0-blueviolet" alt="MCP"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License"></a>
-</p>
+Tether anchors AI coding agents (Antigravity CLI, Claude Code, Cursor) to your local repository. It provides persistent project memory and enforceable plan-vs-code guardrails—with **zero cloud dependency** and **zero data leaving your machine**.
 
 ---
 
-> *"A powerful kite in a storm can only soar stably if anchored to the ground. Cut the string, and it crashes."*  
-> **Tether is the deterministic anchor for probabilistic, stochastic AI agents.**
+## 💡 Why Tether?
 
-Modern AI agents (Antigravity CLI, Claude Code, Cursor, Codex) suffer from two chronic flaws:
-1. **The Amnesiac Agent**: When a session closes, context dies. Architectural decisions, rejected paths, and conventions vanish—forcing endless re-explaining or bloated context-window prompt dumps.
-2. **Reckless Mutation**: Stochastic models mutate production code before specifications are validated, or spawn rogue background subagents that hang CLI sessions and silently break repositories.
-
-**Tether** solves this at the operating system level: a lightning-fast, zero-cloud, single-binary substrate embedded directly into your workspace.
-
----
-
-## ✨ Key Features
-
-- ⚡ **Local-First & Zero-Cloud**: 100% code sovereignty. All sessions, architecture decisions, todos, and learned patterns stay in a local SQLite database (`session.db`). Zero telemetry, zero external cloud dependencies.
-- 🛡️ **Hard OS-Level Governance**: Unlike `.cursorrules` or `CLAUDE.md` which models frequently hallucinate past, Tether enforces hard process boundaries (`exit 2`) via lifecycle hooks.
-- 🧭 **Spec-Driven Planning Sandboxing**: In **Plan Mode**, file mutations to production code are strictly blocked; only documentation artifacts (`docs/`, `.agents/`) are permitted.
-- 🤝 **Subagent Worker-Orchestrator Protocol**: Background subagents are restricted to specialist research and diff proposals. Only the interactive Main Agent can request user approval, completely eliminating hung terminal prompts.
-- 🔌 **Universal Model Context Protocol (MCP)**: Built-in stdio MCP server exposing 20+ tools (`session_load`, `sql_query`, `todo_*`, `mode_set`, etc.) pre-approved for frictionless development.
-- 🪶 **Blazing Performance**: Pure Go with embedded SQLite running in WAL mode, memory temp store, 10MB cache, and fast-path schema migration (`~70ms` hook latency).
+| Without Tether | With Tether |
+| :--- | :--- |
+| **Amnesiac Sessions**: Context, architectural decisions, and bug history vanish whenever a session closes. | **Continuous Project Memory**: Tether remembers your stack, decisions, and tasks locally across restarts and agents. |
+| **Premature Code Edits**: Agents mutate production code before architectural specs are agreed upon. | **Plan vs Code Guardrails**: Lock the repository into `plan` mode. Tether safely blocks code mutations until you approve. |
+| **Cloud Memory Risks**: Third-party memory services send your proprietary codebase metadata to external servers. | **100% Local Sovereignty**: All state lives inside your project's local `.gitignore`'d SQLite database. |
+| **Permission Prompt Spam**: Agents trigger endless confirmation dialogs when trying to query project state. | **Frictionless Integration**: Pre-approved MCP and lifecycle hooks allow instant, seamless agent execution. |
 
 ---
 
-## 🏗️ Architecture
+## ⚡ Quick Start
 
-```mermaid
-flowchart TD
-    User["👨‍💻 Developer (CLI / IDE)"] --> Agent["🤖 AI Agent (Antigravity / Claude Code / Cursor)"]
-    
-    subgraph Tether Substrate ["⚓ Tether (Pure Go Engine)"]
-        HookPreInv["PreInvocation Hook\n(Context & Todo Auto-Inject)"]
-        HookPreTool["PreToolUse Hook\n(Hard Guardrail & Subagent Gating)"]
-        MCPServer["Universal MCP Server\n(Stdio Transport)"]
-        HookPostTool["PostToolUse Hook\n(Audit & File Tracking)"]
-        
-        DB[("📁 session.db\n(SQLite WAL Mode)")]
-        
-        HookPreInv --> DB
-        HookPreTool --> DB
-        MCPServer --> DB
-        HookPostTool --> DB
-    end
-    
-    Agent -->|1. Turn Start| HookPreInv
-    Agent -->|2. Tool Execution| HookPreTool
-    Agent -->|3. Query State| MCPServer
-    Agent -->|4. Post Step| HookPostTool
-```
-
----
-
-## 🚀 Quick Start
-
-### 1. Installation
-
-Install Tether using Go:
+### 1. Install Tether
 
 ```bash
 go install github.com/crossparties/tether/cmd/tether@latest
 ```
 
-Or clone and build locally:
+*(Or download the prebuilt binary from [Releases](https://github.com/crossparties/tether/releases))*
 
-```bash
-git clone https://github.com/crossparties/tether.git
-cd tether
-go build -o ~/.local/bin/tether ./cmd/tether
-```
+### 2. Initialize in Your Project
 
-### 2. Initialize in a Project
-
-Navigate to your project repository and run:
+Run inside any Git repository:
 
 ```bash
 tether init
 ```
 
-This automatically:
-- Creates `session.db` with WAL mode enabled.
-- Automatically appends `session.db` to `.gitignore`.
-- Detects your project's tech stack, package manager, and test runners.
+Tether detects your project's tech stack, initializes local storage, and updates `.gitignore`.
 
-### 3. Wire into Your AI Agent
+### 3. Connect to Your AI Agent
 
-Tether configures MCP and lifecycle hooks automatically:
+Wire Tether into your preferred coding agent:
 
 ```bash
 # For Google Antigravity CLI (agy)
@@ -109,88 +47,75 @@ tether install agy
 
 # For Anthropic Claude Code
 tether install claude
+```
 
-# Verify system health & wiring
+Verify your setup at any time:
+
+```bash
 tether doctor
 ```
 
 ---
 
-## 🕹️ CLI Usage
+## 🚀 How It Works
 
-```text
-tether — The Local-First Deterministic Substrate for AI Agents
+Once wired, Tether runs silently in the background:
 
-Usage:
-  tether init              Initialize tether in current project
-  tether status            Display real-time substrate dashboard & guardrail state
-  tether mode [code|plan]  Inspect or switch active governance mode
-  tether doctor            Verify database, WAL, hooks, and agent wiring
-  tether mcp               Start MCP server (stdio transport)
-  tether hook <event>      Handle lifecycle hook event (PreInvocation|PreToolUse|PostToolUse)
-  tether install [agent]   Wire tether into agent config (agy|claude|codex)
-  tether version           Show version
-```
+### 1. Automatic Memory Injection
+When you start a new conversation turn or ask *"Where were we?"*, Tether automatically provides your agent with active tasks, recent architectural decisions, and stack conventions—without wasting prompt tokens.
 
-### Governance Modes
+### 2. Plan Mode vs. Code Mode
+Keep your agents disciplined:
 
 ```bash
-# Switch to Plan Mode: Codebase writes blocked, only plans allowed
+# Switch to Plan Mode: Agents can write specs in docs/, but cannot mutate source code
 tether mode plan
 
 # Switch to Code Mode: Full implementation unlocked
 tether mode code
 ```
 
----
+Agents can also switch modes programmatically once an implementation plan is approved.
 
-## 🧰 Available MCP Tools
-
-When Tether is connected via MCP (`tether mcp`), agents gain access to the following deterministic tools:
-
-| Category | Tool | Description |
-| :--- | :--- | :--- |
-| **Session** | `workspace_info` | Inspect active project workspace, session ID, branch, and governance mode |
-| | `session_load` | Load active or specific session context, settings, and decisions |
-| | `session_save` | Save an updated summary of the current session |
-| | `session_done` | Mark the active session as completed |
-| **Governance** | `mode_get` | Get current governance mode (`plan`, `code`, `review`) |
-| | `mode_set` | Switch governance mode |
-| | `subagent_spawn_rules` | Retrieve mandatory worker-orchestrator guidelines |
-| **Tasks & Todos** | `todo_list` | List pending and completed tasks for current session/branch |
-| | `todo_add` | Add a new task item with description |
-| | `todo_complete` | Mark a task as completed with optimistic locking |
-| | `todo_remove` | Delete a task item |
-| **Memory & SQL** | `sql_query` | Execute read/write queries safely against `session.db` |
-| | `decision_add` | Record an architectural decision and rationale |
-| | `pattern_add` | Record a learned coding pattern (`do` or `avoid`) |
-| | `setting_set` | Persist a project-level setting or convention |
-| | `files_modified` | Retrieve audit list of files changed in current session |
-
----
-
-## 🛡️ Subagent Governance Protocol
-
-To prevent recursive loops, token drain, and terminal hangs during background delegation:
-
-1. **Worker Role**: Subagents are strictly specialist workers (researchers, static analyzers, patch generators).
-2. **No Direct Mutation**: Subagents cannot write to files or run destructive shell operations.
-3. **Interactive Main Gate**: Proposed patches are returned to the Main Agent. The Main Agent presents the proposal to the user in the interactive session for human approval.
-
----
-
-## 🧪 Testing
-
-Run the comprehensive unit test suite:
+### 3. Check Real-Time Project Status
 
 ```bash
-go test -v ./...
+tether status
 ```
 
-All core engines, hook handlers, and MCP endpoints run embedded in-memory tests with zero external dependencies.
+Displays your active session ID, governance mode, tech stack, and pending task list.
+
+---
+
+## 🛠️ CLI Commands
+
+| Command | Description |
+| :--- | :--- |
+| `tether init` | Initialize Tether in the current repository |
+| `tether status` | Display real-time substrate dashboard & active tasks |
+| `tether mode [plan\|code]` | Inspect or switch active governance mode |
+| `tether doctor` | Run environment, database, and agent wiring diagnostics |
+| `tether install [agent]` | Automatically wire Tether into agent configuration (`agy`, `claude`) |
+| `tether version` | Display current Tether version |
+
+---
+
+## 🧩 Compatibility
+
+- **Google Antigravity CLI (`agy`)**: Full support (MCP server + lifecycle hooks)
+- **Anthropic Claude Code**: Full support (MCP server + hooks)
+- **Cursor / VS Code**: MCP server integration
+- **Platform**: Linux, macOS, Windows
+
+---
+
+## 📚 Deep Dive
+
+Interested in how Tether works under the hood (WAL storage engine, lifecycle hooks, process isolation)?  
+Check out the [Architecture Specification](docs/architecture.md).
 
 ---
 
 ## 📄 License
 
-MIT © [crossparties](https://github.com/crossparties)
+MIT License © [crossparties](https://github.com/crossparties)
