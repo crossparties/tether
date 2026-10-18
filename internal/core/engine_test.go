@@ -3,6 +3,7 @@ package core
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -175,3 +176,56 @@ func TestModeGating(t *testing.T) {
 		t.Error("IsWriteAllowed() false in code mode")
 	}
 }
+
+func TestEngine_ExecuteSQL_And_Optimizations(t *testing.T) {
+	e := newTestEngine(t)
+
+	// 1. Verify PRAGMA user_version fast-path
+	var userVer int
+	if err := e.DB.QueryRow("PRAGMA user_version;").Scan(&userVer); err != nil {
+		t.Fatalf("QueryRow user_version: %v", err)
+	}
+	if userVer != SchemaVersion {
+		t.Errorf("expected user_version = %d, got %d", SchemaVersion, userVer)
+	}
+
+	// 2. Verify WAL mode and busy timeout
+	var journalMode string
+	if err := e.DB.QueryRow("PRAGMA journal_mode;").Scan(&journalMode); err != nil {
+		t.Fatalf("QueryRow journal_mode: %v", err)
+	}
+	if journalMode != "wal" {
+		t.Errorf("expected journal_mode wal, got %s", journalMode)
+	}
+
+	// 3. Test ExecuteSQL SELECT
+	res, err := e.ExecuteSQL("SELECT key, value FROM project_settings")
+	if err != nil {
+		t.Fatalf("ExecuteSQL select: %v", err)
+	}
+	rows, ok := res.([]map[string]interface{})
+	if !ok {
+		t.Fatalf("expected []map[string]interface{}, got %T", res)
+	}
+	_ = rows
+
+	// 4. Test ExecuteSQL INSERT
+	insertRes, err := e.ExecuteSQL("INSERT INTO project_settings (key, value) VALUES ('test_opt', '123')")
+	if err != nil {
+		t.Fatalf("ExecuteSQL insert: %v", err)
+	}
+	insertMap, ok := insertRes.(map[string]interface{})
+	if !ok || insertMap["rows_affected"].(int64) != 1 {
+		t.Fatalf("expected rows_affected = 1, got %+v", insertRes)
+	}
+
+	// 5. Test ExecuteSQL Safety Guard against DROP TABLE
+	_, err = e.ExecuteSQL("DROP TABLE sessions")
+	if err == nil {
+		t.Errorf("expected error when dropping core table, got nil")
+	}
+	if !strings.Contains(err.Error(), "safety guard: dropping core substrate table") {
+		t.Errorf("expected safety guard error message, got %v", err)
+	}
+}
+

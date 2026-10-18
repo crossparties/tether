@@ -79,3 +79,42 @@ func TestMCPServer_Lifecycle(t *testing.T) {
 		t.Errorf("expected final engine mode code, got %s", e.GetMode())
 	}
 }
+
+func TestMCPServer_SQLQuery(t *testing.T) {
+	e := newTestEngine(t)
+	server := NewServer(e)
+
+	// 1. Insert a decision via engine
+	_ = e.AddDecision("auth", "use jwt", "stateless")
+
+	// 2. Call sql_query tool via MCP
+	callReq := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sql_query","arguments":{"query":"SELECT topic, decision FROM decisions WHERE topic = 'auth'"}}}`
+	inputBuf := bytes.NewBufferString(callReq + "\n")
+	outputBuf := &bytes.Buffer{}
+
+	err := server.ServeIO(inputBuf, outputBuf)
+	if err != nil {
+		t.Fatalf("ServeIO: %v", err)
+	}
+
+	var resp Response
+	if err := json.Unmarshal(outputBuf.Bytes(), &resp); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("RPC error: %s", resp.Error.Message)
+	}
+
+	toolResult, ok := resp.Result.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected ToolResult map, got %T", resp.Result)
+	}
+	content := toolResult["content"].([]interface{})
+	firstBlock := content[0].(map[string]interface{})
+	text := firstBlock["text"].(string)
+
+	if !strings.Contains(text, "use jwt") {
+		t.Errorf("expected sql result to contain 'use jwt', got: %s", text)
+	}
+}
+

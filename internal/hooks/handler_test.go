@@ -205,3 +205,151 @@ func TestPreInvocation_AntiPipeGuard(t *testing.T) {
 		}
 	}
 }
+
+func TestPreToolUse_AntigravityPayloadAndAutoApprove(t *testing.T) {
+	e := newTestEngine(t)
+	h := NewHandler(e)
+
+	// 1. In code mode, call_mcp_tool, invoke_subagent, and run_command must be allowed
+	payloads := []string{
+		`{"toolCall":{"name":"call_mcp_tool","args":{"ServerName":"tether","ToolName":"session_load"}}}`,
+		`{"toolCall":{"name":"call_mcp_tool","args":{"ServerName":"tether","ToolName":"sql_query","Arguments":{"query":"SELECT 1"}}}}`,
+		`{"toolCall":{"name":"invoke_subagent","args":{"Subagents":[{"TypeName":"tether_architect","Role":"Architect","Prompt":"Build feature"}]}}}`,
+		`{"toolCall":{"name":"run_command","args":{"CommandLine":"go test ./... 2>&1"}}}`,
+		`{"toolCall":{"name":"replace_file_content","args":{"TargetFile":"main.go","ReplacementContent":"package main"}}}`,
+	}
+
+	for _, p := range payloads {
+		outStr, err := h.Handle("PreToolUse", strings.NewReader(p))
+		if err != nil {
+			t.Fatalf("Handle: %v", err)
+		}
+		var out HookOutput
+		_ = json.Unmarshal([]byte(outStr), &out)
+		if out.Decision != "allow" {
+			t.Errorf("expected payload %s to be allowed, got %s (reason: %s)", p, out.Decision, out.Reason)
+		}
+	}
+
+	// 2. In plan mode, toolCall with TargetFile in code directory must be denied
+	_ = e.SetMode("plan")
+	planWrite := `{"toolCall":{"name":"replace_file_content","args":{"TargetFile":"/repo/internal/core/engine.go"}}}`
+	outStr, err := h.Handle("PreToolUse", strings.NewReader(planWrite))
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	var out HookOutput
+	_ = json.Unmarshal([]byte(outStr), &out)
+	if out.Decision != "deny" {
+		t.Errorf("expected plan mode write to be denied, got %s", out.Decision)
+	}
+
+	// 3. In plan mode, toolCall with docs/ or .agents/ must be allowed
+	planDoc := `{"toolCall":{"name":"write_to_file","args":{"TargetFile":"/repo/docs/spec.md"}}}`
+	outStr, err = h.Handle("PreToolUse", strings.NewReader(planDoc))
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	_ = json.Unmarshal([]byte(outStr), &out)
+	if out.Decision != "allow" {
+		t.Errorf("expected plan mode docs write to be allowed, got %s", out.Decision)
+	}
+
+	// 4. Catastrophic commands must be denied even in code mode
+	_ = e.SetMode("code")
+	catastrophic := `{"toolCall":{"name":"run_command","args":{"CommandLine":"rm -rf / --no-preserve-root"}}}`
+	outStr, err = h.Handle("PreToolUse", strings.NewReader(catastrophic))
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	_ = json.Unmarshal([]byte(outStr), &out)
+	if out.Decision != "deny" {
+		t.Errorf("expected catastrophic command to be denied, got %s", out.Decision)
+	}
+}
+
+func TestPreToolUse_SubagentGovernanceProtocol(t *testing.T) {
+	e := newTestEngine(t)
+	h := NewHandler(e)
+
+	// 1. Establish main conversation ID via PreInvocation
+	mainPreInv := `{"conversationId":"conv-main-001","prompt":"let's build"}`
+	_, err := h.Handle("PreInvocation", strings.NewReader(mainPreInv))
+	if err != nil {
+		t.Fatalf("PreInvocation: %v", err)
+	}
+
+	// 2. Main agent in code mode is authorized for edits
+	mainEdit := `{"conversationId":"conv-main-001","toolCall":{"name":"replace_file_content","args":{"TargetFile":"main.go"}}}`
+	outStr, err := h.Handle("PreToolUse", strings.NewReader(mainEdit))
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	var out HookOutput
+	_ = json.Unmarshal([]byte(outStr), &out)
+	if out.Decision != "allow" {
+		t.Errorf("expected main agent edit to be allowed, got: %s", out.Decision)
+	}
+
+	// 3. Subagent attempting file writes must be DENIED (orchestrator approval required)
+	subagentWrites := []string{
+		`{"conversationId":"conv-subagent-999","toolCall":{"name":"write_to_file","args":{"TargetFile":"secret.go"}}}`,
+		`{"conversationId":"conv-subagent-999","toolCall":{"name":"replace_file_content","args":{"TargetFile":"cmd/main.go"}}}`,
+		`{"agent_type":"tether_architect","toolCall":{"name":"write_file","args":{"TargetFile":"util.go"}}}`,
+		`{"is_subagent":true,"toolCall":{"name":"multi_replace_file_content","args":{"TargetFile":"handler.go"}}}`,
+	}
+
+	for _, sw := range subagentWrites {
+		outStr, err := h.Handle("PreToolUse", strings.NewReader(sw))
+		if err != nil {
+			t.Fatalf("Handle: %v", err)
+		}
+		_ = json.Unmarshal([]byte(outStr), &out)
+		if out.Decision != "deny" {
+			t.Errorf("expected subagent write to be denied, got: %s (payload: %s)", out.Decision, sw)
+		}
+		if !strings.Contains(out.Reason, "Subagents cannot mutate codebase directly") {
+			t.Errorf("expected reason to mention subagents cannot mutate directly, got: %s", out.Reason)
+		}
+	}
+
+	// 4. Subagent attempting mutative shell commands must be DENIED
+	subagentShellMutations := []string{
+		`{"conversationId":"conv-subagent-999","toolCall":{"name":"run_command","args":{"CommandLine":"rm -rf internal/core"}}}`,
+		`{"conversationId":"conv-subagent-999","toolCall":{"name":"run_command","args":{"CommandLine":"mkdir -p internal/newpkg"}}}`,
+		`{"agent_type":"tether_qa","toolCall":{"name":"run_command","args":{"CommandLine":"cat > main.go << 'EOF'\npackage main\nEOF"}}}`,
+	}
+
+	for _, sm := range subagentShellMutations {
+		outStr, err := h.Handle("PreToolUse", strings.NewReader(sm))
+		if err != nil {
+			t.Fatalf("Handle: %v", err)
+		}
+		_ = json.Unmarshal([]byte(outStr), &out)
+		if out.Decision != "deny" {
+			t.Errorf("expected subagent shell mutation to be denied, got: %s (payload: %s)", out.Decision, sm)
+		}
+	}
+
+	// 5. Subagent reading files and querying MCP must be ALLOWED
+	subagentSafeActions := []string{
+		`{"conversationId":"conv-subagent-999","toolCall":{"name":"view_file","args":{"AbsolutePath":"/repo/main.go"}}}`,
+		`{"conversationId":"conv-subagent-999","toolCall":{"name":"read_file","args":{"FilePath":"/repo/main.go"}}}`,
+		`{"conversationId":"conv-subagent-999","toolCall":{"name":"call_mcp_tool","args":{"ServerName":"tether","ToolName":"sql_query","Arguments":{"query":"SELECT * FROM sessions"}}}}`,
+		`{"conversationId":"conv-subagent-999","toolCall":{"name":"call_mcp_tool","args":{"ServerName":"tether","ToolName":"session_load"}}}`,
+		`{"conversationId":"conv-subagent-999","toolCall":{"name":"send_message","args":{"Recipient":"main","Message":"Proposed changes"}}}`,
+	}
+
+	for _, sa := range subagentSafeActions {
+		outStr, err := h.Handle("PreToolUse", strings.NewReader(sa))
+		if err != nil {
+			t.Fatalf("Handle: %v", err)
+		}
+		_ = json.Unmarshal([]byte(outStr), &out)
+		if out.Decision != "allow" {
+			t.Errorf("expected subagent safe action to be allowed, got: %s (payload: %s)", out.Decision, sa)
+		}
+	}
+}
+
+

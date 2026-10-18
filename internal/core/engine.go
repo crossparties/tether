@@ -40,16 +40,46 @@ func DetectGitBranch(workspace string) string {
 	return "default"
 }
 
-// NewEngine creates a new engine for the given workspace
+// SchemaVersion tracks the database schema version for fast-path startup
+const SchemaVersion = 2
+
+// NewEngine creates a new engine for the given workspace with optimized SQLite connection
 func NewEngine(workspace string) (*Engine, error) {
 	dbPath := filepath.Join(workspace, "session.db")
+	dbExisted := false
+	if fi, err := os.Stat(dbPath); err == nil && fi.Size() > 0 {
+		dbExisted = true
+	}
+
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("open session.db: %w", err)
 	}
 
-	// Hardening: WAL mode & busy timeout for concurrent multi-agent safety
-	_, _ = db.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+	// 1. Connection Pooling: single connection avoids SQLite lock contention
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	// 2. High-Performance PRAGMAs:
+	// - WAL mode: concurrent readers + writer
+	// - synchronous=NORMAL: reduces disk fsync by ~95% in WAL mode, 100% crash-safe
+	// - busy_timeout=5000: wait up to 5s if locked by another process
+	// - cache_size=-10000: 10MB page cache in RAM
+	// - temp_store=MEMORY: temp tables/indices in RAM
+	// - mmap_size=67108864: 64MB memory-mapped I/O
+	// - wal_autocheckpoint=1000: keep WAL file compact
+	pragmas := `
+		PRAGMA journal_mode=WAL;
+		PRAGMA synchronous=NORMAL;
+		PRAGMA busy_timeout=5000;
+		PRAGMA cache_size=-10000;
+		PRAGMA temp_store=MEMORY;
+		PRAGMA mmap_size=67108864;
+		PRAGMA wal_autocheckpoint=1000;
+	`
+	if _, err := db.Exec(pragmas); err != nil {
+		_, _ = db.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+	}
 
 	branch := DetectGitBranch(workspace)
 	e := &Engine{
@@ -64,9 +94,10 @@ func NewEngine(workspace string) (*Engine, error) {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 
-	if err := e.ensureGitignore(); err != nil {
-		// non-fatal, just log
-		fmt.Fprintf(os.Stderr, "warning: could not update .gitignore: %v\n", err)
+	if !dbExisted {
+		if err := e.ensureGitignore(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not update .gitignore: %v\n", err)
+		}
 	}
 
 	// Load or create active session
@@ -85,8 +116,14 @@ func (e *Engine) Close() error {
 	return nil
 }
 
-// migrate creates all required tables
+// migrate creates all required tables (fast-paths if schema is already up-to-date)
 func (e *Engine) migrate() error {
+	var currentVersion int
+	_ = e.DB.QueryRow("PRAGMA user_version;").Scan(&currentVersion)
+	if currentVersion >= SchemaVersion {
+		return nil // fast path: schema is up to date, skip DDL overhead
+	}
+
 	schema := `
 	CREATE TABLE IF NOT EXISTS sessions (
 		id TEXT PRIMARY KEY,
@@ -184,6 +221,9 @@ func (e *Engine) migrate() error {
 	_, _ = e.DB.Exec("ALTER TABLE todos ADD COLUMN git_branch TEXT DEFAULT 'default';")
 	_, _ = e.DB.Exec("ALTER TABLE todos ADD COLUMN version INTEGER DEFAULT 1;")
 
+	// Record schema version to fast-path all subsequent runs
+	_, _ = e.DB.Exec(fmt.Sprintf("PRAGMA user_version = %d;", SchemaVersion))
+
 	return nil
 }
 
@@ -218,13 +258,6 @@ func (e *Engine) ensureGitignore() error {
 
 // loadOrCreateSession loads the last active session for this branch or creates a new one
 func (e *Engine) loadOrCreateSession() error {
-	// Archive old sessions (>7 days without activity)
-	_, _ = e.DB.Exec(`
-		UPDATE sessions SET status = 'archived'
-		WHERE status = 'active'
-		AND updated_at < datetime('now', '-7 days')
-	`)
-
 	// Try to load active session for current branch
 	var id, mode string
 	err := e.DB.QueryRow(`
@@ -243,7 +276,13 @@ func (e *Engine) loadOrCreateSession() error {
 	}
 
 	if err == sql.ErrNoRows {
-		// Create new session
+		// Create new session: archive old sessions (>7 days without activity)
+		_, _ = e.DB.Exec(`
+			UPDATE sessions SET status = 'archived'
+			WHERE status = 'active'
+			AND updated_at < datetime('now', '-7 days')
+		`)
+
 		id = uuid.New().String()
 		mode = "code"
 		_, err = e.DB.Exec(`INSERT INTO sessions (id, status, mode, git_branch) VALUES (?, 'active', 'code', ?)`, id, e.Branch)
@@ -666,3 +705,71 @@ type Todo struct {
 	CreatedAt   time.Time
 	CompletedAt string
 }
+
+// ExecuteSQL executes a SQL query directly against session.db and returns JSON-friendly results.
+// SELECT, PRAGMA, EXPLAIN return []map[string]interface{}.
+// DML/DDL (INSERT, UPDATE, DELETE, etc.) return map[string]interface{} with rows_affected and last_insert_id.
+func (e *Engine) ExecuteSQL(query string) (interface{}, error) {
+	trimmed := strings.TrimSpace(query)
+	upper := strings.ToUpper(trimmed)
+
+	// Safety guard: prevent accidental deletion of core substrate tables
+	if strings.Contains(upper, "DROP TABLE") {
+		for _, tbl := range []string{"SESSIONS", "PROJECT_SETTINGS", "DECISIONS", "LEARNED_PATTERNS"} {
+			if strings.Contains(upper, tbl) {
+				return nil, fmt.Errorf("safety guard: dropping core substrate table '%s' is prohibited", tbl)
+			}
+		}
+	}
+
+	if strings.HasPrefix(upper, "SELECT") || strings.HasPrefix(upper, "PRAGMA") || strings.HasPrefix(upper, "EXPLAIN") {
+		rows, err := e.DB.Query(query)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+
+		cols, err := rows.Columns()
+		if err != nil {
+			return nil, err
+		}
+
+		var results []map[string]interface{}
+		for rows.Next() {
+			vals := make([]interface{}, len(cols))
+			ptrs := make([]interface{}, len(cols))
+			for i := range vals {
+				ptrs[i] = &vals[i]
+			}
+			if err := rows.Scan(ptrs...); err != nil {
+				return nil, err
+			}
+			rowMap := make(map[string]interface{}, len(cols))
+			for i, col := range cols {
+				val := vals[i]
+				if b, ok := val.([]byte); ok {
+					rowMap[col] = string(b)
+				} else {
+					rowMap[col] = val
+				}
+			}
+			results = append(results, rowMap)
+		}
+		if results == nil {
+			results = []map[string]interface{}{}
+		}
+		return results, nil
+	}
+
+	res, err := e.DB.Exec(query)
+	if err != nil {
+		return nil, err
+	}
+	rowsAffected, _ := res.RowsAffected()
+	lastID, _ := res.LastInsertId()
+	return map[string]interface{}{
+		"rows_affected":  rowsAffected,
+		"last_insert_id": lastID,
+	}, nil
+}
+

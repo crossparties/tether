@@ -128,19 +128,34 @@ func cmdHook() {
 
 	// Hard OS Exit Code 2 enforcement for tool denial
 	if strings.Contains(result, `"decision":"deny"`) {
-		fmt.Fprintf(os.Stderr, "\n┌────────────────────────────── TETHER GUARD ──────────────────────────────┐\n")
-		fmt.Fprintf(os.Stderr, "│ 🛑 ACTION BLOCKED: Repository is locked in [PLAN MODE]                   │\n")
-		fmt.Fprintf(os.Stderr, "├──────────────────────────────────────────────────────────────────────────┤\n")
-		fmt.Fprintf(os.Stderr, "│ Guardrail prevents code mutation before architectural plan approval.     │\n")
-		fmt.Fprintf(os.Stderr, "├──────────────────────────────────────────────────────────────────────────┤\n")
-		fmt.Fprintf(os.Stderr, "│ 💡 ALLOWED ACTIONS:                                                      │\n")
-		fmt.Fprintf(os.Stderr, "│   1. Write plans/specifications in `docs/` or `.agents/`                 │\n")
-		fmt.Fprintf(os.Stderr, "│   2. Present implementation inline in chat response                      │\n")
-		fmt.Fprintf(os.Stderr, "│                                                                          │\n")
-		fmt.Fprintf(os.Stderr, "│ 🔓 TO UNLOCK CODE MUTATION:                                              │\n")
-		fmt.Fprintf(os.Stderr, "│   • Developer CLI: $ tether mode code                                    │\n")
-		fmt.Fprintf(os.Stderr, "│   • Agent MCP:     Call MCP tool `mode_set(mode=\"code\")`                 │\n")
-		fmt.Fprintf(os.Stderr, "└──────────────────────────────────────────────────────────────────────────┘\n\n")
+		if strings.Contains(result, "Subagents cannot mutate") || strings.Contains(result, "Subagent shell mutation") {
+			fmt.Fprintf(os.Stderr, "\n┌────────────────────────────── TETHER GUARD ──────────────────────────────┐\n")
+			fmt.Fprintf(os.Stderr, "│ 🛑 SUBAGENT ACTION BLOCKED: Direct Codebase Mutation Restricted          │\n")
+			fmt.Fprintf(os.Stderr, "├──────────────────────────────────────────────────────────────────────────┤\n")
+			fmt.Fprintf(os.Stderr, "│ Subagents must propose diffs/commands to Main Agent for user approval.   │\n")
+			fmt.Fprintf(os.Stderr, "└──────────────────────────────────────────────────────────────────────────┘\n\n")
+		} else if strings.Contains(result, "session.db") {
+			fmt.Fprintf(os.Stderr, "\n┌────────────────────────────── TETHER GUARD ──────────────────────────────┐\n")
+			fmt.Fprintf(os.Stderr, "│ 🛑 BASH ACCESS BLOCKED: Use Tether MCP for session.db                    │\n")
+			fmt.Fprintf(os.Stderr, "├──────────────────────────────────────────────────────────────────────────┤\n")
+			fmt.Fprintf(os.Stderr, "│ Direct sqlite3/python shell calls trigger manual permission prompts.     │\n")
+			fmt.Fprintf(os.Stderr, "│ Use Tether MCP tools (session_load, sql_query, todo_list) instead.      │\n")
+			fmt.Fprintf(os.Stderr, "└──────────────────────────────────────────────────────────────────────────┘\n\n")
+		} else {
+			fmt.Fprintf(os.Stderr, "\n┌────────────────────────────── TETHER GUARD ──────────────────────────────┐\n")
+			fmt.Fprintf(os.Stderr, "│ 🛑 ACTION BLOCKED: Repository is locked in [PLAN MODE]                   │\n")
+			fmt.Fprintf(os.Stderr, "├──────────────────────────────────────────────────────────────────────────┤\n")
+			fmt.Fprintf(os.Stderr, "│ Guardrail prevents code mutation before architectural plan approval.     │\n")
+			fmt.Fprintf(os.Stderr, "├──────────────────────────────────────────────────────────────────────────┤\n")
+			fmt.Fprintf(os.Stderr, "│ 💡 ALLOWED ACTIONS:                                                      │\n")
+			fmt.Fprintf(os.Stderr, "│   1. Write plans/specifications in `docs/` or `.agents/`                 │\n")
+			fmt.Fprintf(os.Stderr, "│   2. Present implementation inline in chat response                      │\n")
+			fmt.Fprintf(os.Stderr, "│                                                                          │\n")
+			fmt.Fprintf(os.Stderr, "│ 🔓 TO UNLOCK CODE MUTATION:                                              │\n")
+			fmt.Fprintf(os.Stderr, "│   • Developer CLI: $ tether mode code                                    │\n")
+			fmt.Fprintf(os.Stderr, "│   • Agent MCP:     Call MCP tool `mode_set(mode=\"code\")`                 │\n")
+			fmt.Fprintf(os.Stderr, "└──────────────────────────────────────────────────────────────────────────┘\n\n")
+		}
 		os.Exit(2)
 	}
 }

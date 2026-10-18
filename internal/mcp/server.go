@@ -384,6 +384,17 @@ func (s *Server) handleToolsList(req *Request) *Response {
 			Description: "Get mandatory rules for spawning subagents with write access. Call this before invoking any subagent that will create or modify files.",
 			InputSchema: InputSchema{Type: "object"},
 		},
+		{
+			Name:        "sql_query",
+			Description: "Directly execute SQL query against session.db (full access to sessions, session_context, project_settings, decisions, learned_patterns, todos, kb_documents). Returns results as JSON.",
+			InputSchema: InputSchema{
+				Type: "object",
+				Properties: map[string]Property{
+					"query": {Type: "string", Description: "SQL query to execute (e.g. 'SELECT * FROM sessions', 'SELECT * FROM decisions')"},
+				},
+				Required: []string{"query"},
+			},
+		},
 	}
 
 	return &Response{
@@ -445,6 +456,8 @@ func (s *Server) handleToolsCall(req *Request) *Response {
 		result = s.toolFilesModified()
 	case "subagent_spawn_rules":
 		result = s.toolSubagentSpawnRules()
+	case "sql_query":
+		result, isError = s.toolSQLQuery(params.Arguments)
 	default:
 		result = fmt.Sprintf("unknown tool: %s", params.Name)
 		isError = true
@@ -774,40 +787,52 @@ func (s *Server) toolFilesModified() string {
 	return string(out)
 }
 
-// toolSubagentSpawnRules returns mandatory rules for spawning write-capable subagents
+// toolSubagentSpawnRules returns mandatory rules for subagents and orchestrator approval protocol
 func (s *Server) toolSubagentSpawnRules() string {
-	return `## Mandatory Subagent Write Rules
+	return `## Subagent Governance & Approval Protocol
 
-PROBLEM: Subagents spawned with TypeName "self" have no system prompt guaranteeing
-non-interactive terminal use. When they call mkdir or create files without the right
-flags they can block on a terminal prompt → waiting_for_input → stuck forever.
+### Architecture: Orchestrator-Worker Model
+1. Subagents are SPECIALIST WORKERS (analysis, research, code review, diff drafting).
+2. Subagents CANNOT mutate the codebase or execute mutative shell commands directly.
+3. Subagents MUST send their proposed changes/diffs/commands via message back to the Main Agent.
+4. The Main Agent (Orchestrator) presents the proposal to the user in the main chat session for approval.
+5. Only after explicit user approval does the Main Agent execute the approved changes.
 
-### Rules (embed these in every write-capable subagent Prompt):
-
-1. NEVER use write_to_file for project files.
-   write_to_file only writes to the artifact dir (~/.gemini/brain/...), not the project.
-
-2. NEVER use TypeName "self" for tasks that create or modify project files.
-   Use a named subagent type (tether_architect, tether_qa, tether_frontend) that has
-   these rules baked into its system prompt.
-
-3. For NEW files: run_command with heredoc, WaitMsBeforeAsync >= 5000:
-   cat > /absolute/path/to/file.go << 'EOF'
-   ...file content...
-   EOF
-
-4. For MODIFYING existing files: replace_file_content tool.
-
-5. For directories: run_command "mkdir -p /path", WaitMsBeforeAsync >= 3000.
-
-6. All run_command calls MUST be non-interactive.
-   Set WaitMsBeforeAsync to at least the expected completion time (min 5000ms for file writes).
-
-7. After ALL file changes: run go build ./... 2>&1 and fix errors before reporting done.
+### Rules for Subagent Prompts:
+1. NO DIRECT MUTATION PERMISSION: Do NOT attempt write_to_file, replace_file_content, or shell mutators. Tether Guard will strictly deny direct mutations.
+2. READ & ANALYZE: Use read_file, view_file, grep, search_files, kb_search freely.
+3. PROPOSE ONLY: Compose all proposed code modifications as markdown diff blocks or shell command scripts.
+4. RETURN VIA MESSAGE: Return the proposal clearly formatted in the final message to the Main Agent.
+5. DO NOT LOOP ON DENIAL: If any mutation is denied, immediately return your findings and proposed diff/command via message to the Main Agent.
 
 ### Named subagent types available:
-- tether_architect: Go backend code, heredoc writes, build verify
-- tether_qa: Test writing, go test runner
-- tether_frontend: Frontend writes
+- tether_architect: Architecture design and diff composition
+- tether_qa: Test planning and verification script design
+- tether_frontend: Frontend component design and styling diffs
 - tether_product: Product specification and planning`
 }
+
+
+func (s *Server) toolSQLQuery(args json.RawMessage) (string, bool) {
+	var params struct {
+		Query string `json:"query"`
+	}
+	if err := json.Unmarshal(args, &params); err != nil {
+		return "invalid params", true
+	}
+	if strings.TrimSpace(params.Query) == "" {
+		return "query cannot be empty", true
+	}
+
+	res, err := s.engine.ExecuteSQL(params.Query)
+	if err != nil {
+		return fmt.Sprintf("sql error: %v", err), true
+	}
+
+	out, err := json.MarshalIndent(res, "", "  ")
+	if err != nil {
+		return fmt.Sprintf("marshal error: %v", err), true
+	}
+	return string(out), false
+}
+
