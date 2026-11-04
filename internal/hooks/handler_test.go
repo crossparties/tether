@@ -353,3 +353,202 @@ func TestPreToolUse_SubagentGovernanceProtocol(t *testing.T) {
 }
 
 
+
+// A subagent must never be able to claim the main conversation identity.
+func TestPreInvocation_SubagentCannotHijackMainConversation(t *testing.T) {
+	e := newTestEngine(t)
+	h := NewHandler(e)
+
+	// The real Main Agent registers itself first.
+	if _, err := h.Handle("PreInvocation", strings.NewReader(`{"conversationId":"main-123"}`)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if got, _ := e.GetProjectSetting("main_conversation_id"); got != "main-123" {
+		t.Fatalf("main_conversation_id = %q, want main-123", got)
+	}
+
+	// A subagent run must be ignored.
+	if _, err := h.Handle("PreInvocation", strings.NewReader(`{"conversationId":"sub-999","is_subagent":true}`)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if got, _ := e.GetProjectSetting("main_conversation_id"); got != "main-123" {
+		t.Fatalf("subagent hijacked main_conversation_id: got %q, want main-123", got)
+	}
+}
+
+// The Main Agent must be blocked from writing while a subagent proposal awaits
+// user approval, and unblocked only after approve_proposal runs.
+func TestPreToolUse_ProposalApprovalGate(t *testing.T) {
+	e := newTestEngine(t)
+	h := NewHandler(e)
+
+	_ = e.SetMode("code")
+	if _, err := h.Handle("PreInvocation", strings.NewReader(`{"conversationId":"main-1"}`)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	writeCall := `{"tool_name":"write_file","tool_call":{"name":"write_file","args":{"path":"internal/x.go","content":"package x"}}}`
+
+	// Without a pending proposal the write is allowed.
+	outStr, err := h.Handle("PreToolUse", strings.NewReader(writeCall))
+	if err != nil {
+		t.Fatalf("Handle PreToolUse: %v", err)
+	}
+	if !strings.Contains(outStr, `"allow"`) {
+		t.Fatalf("expected allow with no pending proposal, got %s", outStr)
+	}
+
+	// Once a subagent proposal is recorded, the write is denied.
+	id, err := e.RecordProposal("tether_qa", "propose adapter tests")
+	if err != nil {
+		t.Fatalf("RecordProposal: %v", err)
+	}
+	outStr, err = h.Handle("PreToolUse", strings.NewReader(writeCall))
+	if err != nil {
+		t.Fatalf("Handle PreToolUse: %v", err)
+	}
+	if !strings.Contains(outStr, `"deny"`) {
+		t.Fatalf("expected deny while proposal #%d pending, got %s", id, outStr)
+	}
+	if !strings.Contains(outStr, "awaiting user approval") {
+		t.Fatalf("deny reason should mention approval, got %s", outStr)
+	}
+
+	// Mutative shell commands are gated too.
+	cmdCall := `{"tool_name":"run_command","command":"rm -rf build","tool_call":{"name":"run_command","args":{"command":"rm -rf build"}}}`
+	outStr, err = h.Handle("PreToolUse", strings.NewReader(cmdCall))
+	if err != nil {
+		t.Fatalf("Handle PreToolUse: %v", err)
+	}
+	if !strings.Contains(outStr, `"deny"`) {
+		t.Fatalf("expected deny for mutative command while proposal pending, got %s", outStr)
+	}
+
+	// Read tools are never gated.
+	readCall := `{"tool_name":"read_file","tool_call":{"name":"read_file","args":{"path":"internal/x.go"}}}`
+	outStr, err = h.Handle("PreToolUse", strings.NewReader(readCall))
+	if err != nil {
+		t.Fatalf("Handle PreToolUse: %v", err)
+	}
+	if !strings.Contains(outStr, `"allow"`) {
+		t.Fatalf("expected read_file to stay allowed, got %s", outStr)
+	}
+
+	// After approval the write is allowed again.
+	if _, err := e.ApproveProposal(); err != nil {
+		t.Fatalf("ApproveProposal: %v", err)
+	}
+	outStr, err = h.Handle("PreToolUse", strings.NewReader(writeCall))
+	if err != nil {
+		t.Fatalf("Handle PreToolUse: %v", err)
+	}
+	if !strings.Contains(outStr, `"allow"`) {
+		t.Fatalf("expected allow after approval, got %s", outStr)
+	}
+}
+
+// The proposal gate must close every door that mutates the substrate, not just
+// file writes — otherwise a gated agent simply writes sideways.
+func TestPreToolUse_ProposalGateCoversAllMutations(t *testing.T) {
+	e := newTestEngine(t)
+	h := NewHandler(e)
+	_ = e.SetMode("code")
+	if _, err := h.Handle("PreInvocation", strings.NewReader(`{"conversationId":"main-1"}`)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if _, err := e.RecordProposal("tether_qa", "pending work"); err != nil {
+		t.Fatalf("RecordProposal: %v", err)
+	}
+
+	denied := []struct {
+		name string
+		body string
+	}{
+		{"write_file", `{"tool_name":"write_file","tool_call":{"name":"write_file","args":{"path":"a.go","content":"x"}}}`},
+		{"edit_file", `{"tool_name":"edit_file","tool_call":{"name":"edit_file","args":{"path":"a.go"}}}`},
+		{"session_save", `{"tool_name":"session_save","tool_call":{"name":"session_save","args":{"role":"user","content":"x"}}}`},
+		{"setting_set", `{"tool_name":"setting_set","tool_call":{"name":"setting_set","args":{"key":"k","value":"v"}}}`},
+		{"decision_add", `{"tool_name":"decision_add","tool_call":{"name":"decision_add","args":{"topic":"t"}}}`},
+		{"pattern_add", `{"tool_name":"pattern_add","tool_call":{"name":"pattern_add","args":{"type":"do"}}}`},
+		{"todo_add", `{"tool_name":"todo_add","tool_call":{"name":"todo_add","args":{"description":"x"}}}`},
+		{"sql_query insert", `{"tool_name":"sql_query","tool_call":{"name":"sql_query","args":{"query":"INSERT INTO todos (description) VALUES ('x')"}}}`},
+		{"sql_query update", `{"tool_name":"sql_query","tool_call":{"name":"sql_query","args":{"query":"update sessions set mode='plan'"}}}`},
+		{"sql_query delete", `{"tool_name":"sql_query","tool_call":{"name":"sql_query","args":{"query":"DELETE FROM todos"}}}`},
+		{"cmd tee", `{"tool_name":"run_command","command":"echo hi | tee out.txt","tool_call":{"name":"run_command","args":{"command":"echo hi | tee out.txt"}}}`},
+		{"cmd mkdir", `{"tool_name":"run_command","command":"mkdir newdir","tool_call":{"name":"run_command","args":{"command":"mkdir newdir"}}}`},
+		{"cmd cp", `{"tool_name":"run_command","command":"cp a b","tool_call":{"name":"run_command","args":{"command":"cp a b"}}}`},
+		{"cmd go generate", `{"tool_name":"run_command","command":"go generate ./...","tool_call":{"name":"run_command","args":{"command":"go generate ./..."}}}`},
+	}
+	for _, tc := range denied {
+		out, err := h.Handle("PreToolUse", strings.NewReader(tc.body))
+		if err != nil {
+			t.Fatalf("%s: Handle: %v", tc.name, err)
+		}
+		if !strings.Contains(out, `"deny"`) {
+			t.Errorf("%s should be denied while a proposal is pending, got %s", tc.name, out)
+		}
+	}
+
+	// Read-only work must keep flowing.
+	allowed := []struct {
+		name string
+		body string
+	}{
+		{"read_file", `{"tool_name":"read_file","tool_call":{"name":"read_file","args":{"path":"a.go"}}}`},
+		{"sql_query select", `{"tool_name":"sql_query","tool_call":{"name":"sql_query","args":{"query":"SELECT * FROM todos"}}}`},
+		{"session_load", `{"tool_name":"session_load","tool_call":{"name":"session_load","args":{}}}`},
+		{"todo_list", `{"tool_name":"todo_list","tool_call":{"name":"todo_list","args":{}}}`},
+	}
+	for _, tc := range allowed {
+		out, err := h.Handle("PreToolUse", strings.NewReader(tc.body))
+		if err != nil {
+			t.Fatalf("%s: Handle: %v", tc.name, err)
+		}
+		if !strings.Contains(out, `"allow"`) {
+			t.Errorf("%s should stay allowed, got %s", tc.name, out)
+		}
+	}
+}
+
+// The gate must read the command from a snake_case tool_call payload. When
+// Normalized() only looked at the camelCase field, command was always empty and
+// every command-based rule silently passed.
+func TestGateReadsSnakeCaseToolCall(t *testing.T) {
+	e := newTestEngine(t)
+	h := NewHandler(e)
+	_ = e.SetMode("code")
+	if _, err := h.Handle("PreInvocation", strings.NewReader(`{"conversationId":"main-1"}`)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if _, err := e.RecordProposal("tether_qa", "pending work"); err != nil {
+		t.Fatalf("RecordProposal: %v", err)
+	}
+
+	// Sanity: the payload really is snake_case.
+	var in HookInput
+	if err := json.Unmarshal([]byte(`{"tool_name":"run_command","tool_call":{"name":"run_command","args":{"command":"echo x | tee f.txt"}}}`), &in); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, cmd, _ := in.Normalized(); cmd == "" {
+		t.Fatal("Normalized() lost the command from a tool_call payload")
+	}
+
+	out, err := h.Handle("PreToolUse", strings.NewReader(
+		`{"tool_name":"run_command","tool_call":{"name":"run_command","args":{"command":"echo x | tee f.txt"}}}`))
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if !strings.Contains(out, `"deny"`) {
+		t.Fatalf("tee should be denied while a proposal is pending, got %s", out)
+	}
+
+	// Read-only commands stay allowed.
+	out, err = h.Handle("PreToolUse", strings.NewReader(
+		`{"tool_name":"run_command","tool_call":{"name":"run_command","args":{"command":"ls -la"}}}`))
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if !strings.Contains(out, `"allow"`) {
+		t.Fatalf("ls should stay allowed, got %s", out)
+	}
+}

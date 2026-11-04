@@ -27,6 +27,10 @@ type ToolCall struct {
 
 // HookInput is the JSON payload agents send to hooks via stdin
 type HookInput struct {
+	// Accept both spellings: the runner marshals "toolCall" while tests and
+	// external agents send "tool_call". Without this, ToolCall silently
+	// unmarshals to nil and every argument-derived gate (notably sql_query)
+	// sees nothing to inspect.
 	ToolCall       *ToolCall `json:"toolCall,omitempty"`
 	ToolName       string    `json:"tool_name,omitempty"`
 	Command        string    `json:"command,omitempty"`
@@ -36,6 +40,17 @@ type HookInput struct {
 	Prompt         string    `json:"prompt,omitempty"`
 	ConversationID string    `json:"conversationId,omitempty"`
 	IsSubagent     bool      `json:"is_subagent,omitempty"`
+
+	// ToolCallSnake captures the snake_case variant some clients send.
+	ToolCallSnake *ToolCall `json:"tool_call,omitempty"`
+}
+
+// toolCallValue returns whichever tool-call payload was supplied.
+func (h *HookInput) toolCallValue() *ToolCall {
+	if h.ToolCall != nil {
+		return h.ToolCall
+	}
+	return h.ToolCallSnake
 }
 
 func (h *HookInput) CheckIsSubagent(mainConversationID string) bool {
@@ -51,24 +66,36 @@ func (h *HookInput) CheckIsSubagent(mainConversationID string) bool {
 	return false
 }
 
+// ArgText returns a string tool argument by name, reading the nested toolCall
+// args first and falling back to nothing. Used for arguments the main gating
+// path does not normalise (e.g. the SQL text of sql_query).
+func (h *HookInput) ArgText(key string) string {
+	if tc := h.toolCallValue(); tc != nil {
+		if v, ok := tc.Args[key].(string); ok {
+			return v
+		}
+	}
+	return ""
+}
+
 func (h *HookInput) Normalized() (toolName, command, filePath string) {
 	toolName = h.ToolName
 	command = h.Command
 	filePath = h.FilePath
 
-	if h.ToolCall != nil {
-		if h.ToolCall.Name != "" {
-			toolName = h.ToolCall.Name
+	if tc := h.toolCallValue(); tc != nil {
+		if tc.Name != "" {
+			toolName = tc.Name
 		}
-		if h.ToolCall.Args != nil {
-			if cmd, ok := h.ToolCall.Args["CommandLine"].(string); ok && cmd != "" {
+		if tc.Args != nil {
+			if cmd, ok := tc.Args["CommandLine"].(string); ok && cmd != "" {
 				command = cmd
-			} else if cmd, ok := h.ToolCall.Args["command"].(string); ok && cmd != "" {
+			} else if cmd, ok := tc.Args["command"].(string); ok && cmd != "" {
 				command = cmd
 			}
 
 			for _, key := range []string{"TargetFile", "AbsolutePath", "FilePath", "path", "target_file"} {
-				if fp, ok := h.ToolCall.Args[key].(string); ok && fp != "" {
+				if fp, ok := tc.Args[key].(string); ok && fp != "" {
 					filePath = fp
 					break
 				}
@@ -124,7 +151,11 @@ func (h *Handler) Handle(hookType string, input io.Reader) (string, error) {
 
 // handlePreInvocation injects workspace context + task routing hint before model runs
 func (h *Handler) handlePreInvocation(input HookInput) HookOutput {
-	if input.ConversationID != "" {
+	// A subagent must never claim the main conversation identity. Without this
+	// guard every subagent run overwrote main_conversation_id, after which the
+	// real Main Agent was itself classified as a subagent and lost its
+	// authorization path (see handlePreToolUse).
+	if input.ConversationID != "" && !input.IsSubagent {
 		_ = h.engine.SetProjectSetting("main_conversation_id", input.ConversationID)
 	}
 
@@ -275,7 +306,82 @@ func (h *Handler) handlePreToolUse(input HookInput) HookOutput {
 	mainConvID, _ := h.engine.GetProjectSetting("main_conversation_id")
 	isSubagent := input.CheckIsSubagent(mainConvID)
 
-	// 2. Subagent Gating: Subagents must NOT mutate codebase or run mutative commands directly.
+	// 2. Proposal Gate: while a subagent proposal awaits the user's approval,
+	// the Main Agent itself must not mutate the codebase. The protocol used to
+	// live only in the system prompt, so nothing actually stopped a write. This
+	// gate makes it enforceable: approve_proposal (after the user says yes) or
+	// reject_proposal (after the user says no) is required first.
+	if !isSubagent {
+		writeTools := map[string]bool{
+			"write_to_file":              true,
+			"write_file":                 true,
+			"edit_file":                  true,
+			"replace_file_content":       true,
+			"multi_replace_file_content": true,
+		}
+
+		// State-mutating tools that are not file writes but still change the
+		// substrate. Leaving them open would let a gated agent write "sideways":
+		// recording a decision or doctoring todos instead of waiting.
+		stateTools := map[string]bool{
+			"session_save":    true,
+			"setting_set":     true,
+			"decision_add":    true,
+			"pattern_add":     true,
+			"todo_add":        true,
+			"todo_complete":   true,
+			"todo_remove":     true,
+			"approve_proposal": true,
+			"reject_proposal":  true,
+		}
+
+		blocked := writeTools[toolName] || stateTools[toolName]
+
+		// sql_query can mutate just as effectively as a file write.
+		if !blocked && toolName == "sql_query" {
+			q := strings.ToLower(strings.TrimSpace(input.ArgText("query")))
+			for _, verb := range []string{"insert", "update", "delete", "drop", "alter", "create", "replace", "truncate"} {
+				if strings.HasPrefix(q, verb) || strings.Contains(q, " "+verb+" ") {
+					blocked = true
+					break
+				}
+			}
+		}
+
+		if !blocked && (toolName == "run_command" || toolName == "bash") {
+			sanitized := sanitizeRedirections(strings.ToLower(command))
+			for _, sig := range []string{
+				">", ">>", "sed -i", "rm ", "mv ", "cp ", "tee ", "chmod ", "chown ",
+				"mkdir ", "touch ", "truncate ", "dd ", "git checkout", "git reset",
+				"git push", "git apply", "go generate", "make ", "npm install", "pip install",
+			} {
+				if strings.Contains(sanitized, sig) {
+					blocked = true
+					break
+				}
+			}
+		}
+
+		if blocked {
+			pending, err := h.engine.GetPendingProposal()
+			if err == nil && pending != nil {
+				preview := pending.Proposal
+				if len(preview) > 400 {
+					preview = preview[:400] + "... [truncated]"
+				}
+				return HookOutput{
+					Decision: "deny",
+					Reason: fmt.Sprintf(
+						"Tether Guard: a subagent proposal is still awaiting user approval (proposal #%d from %s). "+
+							"Present it to the user in the main chat, then call approve_proposal once they confirm "+
+							"(or reject_proposal if they decline). Mutations stay blocked until then.\n---\n%s",
+						pending.ID, pending.Role, preview),
+				}
+			}
+		}
+	}
+
+	// 3. Subagent Gating: Subagents must NOT mutate codebase or run mutative commands directly.
 	// They must propose changes to the Main Agent so the user can approve in the main session.
 	if isSubagent {
 		writeTools := map[string]bool{
