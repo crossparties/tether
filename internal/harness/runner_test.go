@@ -222,3 +222,87 @@ func mustQuote(s string) string {
 	return string(b)
 }
 
+
+// The step budget must be configurable, and a project setting must win over the
+// built-in default so operators can tune it without a rebuild.
+func TestMaxStepsResolution(t *testing.T) {
+	dir := t.TempDir()
+	e, err := core.NewEngine(dir)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	defer e.Close()
+
+	def := ResolveConfig(e, Config{})
+	if def.MaxSteps != 80 {
+		t.Fatalf("default MaxSteps = %d, want 80", def.MaxSteps)
+	}
+
+	if err := e.SetProjectSetting("max_steps", "150"); err != nil {
+		t.Fatalf("SetProjectSetting: %v", err)
+	}
+	got := ResolveConfig(e, Config{})
+	if got.MaxSteps != 150 {
+		t.Fatalf("MaxSteps = %d, want 150 from the project setting", got.MaxSteps)
+	}
+
+	// An explicit flag must beat the stored setting.
+	explicit := ResolveConfig(e, Config{MaxSteps: 7})
+	if explicit.MaxSteps != 7 {
+		t.Fatalf("explicit MaxSteps = %d, want 7 (flag must win)", explicit.MaxSteps)
+	}
+
+	// Garbage in the setting must not brick the runner.
+	_ = e.SetProjectSetting("max_steps", "not-a-number")
+	if got := ResolveConfig(e, Config{}); got.MaxSteps != 80 {
+		t.Fatalf("invalid setting should fall back to 80, got MaxSteps=%d", got.MaxSteps)
+	}
+}
+
+// A pause must leave the working history intact so "continue" resumes the task
+// instead of starting over without the tool results the model just produced.
+func TestPausePersistsFullHistory(t *testing.T) {
+	src, err := os.ReadFile("runner.go")
+	if err != nil {
+		t.Fatalf("read runner.go: %v", err)
+	}
+	text := string(src)
+
+	// Locate the pause branch narrowly: from the last history assignment that
+	// precedes the pause message, up to the message itself.
+	idx := strings.Index(text, "[paused after %d tool steps")
+	if idx < 0 {
+		t.Fatal("pause branch not found")
+	}
+	body := text[:idx]
+	if cut := strings.LastIndex(body, "r.history = "); cut >= 0 {
+		body = body[cut:]
+	}
+
+	if strings.Contains(body, "r.history = compactMessagesWithLimits(messages, keepTurns, maxRunes)") {
+		t.Fatal("the pause branch compacts history before saving it; resuming would lose the tool results just produced")
+	}
+	if !strings.Contains(body, "r.history = messages") {
+		t.Fatal("the pause branch does not persist the full working history")
+	}
+}
+
+// Analysis-only subagents must not lock the workspace.
+func TestProducesMutation(t *testing.T) {
+	cases := []struct {
+		role   string
+		output string
+		want   bool
+	}{
+		{"tether_qa", "Coverage is 86.6%. No changes needed.", false},
+		{"tether_qa", "Gaps found. Here is the patch:\n```diff\n--- a/x.go\n+++ b/x.go\n```", true},
+		{"tether_product", "Recommendation: add onboarding docs.", false},
+		{"tether_architect", "## Plan\nRefactor the loop.", true},
+		{"tether_frontend", "Use a table component.", true},
+	}
+	for _, tc := range cases {
+		if got := producesMutation(tc.role, tc.output); got != tc.want {
+			t.Errorf("producesMutation(%q, ...) = %v, want %v", tc.role, got, tc.want)
+		}
+	}
+}

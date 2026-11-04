@@ -214,6 +214,31 @@ func (s *Server) handleToolsList(req *Request) *Response {
 			InputSchema: InputSchema{Type: "object"},
 		},
 		{
+			Name:        "approve_proposal",
+			Description: "Mark a subagent proposal as approved by the user. Call ONLY after the user explicitly says yes in the main chat. Lifts the Tether Guard write block.",
+			InputSchema: InputSchema{
+				Type: "object",
+				Properties: map[string]Property{
+					"proposal_id": {Type: "integer", Description: "Proposal to approve. Omit to approve the oldest pending one."},
+				},
+			},
+		},
+		{
+			Name:        "reject_proposal",
+			Description: "Mark a subagent proposal as rejected by the user. Call when the user declines. Lifts the Tether Guard write block without applying the proposal.",
+			InputSchema: InputSchema{
+				Type: "object",
+				Properties: map[string]Property{
+					"proposal_id": {Type: "integer", Description: "Proposal to reject. Omit to reject the oldest pending one."},
+				},
+			},
+		},
+		{
+			Name:        "proposal_status",
+			Description: "Show any subagent proposal still awaiting user approval",
+			InputSchema: InputSchema{Type: "object"},
+		},
+		{
 			Name:        "session_load",
 			Description: "Load the active session context (recent history, decisions, patterns)",
 			InputSchema: InputSchema{
@@ -480,6 +505,12 @@ func (s *Server) CallTool(name string, args json.RawMessage) (string, bool) {
 	switch name {
 	case "workspace_info":
 		return s.toolWorkspaceInfo(), false
+	case "approve_proposal":
+		return s.toolResolveProposal("approve", args), false
+	case "reject_proposal":
+		return s.toolResolveProposal("reject", args), false
+	case "proposal_status":
+		return s.toolProposalStatus(), false
 	case "session_load":
 		return s.toolSessionLoad(args), false
 	case "session_save":
@@ -561,6 +592,95 @@ func (s *Server) toolWorkspaceInfo() string {
 		"settings":   settings,
 	}
 	out, _ := json.MarshalIndent(info, "", "  ")
+	return string(out)
+}
+
+// toolResolveProposal approves or rejects the pending subagent proposal. It is
+// the only path that lifts the PreToolUse mutation gate.
+func (s *Server) toolResolveProposal(action string, args json.RawMessage) string {
+	var params struct {
+		ProposalID int64 `json:"proposal_id"`
+	}
+	if len(args) > 0 {
+		_ = json.Unmarshal(args, &params)
+	}
+
+	var (
+		pending *core.ProposalRecord
+		err     error
+	)
+	if params.ProposalID > 0 {
+		candidate, gerr := s.engine.GetProposalByID(params.ProposalID)
+		if gerr != nil {
+			return fmt.Sprintf("error reading proposal #%d: %v", params.ProposalID, gerr)
+		}
+		if candidate == nil {
+			return fmt.Sprintf("no proposal #%d", params.ProposalID)
+		}
+		if candidate.Status != "pending" {
+			return fmt.Sprintf("proposal #%d is already %s", candidate.ID, candidate.Status)
+		}
+		pending = candidate
+	} else {
+		pending, err = s.engine.GetPendingProposal()
+		if err != nil {
+			return fmt.Sprintf("error reading pending proposal: %v", err)
+		}
+		if pending == nil {
+			return "no pending proposal (the Tether Guard write block is not active)"
+		}
+	}
+
+	var affected int64
+	if action == "approve" {
+		affected, err = s.engine.ApproveProposalByID(pending.ID)
+	} else {
+		affected, err = s.engine.RejectProposalByID(pending.ID)
+	}
+	if err != nil {
+		return fmt.Sprintf("error resolving proposal: %v", err)
+	}
+
+	verdict := "approved"
+	if action != "approve" {
+		verdict = "rejected"
+	}
+	out, _ := json.MarshalIndent(map[string]interface{}{
+		"proposal_id":   pending.ID,
+		"role":          pending.Role,
+		"status":        verdict,
+		"affected":      affected,
+		"write_blocked": false,
+	}, "", "  ")
+	return string(out)
+}
+
+// toolProposalStatus reports whether a subagent proposal is blocking writes.
+func (s *Server) toolProposalStatus() string {
+	pending, err := s.engine.GetPendingProposal()
+	if err != nil {
+		return fmt.Sprintf("error reading pending proposal: %v", err)
+	}
+	if pending == nil {
+		out, _ := json.MarshalIndent(map[string]interface{}{
+			"pending":       false,
+			"write_blocked": false,
+		}, "", "  ")
+		return string(out)
+	}
+
+	preview := pending.Proposal
+	if len(preview) > 500 {
+		preview = preview[:500] + "... [truncated]"
+	}
+	out, _ := json.MarshalIndent(map[string]interface{}{
+		"pending":       true,
+		"write_blocked": true,
+		"proposal_id":   pending.ID,
+		"role":          pending.Role,
+		"created_at":    pending.CreatedAt,
+		"proposal":      preview,
+	}, "", "  ")
 	return string(out)
 }
 

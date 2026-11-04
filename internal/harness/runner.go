@@ -100,7 +100,14 @@ func ResolveConfig(engine *core.Engine, cfg Config) Config {
 		cfg.APIKey = loadSavedKey(cfg.Provider)
 	}
 	if cfg.MaxSteps <= 0 {
-		cfg.MaxSteps = 35
+		cfg.MaxSteps = 80
+		// Project setting > built-in default, but an explicit flag still wins
+		// because it arrives with MaxSteps already set.
+		if v, err := engine.GetProjectSetting("max_steps"); err == nil && v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				cfg.MaxSteps = n
+			}
+		}
 	}
 	if cfg.Out == nil {
 		cfg.Out = os.Stdout
@@ -312,7 +319,10 @@ func (r *Runner) Run(ctx context.Context, prompt string) (string, error) {
 		}
 	}
 
-	r.history = compactMessagesWithLimits(messages, keepTurns, maxRunes)
+	// Persist the full working history so typing "continue" actually resumes the
+	// same task. Compaction is deliberately skipped here: dropping the tool
+	// results the model had just produced was what turned a pause into a restart.
+	r.history = messages
 	_ = r.engine.AddContext(r.cfg.Provider, "assistant", fmt.Sprintf("[paused after %d tool steps — type 'continue' to resume]", r.cfg.MaxSteps))
 	return "", fmt.Errorf("paused after %d steps (type 'continue' or 'lanjutkan' to resume)", r.cfg.MaxSteps)
 }
@@ -390,7 +400,7 @@ func (r *Runner) runSubagent(args map[string]interface{}) string {
 
 	fmt.Fprintf(r.cfg.Out, "\n🤖 [spawn_subagent:%s] Task: %s\n", role, task)
 	subCfg := r.cfg
-	subCfg.MaxSteps = 12
+	subCfg.MaxSteps = 40
 	subRunner := &Runner{
 		engine:     r.engine,
 		hooks:      r.hooks,
@@ -408,7 +418,43 @@ func (r *Runner) runSubagent(args map[string]interface{}) string {
 	}
 	fmt.Fprintf(r.cfg.Out, "🤖 [subagent:%s completed] Returned proposal to Main Agent.\n\n", role)
 	_ = r.engine.AddContext(role, "plan", ans)
-	return fmt.Sprintf("[Subagent %s Report]:\n%s", role, ans)
+
+	// Record the subagent's output as a proposal awaiting user approval. The
+	// PreToolUse gate refuses any mutation until approve_proposal is called, so
+	// the "propose first, mutate later" rule is enforced rather than hoped for.
+	//
+	// Read-only analysis must NOT lock the workspace: a pure audit produces
+	// nothing to approve, so locking for it would block the user for no reason.
+	if !producesMutation(role, ans) {
+		fmt.Fprintf(r.cfg.Out, "🔓 [subagent:%s] analysis only — no proposal recorded, writes stay unlocked.\n\n", role)
+		return fmt.Sprintf("[Subagent %s Report]:\n%s", role, ans)
+	}
+
+	proposalID, recErr := r.engine.RecordProposal(role, ans)
+	if recErr != nil {
+		fmt.Fprintf(r.cfg.Out, "⚠️  [subagent:%s] could not record proposal: %v\n", role, recErr)
+	} else {
+		// Speak to the user, not to the model: show what was proposed and how to
+		// decide, without leaking internal tool instructions into the terminal.
+		fmt.Fprintf(r.cfg.Out, "\n┌─ PROPOSAL #%d · %s ", proposalID, role)
+		fmt.Fprintf(r.cfg.Out, "%s\n", strings.Repeat("─", max(0, 44-len(role))))
+		for _, line := range firstLines(ans, 4) {
+			fmt.Fprintf(r.cfg.Out, "│ %s\n", line)
+		}
+		fmt.Fprintf(r.cfg.Out, "├───────────────────────────────────────────────────\n")
+		fmt.Fprintf(r.cfg.Out, "│ 🔒 Codebase writes are blocked until you decide.\n")
+		fmt.Fprintf(r.cfg.Out, "│ ✅ tether proposal approve %d\n", proposalID)
+		fmt.Fprintf(r.cfg.Out, "│ 🚫 tether proposal reject %d\n", proposalID)
+		fmt.Fprintf(r.cfg.Out, "│ 👁  tether proposal show %d\n", proposalID)
+		fmt.Fprintf(r.cfg.Out, "└───────────────────────────────────────────────────\n\n")
+	}
+
+	return fmt.Sprintf(
+		"[Subagent %s Report — PROPOSAL #%d, AWAITING USER APPROVAL]:\n%s\n\n"+
+			"⛔ You MUST present this proposal to the user in the main chat and wait for their explicit "+
+			"approval. Mutations are blocked by Tether Guard until you call approve_proposal (user said yes) "+
+			"or reject_proposal (user said no). Do not write files before that.",
+		role, proposalID, ans)
 }
 
 func (r *Runner) printToolAction(name string, args map[string]interface{}) {
@@ -540,7 +586,11 @@ func (r *Runner) RunInteractive(ctx context.Context, in io.Reader) error {
 	}
 
 	for {
-		fmt.Fprintf(r.cfg.Out, "[%s:%s]> ", r.cfg.Model, r.engine.GetMode())
+		promptLabel := ""
+		if pending, perr := r.engine.GetPendingProposal(); perr == nil && pending != nil {
+			promptLabel = fmt.Sprintf(" 🔒 proposal #%d pending (tether proposal approve %d)", pending.ID, pending.ID)
+		}
+		fmt.Fprintf(r.cfg.Out, "[%s:%s%s]> ", r.cfg.Model, r.engine.GetMode(), promptLabel)
 		if !scanner.Scan() {
 			fmt.Fprintln(r.cfg.Out)
 			return nil
@@ -660,4 +710,61 @@ func compactMessagesWithLimits(messages []chatMessage, keepAssistantTurns, maxSt
 		}
 	}
 	return out
+}
+
+// firstLines returns up to n meaningful (non-blank) lines from text, each
+// trimmed to a terminal-friendly width.
+func firstLines(text string, n int) []string {
+	var out []string
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if len(line) > 70 {
+			line = line[:70] + "…"
+		}
+		out = append(out, line)
+		if len(out) == n {
+			break
+		}
+	}
+	if len(out) == 0 {
+		out = []string{"(empty report)"}
+	}
+	return out
+}
+
+// max returns the larger of a and b.
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// analysisOnlyRoles are subagent roles whose normal output is a report, not a
+// change request. They only create a proposal when the output actually carries
+// something actionable (a diff block or an explicit proposal block).
+var analysisOnlyRoles = map[string]bool{
+	"tether_qa":      true,
+	"tether_product": true,
+}
+
+// producesMutation reports whether a subagent result should become an approval
+// proposal. Requiring an actionable block for analysis roles keeps audits
+// lock-free while still gating real change requests.
+func producesMutation(role, output string) bool {
+	markers := []string{"```diff", "```patch", "```proposal", "--- a/", "+++ b/"}
+	hasActionable := false
+	for _, marker := range markers {
+		if strings.Contains(output, marker) {
+			hasActionable = true
+			break
+		}
+	}
+	if analysisOnlyRoles[role] {
+		return hasActionable
+	}
+	return true
 }
