@@ -2,11 +2,15 @@ package mcp
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/croosparties/tether/internal/core"
 )
@@ -395,12 +399,135 @@ func (s *Server) handleToolsList(req *Request) *Response {
 				Required: []string{"query"},
 			},
 		},
+		{
+			Name:        "read_file",
+			Description: "Read file contents in the workspace (optionally specify start_line and end_line to save context tokens).",
+			InputSchema: InputSchema{
+				Type: "object",
+				Properties: map[string]Property{
+					"path":       {Type: "string", Description: "Relative or absolute path of the file to read"},
+					"start_line": {Type: "integer", Description: "Optional 1-based start line"},
+					"end_line":   {Type: "integer", Description: "Optional 1-based end line"},
+				},
+				Required: []string{"path"},
+			},
+		},
+		{
+			Name:        "write_file",
+			Description: "Create or overwrite a file in the workspace. Enforces Tether Plan vs Code mode guardrails.",
+			InputSchema: InputSchema{
+				Type: "object",
+				Properties: map[string]Property{
+					"path":    {Type: "string", Description: "Relative or absolute path of the file to write"},
+					"content": {Type: "string", Description: "Full content to write to the file"},
+				},
+				Required: []string{"path", "content"},
+			},
+		},
+		{
+			Name:        "edit_file",
+			Description: "Replace an exact target string in an existing file with replacement text. Enforces Tether Plan vs Code mode guardrails.",
+			InputSchema: InputSchema{
+				Type: "object",
+				Properties: map[string]Property{
+					"path":        {Type: "string", Description: "Relative or absolute path of the file to edit"},
+					"target":      {Type: "string", Description: "Exact string to find and replace"},
+					"replacement": {Type: "string", Description: "Replacement string"},
+				},
+				Required: []string{"path", "target", "replacement"},
+			},
+		},
+		{
+			Name:        "run_command",
+			Description: "Execute a shell command in the workspace. Enforces Tether Plan vs Code mode and catastrophic command guardrails.",
+			InputSchema: InputSchema{
+				Type: "object",
+				Properties: map[string]Property{
+					"command": {Type: "string", Description: "Shell command to execute"},
+				},
+				Required: []string{"command"},
+			},
+		},
 	}
 
 	return &Response{
 		JSONRPC: "2.0",
 		ID:      req.ID,
 		Result:  map[string]interface{}{"tools": tools},
+	}
+}
+
+// ListTools returns the full list of registered Tether + workspace tools
+func (s *Server) ListTools() []Tool {
+	resp := s.handleToolsList(&Request{JSONRPC: "2.0", ID: 1})
+	if resp == nil {
+		return nil
+	}
+	resMap, ok := resp.Result.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	tools, _ := resMap["tools"].([]Tool)
+	return tools
+}
+
+// CallTool executes a named tool with JSON arguments and returns (resultText, isError)
+func (s *Server) CallTool(name string, args json.RawMessage) (string, bool) {
+	if len(args) == 0 {
+		args = json.RawMessage(`{}`)
+	}
+
+	switch name {
+	case "workspace_info":
+		return s.toolWorkspaceInfo(), false
+	case "session_load":
+		return s.toolSessionLoad(args), false
+	case "session_save":
+		return s.toolSessionSave(args)
+	case "session_done":
+		return s.toolSessionDone()
+	case "setting_set":
+		return s.toolSettingSet(args)
+	case "decision_add":
+		return s.toolDecisionAdd(args)
+	case "pattern_add":
+		return s.toolPatternAdd(args)
+	case "mode_set":
+		return s.toolModeSet(args)
+	case "mode_get":
+		return s.toolModeGet(), false
+	case "kb_index":
+		return s.toolKBIndex(args)
+	case "kb_search":
+		return s.toolKBSearch(args)
+	case "kb_status":
+		return s.toolKBStatus(), false
+	case "todo_add":
+		return s.toolTodoAdd(args)
+	case "todo_list":
+		return s.toolTodoList(args), false
+	case "todo_complete":
+		return s.toolTodoComplete(args)
+	case "todo_remove":
+		return s.toolTodoRemove(args)
+	case "task_classify":
+		return s.toolTaskClassify(args), false
+	case "files_modified":
+		return s.toolFilesModified(), false
+	case "subagent_spawn_rules":
+		return s.toolSubagentSpawnRules(), false
+	case "sql_query":
+		return s.toolSQLQuery(args)
+	case "read_file":
+		return s.toolReadFile(args)
+	case "write_file":
+		return s.toolWriteFile(args)
+	case "edit_file":
+		return s.toolEditFile(args)
+	case "run_command":
+		return s.toolRunCommand(args)
+	default:
+		return fmt.Sprintf("unknown tool: %s", name), true
 	}
 }
 
@@ -414,54 +541,7 @@ func (s *Server) handleToolsCall(req *Request) *Response {
 		}
 	}
 
-	var result string
-	var isError bool
-
-	switch params.Name {
-	case "workspace_info":
-		result = s.toolWorkspaceInfo()
-	case "session_load":
-		result = s.toolSessionLoad(params.Arguments)
-	case "session_save":
-		result, isError = s.toolSessionSave(params.Arguments)
-	case "session_done":
-		result, isError = s.toolSessionDone()
-	case "setting_set":
-		result, isError = s.toolSettingSet(params.Arguments)
-	case "decision_add":
-		result, isError = s.toolDecisionAdd(params.Arguments)
-	case "pattern_add":
-		result, isError = s.toolPatternAdd(params.Arguments)
-	case "mode_set":
-		result, isError = s.toolModeSet(params.Arguments)
-	case "mode_get":
-		result = s.toolModeGet()
-	case "kb_index":
-		result, isError = s.toolKBIndex(params.Arguments)
-	case "kb_search":
-		result, isError = s.toolKBSearch(params.Arguments)
-	case "kb_status":
-		result = s.toolKBStatus()
-	case "todo_add":
-		result, isError = s.toolTodoAdd(params.Arguments)
-	case "todo_list":
-		result = s.toolTodoList(params.Arguments)
-	case "todo_complete":
-		result, isError = s.toolTodoComplete(params.Arguments)
-	case "todo_remove":
-		result, isError = s.toolTodoRemove(params.Arguments)
-	case "task_classify":
-		result = s.toolTaskClassify(params.Arguments)
-	case "files_modified":
-		result = s.toolFilesModified()
-	case "subagent_spawn_rules":
-		result = s.toolSubagentSpawnRules()
-	case "sql_query":
-		result, isError = s.toolSQLQuery(params.Arguments)
-	default:
-		result = fmt.Sprintf("unknown tool: %s", params.Name)
-		isError = true
-	}
+	result, isError := s.CallTool(params.Name, params.Arguments)
 
 	return &Response{
 		JSONRPC: "2.0",
@@ -835,4 +915,255 @@ func (s *Server) toolSQLQuery(args json.RawMessage) (string, bool) {
 	}
 	return string(out), false
 }
+
+// --- Workspace Primitives (for Micro-Harness & MCP) ---
+
+func (s *Server) resolvePath(p string) string {
+	if filepath.IsAbs(p) {
+		return filepath.Clean(p)
+	}
+	return filepath.Join(s.engine.Workspace, p)
+}
+
+func (s *Server) toolReadFile(args json.RawMessage) (string, bool) {
+	var params struct {
+		Path      string `json:"path"`
+		StartLine int    `json:"start_line"`
+		EndLine   int    `json:"end_line"`
+	}
+	if err := json.Unmarshal(args, &params); err != nil || params.Path == "" {
+		return "invalid params: path required", true
+	}
+	data, err := os.ReadFile(s.resolvePath(params.Path))
+	if err != nil {
+		return err.Error(), true
+	}
+	content := strings.ReplaceAll(string(data), "\r\n", "\n")
+	if params.StartLine > 0 || params.EndLine > 0 {
+		lines := strings.Split(content, "\n")
+		start := params.StartLine
+		if start < 1 {
+			start = 1
+		}
+		end := params.EndLine
+		if end <= 0 || end > len(lines) {
+			end = len(lines)
+		}
+		if start > len(lines) || start > end {
+			return fmt.Sprintf("invalid line range %d-%d (file has %d lines)", start, end, len(lines)), true
+		}
+		var b strings.Builder
+		for i := start - 1; i < end; i++ {
+			fmt.Fprintf(&b, "%d: %s\n", i+1, lines[i])
+		}
+		content = b.String()
+	}
+	if len(content) > 32768 {
+		return content[:32768] + "\n... [truncated at 32KB]", false
+	}
+	return content, false
+}
+
+func (s *Server) toolWriteFile(args json.RawMessage) (string, bool) {
+	var params struct {
+		Path    string `json:"path"`
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(args, &params); err != nil || params.Path == "" {
+		return "invalid params: path and content required", true
+	}
+	fullPath := s.resolvePath(params.Path)
+	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+		return err.Error(), true
+	}
+	if err := os.WriteFile(fullPath, []byte(params.Content), 0644); err != nil {
+		return err.Error(), true
+	}
+	return fmt.Sprintf("wrote %d bytes to %s", len(params.Content), params.Path), false
+}
+
+func (s *Server) toolEditFile(args json.RawMessage) (string, bool) {
+	var params struct {
+		Path        string `json:"path"`
+		Target      string `json:"target"`
+		Replacement string `json:"replacement"`
+	}
+	if err := json.Unmarshal(args, &params); err != nil || params.Path == "" || params.Target == "" {
+		return "invalid params: path and target required", true
+	}
+	fullPath := s.resolvePath(params.Path)
+	data, err := os.ReadFile(fullPath)
+	if err != nil {
+		return err.Error(), true
+	}
+	updated, tier, err := applyFuzzyEdit(string(data), params.Target, params.Replacement)
+	if err != nil {
+		return err.Error(), true
+	}
+	if err := os.WriteFile(fullPath, []byte(updated), 0644); err != nil {
+		return err.Error(), true
+	}
+	return fmt.Sprintf("edited %s (match:%s)", params.Path, tier), false
+}
+
+// applyFuzzyEdit implements a 3-Tier surgical matcher:
+// applyFuzzyEdit implements a 3-Tier surgical matcher:
+// Tier 1: Unique exact substring match (with ambiguity guard)
+// Tier 2: Unique CRLF-normalized match (with ambiguity guard)
+// Tier 3: Indentation & blank-line tolerant block match with proportional nested re-indentation
+func applyFuzzyEdit(content, target, replacement string) (string, string, error) {
+	// Tier 1: Exact match with ambiguity guard
+	if cnt := strings.Count(content, target); cnt > 0 {
+		if cnt > 1 {
+			return "", "", fmt.Errorf("ambiguous target: matched %d locations; include more surrounding lines", cnt)
+		}
+		return strings.Replace(content, target, replacement, 1), "exact", nil
+	}
+
+	normContent := strings.ReplaceAll(content, "\r\n", "\n")
+	normTarget := strings.ReplaceAll(target, "\r\n", "\n")
+	normReplace := strings.ReplaceAll(replacement, "\r\n", "\n")
+
+	// Tier 2: CRLF-normalized match with ambiguity guard
+	if cnt := strings.Count(normContent, normTarget); cnt > 0 {
+		if cnt > 1 {
+			return "", "", fmt.Errorf("ambiguous target: matched %d locations; include more surrounding lines", cnt)
+		}
+		return strings.Replace(normContent, normTarget, normReplace, 1), "crlf-normalized", nil
+	}
+
+	// Tier 3: Indentation & blank-line tolerant block match
+	contentLines := strings.Split(normContent, "\n")
+	targetLines := strings.Split(strings.TrimSuffix(normTarget, "\n"), "\n")
+
+	startIdx, endIdx, matchCount := findFuzzySpan(contentLines, targetLines)
+	if matchCount == 0 {
+		return "", "", fmt.Errorf("target string not found in file (even with fuzzy indentation/blank-line matching)")
+	}
+	if matchCount > 1 {
+		return "", "", fmt.Errorf("ambiguous target: matched %d locations; include more surrounding lines", matchCount)
+	}
+
+	replaceLines := reindentReplacement(contentLines[startIdx:endIdx], targetLines, normReplace)
+
+	var resultLines []string
+	resultLines = append(resultLines, contentLines[:startIdx]...)
+	resultLines = append(resultLines, replaceLines...)
+	resultLines = append(resultLines, contentLines[endIdx:]...)
+	return strings.Join(resultLines, "\n"), "fuzzy-indent", nil
+}
+
+// findFuzzySpan locates [startIdx, endIdx) in contentLines matching non-empty trimmed targetLines,
+// tolerating added or omitted blank lines inside the block.
+func findFuzzySpan(contentLines, targetLines []string) (int, int, int) {
+	var nonEmptyTarget []string
+	for _, tl := range targetLines {
+		if t := strings.TrimSpace(tl); t != "" {
+			nonEmptyTarget = append(nonEmptyTarget, t)
+		}
+	}
+	if len(nonEmptyTarget) == 0 {
+		return -1, -1, 0
+	}
+
+	bestStart, bestEnd, matchCount := -1, -1, 0
+	for i := 0; i < len(contentLines); i++ {
+		if strings.TrimSpace(contentLines[i]) != nonEmptyTarget[0] {
+			continue
+		}
+		cIdx := i
+		tIdx := 0
+		for cIdx < len(contentLines) && tIdx < len(nonEmptyTarget) {
+			trimmed := strings.TrimSpace(contentLines[cIdx])
+			if trimmed == "" {
+				cIdx++
+				continue
+			}
+			if trimmed != nonEmptyTarget[tIdx] {
+				break
+			}
+			tIdx++
+			cIdx++
+		}
+		if tIdx == len(nonEmptyTarget) {
+			bestStart = i
+			bestEnd = cIdx
+			matchCount++
+		}
+	}
+	return bestStart, bestEnd, matchCount
+}
+
+// reindentReplacement aligns base indentation and proportionally converts nested spaces<->tabs
+func reindentReplacement(matchedFileLines, targetLines []string, normReplace string) []string {
+	var fileIndent, targetIndent string
+	fileUsesTabs := false
+	for _, fl := range matchedFileLines {
+		if strings.TrimSpace(fl) != "" {
+			ind := leadingWhitespace(fl)
+			if fileIndent == "" {
+				fileIndent = ind
+			}
+			if strings.Contains(ind, "\t") {
+				fileUsesTabs = true
+			}
+		}
+	}
+	for _, tl := range targetLines {
+		if strings.TrimSpace(tl) != "" {
+			targetIndent = leadingWhitespace(tl)
+			break
+		}
+	}
+
+	replaceLines := strings.Split(strings.TrimSuffix(normReplace, "\n"), "\n")
+	for j, rl := range replaceLines {
+		if strings.TrimSpace(rl) == "" {
+			replaceLines[j] = ""
+			continue
+		}
+		relLine := strings.TrimPrefix(rl, targetIndent)
+		relIndent := leadingWhitespace(relLine)
+		codePart := strings.TrimLeft(relLine, " \t")
+
+		if fileUsesTabs && strings.Contains(relIndent, "    ") {
+			relIndent = strings.ReplaceAll(relIndent, "    ", "\t")
+		} else if !fileUsesTabs && strings.Contains(fileIndent, " ") && strings.Contains(relIndent, "\t") {
+			relIndent = strings.ReplaceAll(relIndent, "\t", "    ")
+		}
+		replaceLines[j] = fileIndent + relIndent + codePart
+	}
+	return replaceLines
+}
+
+func leadingWhitespace(s string) string {
+	trimmed := strings.TrimLeft(s, " \t")
+	return s[:len(s)-len(trimmed)]
+}
+
+func (s *Server) toolRunCommand(args json.RawMessage) (string, bool) {
+	var params struct {
+		Command string `json:"command"`
+	}
+	if err := json.Unmarshal(args, &params); err != nil || strings.TrimSpace(params.Command) == "" {
+		return "invalid params: command required", true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sh", "-c", params.Command)
+	cmd.Dir = s.engine.Workspace
+	out, err := cmd.CombinedOutput()
+	output := string(out)
+	if len(output) > 16384 {
+		output = output[:16384] + "\n... [truncated at 16KB]"
+	}
+	if err != nil {
+		return fmt.Sprintf("exit error: %v\n%s", err, output), true
+	}
+	if output == "" {
+		return "(command completed with no output)", false
+	}
+	return output, false
+}
+
 

@@ -19,8 +19,21 @@ func Install(agent string) error {
 		return installCodex()
 	case "cursor":
 		return installCursor()
+	case "windsurf":
+		return installGenericMCP(".codeium/windsurf", "mcp_config.json")
+	case "cline":
+		return installGenericMCP(".cline", "mcp_settings.json")
+	case "roo":
+		return installGenericMCP(".roo", "mcp_settings.json")
+	case "opencode":
+		return installGenericMCP(".config/opencode", "mcp.json")
+	case "all":
+		for _, a := range []string{"agy", "claude", "codex", "cursor", "windsurf", "cline", "roo", "opencode"} {
+			_ = Install(a)
+		}
+		return nil
 	default:
-		return fmt.Errorf("unsupported agent: %s (supported: agy, claude, codex, cursor)", agent)
+		return fmt.Errorf("unsupported agent: %s (supported: agy, claude, codex, cursor, windsurf, cline, roo, opencode, all)", agent)
 	}
 }
 
@@ -261,40 +274,21 @@ func installClaude() error {
 	return nil
 }
 
-// --- Codex ---
+// --- Generic MCP Config Installer (Codex, Cursor, Windsurf, Cline, Roo, OpenCode) ---
 
 func installCodex() error {
-	home, _ := os.UserHomeDir()
-	configDir := filepath.Join(home, ".codex")
-	if err := os.MkdirAll(configDir, 0755); err != nil {
-		return fmt.Errorf("mkdir .codex: %w", err)
-	}
-
-	mcpConfig := map[string]interface{}{
-		"mcpServers": map[string]interface{}{
-			"tether": map[string]interface{}{
-				"command": tetherBinary(),
-				"args":    []string{"mcp"},
-			},
-		},
-	}
-
-	mcpPath := filepath.Join(configDir, "mcp_config.json")
-	if err := writeJSON(mcpPath, mcpConfig); err != nil {
-		return fmt.Errorf("write mcp_config.json: %w", err)
-	}
-
-	fmt.Printf("  → MCP server configured: %s\n", mcpPath)
-	return nil
+	return installGenericMCP(".codex", "mcp_config.json")
 }
 
-// --- Cursor ---
-
 func installCursor() error {
+	return installGenericMCP(".cursor", "mcp.json")
+}
+
+func installGenericMCP(relDir, fileName string) error {
 	home, _ := os.UserHomeDir()
-	configDir := filepath.Join(home, ".cursor")
+	configDir := filepath.Join(home, relDir)
 	if err := os.MkdirAll(configDir, 0755); err != nil {
-		return fmt.Errorf("mkdir .cursor: %w", err)
+		return fmt.Errorf("mkdir %s: %w", relDir, err)
 	}
 
 	mcpConfig := map[string]interface{}{
@@ -306,9 +300,9 @@ func installCursor() error {
 		},
 	}
 
-	mcpPath := filepath.Join(configDir, "mcp.json")
+	mcpPath := filepath.Join(configDir, fileName)
 	if err := writeJSON(mcpPath, mcpConfig); err != nil {
-		return fmt.Errorf("write mcp.json: %w", err)
+		return fmt.Errorf("write %s: %w", fileName, err)
 	}
 
 	fmt.Printf("  → MCP server configured: %s\n", mcpPath)

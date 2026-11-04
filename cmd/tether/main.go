@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,16 +9,17 @@ import (
 
 	"github.com/croosparties/tether/internal/adapter"
 	"github.com/croosparties/tether/internal/core"
+	"github.com/croosparties/tether/internal/harness"
 	"github.com/croosparties/tether/internal/hooks"
 	"github.com/croosparties/tether/internal/mcp"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 func main() {
 	if len(os.Args) < 2 {
-		printUsage()
-		os.Exit(1)
+		cmdRun(nil)
+		return
 	}
 
 	switch os.Args[1] {
@@ -35,14 +37,15 @@ func main() {
 		cmdDoctor()
 	case "install":
 		cmdInstall()
+	case "run", "agent", "chat":
+		cmdRun(os.Args[2:])
 	case "version":
 		fmt.Printf("tether v%s\n", version)
 	case "help", "--help", "-h":
 		printUsage()
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command: %s\n", os.Args[1])
-		printUsage()
-		os.Exit(1)
+		// Allow flags or direct prompt right after `tether` (Aider / Claude Code style)
+		cmdRun(os.Args[1:])
 	}
 }
 
@@ -433,20 +436,87 @@ func cmdInstall() {
 	fmt.Printf("✓ Tether installed for %s\n", agent)
 }
 
+// cmdRun launches the Interactive Agent REPL (when no prompt is passed) or runs a prompt directly
+func cmdRun(args []string) {
+	var cfg harness.Config
+	var promptParts []string
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--provider", "-p":
+			if i+1 < len(args) {
+				cfg.Provider = args[i+1]
+				i++
+			}
+		case "--model", "-m":
+			if i+1 < len(args) {
+				cfg.Model = args[i+1]
+				i++
+			}
+		case "--api-key", "-k":
+			if i+1 < len(args) {
+				cfg.APIKey = args[i+1]
+				i++
+			}
+		case "--base-url":
+			if i+1 < len(args) {
+				cfg.BaseURL = args[i+1]
+				i++
+			}
+		default:
+			promptParts = append(promptParts, args[i])
+		}
+	}
+
+	workspace, err := core.DetectWorkspace(".")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	engine, err := core.NewEngine(workspace)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	defer engine.Close()
+
+	if cfg.APIKey != "" {
+		resolved := harness.ResolveConfig(engine, cfg)
+		_ = harness.SaveAPIKey(resolved.Provider, cfg.APIKey)
+	}
+
+	runner := harness.NewRunner(engine, cfg)
+	prompt := strings.TrimSpace(strings.Join(promptParts, " "))
+	if prompt == "" {
+		if err := runner.RunInteractive(context.Background(), os.Stdin); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	out, err := runner.Run(context.Background(), prompt)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "harness error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(out)
+}
+
 func printUsage() {
-	fmt.Println(`tether — The Local-First Deterministic Substrate for AI Agents
+	fmt.Println(`tether — The Local-First Deterministic Substrate & Interactive AI Agent
 
 Usage:
+  tether                   Start interactive AI coding session (Aider / Claude Code style)
+  tether --model <model>   Start interactive session with specific model (e.g. deepseek-reasoner)
   tether init              Initialize tether in current project
   tether status            Display real-time substrate dashboard & guardrail state
   tether mode [code|plan]  Inspect or switch active governance mode
   tether doctor            Verify database, WAL, hooks, and agent wiring
   tether mcp               Start MCP server (stdio transport)
   tether hook <event>      Handle lifecycle hook event (PreInvocation|PreToolUse|PostToolUse)
-  tether install [agent]   Wire tether into agent config (agy|claude|codex)
+  tether install [agent]   Wire tether into agent config (agy|claude|codex|cursor|windsurf|cline|roo|opencode|all)
   tether version           Show version
-  tether help              Show this help
-
-Tether provides local session management, workspace detection, planning mode
-enforcement, and continuous project memory for any CLI AI agent.`)
+  tether help              Show this help`)
 }

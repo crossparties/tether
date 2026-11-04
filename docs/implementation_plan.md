@@ -1,74 +1,55 @@
-# Implementation Plan: Tether — Universal Substrate & Proactive Lifecycle Gatekeeper for AI Agents
+# Implementation Plan: Tether v0.2.0 — Universal MCP Adapter & Stdlib Micro-Harness
 
-## Problem Statement
-Proyek ini bertransisi menjadi arsitektur orisinal independen: **Tether**, sebuah *deterministic substrate* lokal-pertama (zero-cloud, offline) dan *proactive lifecycle gatekeeper* yang mengikat (*tethers*) AI agent yang bersifat probabilistik dan terisolasi, sehingga developer memiliki kontinuitas konteks, single source of truth, dan jaminan keamanan workflow lintasan agent.
-
----
-
-## Requirements (Berdasarkan Jawaban User: 1b, 2b, 3a, 4c)
-1. **Scope Identitas (1b)**: Penegasan konsep di level dokumentasi (`docs/PRD.md`) dan arsitektur produk sebagai entitas mandiri dan orisinal.
-2. **Format Dokumen (2b)**: Menulis ulang `docs/PRD.md` menjadi **Single Unified PRD** berstandar industri yang memuat seluruh narasi produk dan spesifikasi teknis:
-   - *What the problem is* (Stateless & uncoordinated agents)
-   - *Why it was made* (Ketiadaan shared substrate lokal lintas vendor)
-   - *What solutions it provides* (Proactive hook interceptor + SQLite state persistence)
-   - *How it makes developer life easier* (Zero-cloud, seamless multi-agent handoff, automatic guardrails)
-   - *Why it is a genuine invention* (Proactive in-flight gatekeeping vs reactive memory sinks seperti Mem0/Zep)
-3. **Product Architect Subagent (3a)**: Menggunakan subagent berorientasi Product Architect untuk meriset lanskap kompetitif (Mem0, Zep, Letta, native agent hooks), merumuskan diferensiasi, dan memvalidasi keutuhan narasi invensi.
-4. **Pilar Inti Invensi (4c)**: Menggabungkan dua pilar utama:
-   - **Pilar 1 — Proactive Lifecycle Gatekeeper**: Intersepsi in-flight via hooks (`PreInvocation` surgical context router + `PreToolUse` write gating).
-   - **Pilar 2 — Universal Shared Memory Substrate**: Single source of truth lokal (SQLite) yang memungkinkan session handoff antar agent (Claude Code, Agy, Cursor, Codex) tanpa vendor lock-in.
+> **Methodology**: OKF (Open Knowledge Fact-finding) & Ponytail Minimalist Discipline  
+> **Zero External Dependencies**: Pure Go standard library (`net/http`, `os/exec`) + existing `modernc.org/sqlite` substrate.
 
 ---
 
-## Task Breakdown
+## 1. OKF & Ponytail Architectural Framing
 
-### Task 1: Research & Competitive Positioning Synthesis (Product Architect Role)
-- **Objective**: Membedah posisi Tether di pasar AI developer tools dan merumuskan argumen invensi yang solid terhadap kompetitor (Mem0, Letta/MemGPT, Zep, cursor rules).
-- **Implementation**:
-  - Menyusun 5 pilar narasi: Problem, Why, Solution, Ergonomics (How it's easier), dan Invention Defense (The Moat).
-  - Merumuskan terminologi orisinal Tether (e.g., *Tether Substrate*, *Tether Hook Interceptor*, *Continuous Project Memory*, *Surgical Context Router*).
-- **Done when**: Rumusan narasi selesai dan siap diintegrasikan ke dalam draft PRD terpadu.
+### 1.1 What The Problem Is
+1. **Incomplete Agent Coverage**: `tether install` currently wires `agy`, `claude`, `codex`, and `cursor`, leaving out popular MCP-native agents (`windsurf`, `cline`, `roo`, `opencode`, and `all`).
+2. **Raw API Gap**: Developers holding a raw LLM API key (e.g., `DEEPSEEK_API_KEY` for `deepseek-chat` / `deepseek-reasoner`, OpenRouter, Groq, OpenAI, or local Ollama) cannot execute tasks directly against the Tether substrate without installing an external third-party harness.
 
-### Task 2: Drafting the Unified Tether PRD (`docs/PRD.md`)
-- **Objective**: Menulis ulang `docs/PRD.md` secara menyeluruh dengan struktur produk modern dan komprehensif.
-- **Implementation**:
-  - **Section 1: Executive Summary & The Invention Thesis**
-    - Mengapa Tether adalah invensi (Proactive vs Reactive memory).
-    - Filosofi "Tether": Menjinakkan agent liar dengan tali deterministik lokal.
-  - **Section 2: The Core Problem & Why Tether Was Made**
-    - Masalah amnesia agent per sesi.
-    - Masalah fragmentasi multi-agent (Claude vs Agy vs Cursor tidak saling kenal).
-    - Masalah premature coding (agent menulis kode tanpa plan matang).
-  - **Section 3: Solutions & Architecture**
-    - Local SQLite Substrate (Session, Decisions, Patterns, FTS5 Knowledge Base, Todos).
-    - Lifecycle Interception Engine (`PreInvocation`, `PreToolUse`, `PostToolUse`).
-    - Standard MCP Server (stdio newline-delimited protocol).
-  - **Section 4: Ergonomics — How It Makes Development Easier**
-    - Zero config cloudless setup (`tether init`).
-    - Multi-agent session handoff (Pindah terminal tanpa kehilangan konteks).
-    - Surgical context delivery (Hemat token hingga 80%).
-  - **Section 5: Technical Specification & Contracts**
-    - Database schema (`session.db`).
-    - Hook contract specification.
-    - MCP tools definition.
-    - CLI commands spec (`init`, `status`, `doctor`, `replay`, `todo`).
-  - **Section 6: Implementation Roadmap (v0.1.0 to v1.0.0)**
-    - Phase 1: Solidify Substrate & Fix MCP Protocol Framing.
-    - Phase 2: CLI Observability (`status`, `doctor`, `replay`).
-    - Phase 3: Surgical Context Routing & Strict Gating.
-- **Done when**: File `docs/PRD.md` terupdate penuh dan memiliki narasi invensi yang tajam dan kohesif.
-
-### Task 3: Verification & Cleanliness Review
-- **Objective**: Memverifikasi identitas Tether mandiri dan konsisten di seluruh dokumentasi.
-- **Implementation**:
-  - Verifikasi kelengkapan 5 elemen pertanyaan user (Problem, Why, Solution, Easier, Invention).
-- **Done when**: Struktur PRD memenuhi standar arsitektur Tether.
+### 1.2 Why This Design Was Chosen (Ponytail Minimalist Discipline)
+- *"The best code is code never written."* Rather than cloning a bloated TUI/IDE agent, Tether provides a **<200 LOC surgical micro-harness (`tether run`)** that reuses 100% of Tether's existing `hooks.Handler` (`PreInvocation`, `PreToolUse`, `PostToolUse`) and `mcp.Server` tool dispatcher.
+- **Zero New Dependencies**: Uses standard `net/http` against the industry-standard OpenAI-compatible `/chat/completions` contract supported by DeepSeek, OpenAI, OpenRouter, Groq, Gemini, xAI, and Ollama.
+- **DeepSeek R1 (`deepseek-reasoner`) Native Compatibility**: Properly handles `reasoning_content` in assistant tool-call turns while stripping historical `reasoning_content` on subsequent user turns as mandated by the DeepSeek API specification.
 
 ---
 
-## Verification Plan
-### Automated Verification
-- `head -n 40 docs/PRD.md` -> Memverifikasi judul, meta, dan executive summary Tether.
+## 2. Surgical Changes Breakdown
 
-### Manual Verification
-- Review alur narasi: Memastikan penjelasan "Why it is an invention" membedakan Tether secara tegas dari database memori cloud (Mem0/Zep) dan aturan statis (`.cursorrules`/`CLAUDE.md`).
+### Component 1: Unified Tool Dispatcher & 4 OS Primitives (`internal/mcp/server.go` & `internal/hooks/handler.go`)
+- Expose `ListTools() []Tool` and `CallTool(name string, args json.RawMessage) (string, bool)` on `*mcp.Server`.
+- Add 4 minimal workspace primitives to `mcp.Server` (`read_file`, `write_file`, `edit_file`, `run_command`) so raw APIs in `tether run` (and any minimal MCP client) can inspect and mutate the workspace.
+- Register `edit_file` in `hooks.Handler` write-gating maps so `PLAN` mode and subagent restrictions physically block unauthorized mutations.
+
+### Component 2: Stdlib Universal API Micro-Harness (`internal/harness/runner.go`)
+- Provider presets:
+  - `deepseek` (`https://api.deepseek.com/chat/completions`, default model: `deepseek-chat`)
+  - `openrouter` (`https://openrouter.ai/api/v1/chat/completions`, default model: `deepseek/deepseek-chat`)
+  - `openai` (`https://api.openai.com/v1/chat/completions`, default model: `gpt-4o`)
+  - `groq` (`https://api.groq.com/openai/v1/chat/completions`, default model: `llama-3.3-70b-versatile`)
+  - `gemini` (`https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`, default model: `gemini-2.5-pro`)
+  - `ollama` (`http://localhost:11434/v1/chat/completions`, default model: `qwen2.5-coder:7b`)
+- Execution pipeline per turn:
+  1. **PreInvocation**: Calls `hooks.Handler.Handle("PreInvocation", ...)` to inject surgical context from `session.db`.
+  2. **Inference**: Sends messages + `mcp.Server.ListTools()` to the configured provider endpoint.
+  3. **PreToolUse Gate**: Before executing any `tool_call`, validates via `hooks.Handler.Handle("PreToolUse", ...)`. If `decision == "deny"`, returns the denial reason directly to the model without touching disk.
+  4. **Execution & PostToolUse**: Executes allowed tools via `mcp.Server.CallTool()` and records state via `hooks.Handler.Handle("PostToolUse", ...)`.
+  5. **Session Continuity**: Persists user prompt and final assistant output into `session.db` (`session_context`), enabling instant handoff between `tether run` (DeepSeek API) and `agy` / `claude` / `cursor`.
+
+### Component 3: Universal MCP Installer (`internal/adapter/adapter.go`)
+- Add support for `windsurf`, `cline`, `roo`, `opencode`, and `all` in `adapter.Install()`.
+
+### Component 4: CLI Wiring (`cmd/tether/main.go`)
+- Add `tether run "<prompt>"` (with flags/env support: `--provider`, `--model`, `DEEPSEEK_API_KEY`, etc.).
+
+---
+
+## 3. Concrete Verification Plan
+1. `go test ./...` — All existing tests in `internal/core`, `internal/hooks`, `internal/mcp` plus new tests in `internal/harness/runner_test.go` must pass.
+2. Verify via `runner_test.go` mock server:
+   - Multi-turn `tool_calls` with `deepseek-reasoner` (`reasoning_content`) executes `read_file` and `todo_add`.
+   - Switching engine to `plan` mode causes `Tether Guard` (`PreToolUse`) to block `write_file` / `edit_file` during `tether run` while allowing writes to `docs/`.

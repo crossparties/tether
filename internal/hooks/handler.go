@@ -268,6 +268,7 @@ func (h *Handler) handlePreToolUse(input HookInput) HookOutput {
 		writeTools := map[string]bool{
 			"write_to_file":              true,
 			"write_file":                 true,
+			"edit_file":                  true,
 			"replace_file_content":       true,
 			"multi_replace_file_content": true,
 		}
@@ -302,6 +303,7 @@ func (h *Handler) handlePreToolUse(input HookInput) HookOutput {
 		writeTools := map[string]bool{
 			"write_to_file":              true,
 			"write_file":                 true,
+			"edit_file":                  true,
 			"replace_file_content":       true,
 			"multi_replace_file_content": true,
 		}
@@ -365,6 +367,7 @@ func (h *Handler) handlePostToolUse(input HookInput) HookOutput {
 	isWriteTool := toolName == "write_to_file" ||
 		toolName == "replace_file_content" ||
 		toolName == "write_file" ||
+		toolName == "edit_file" ||
 		toolName == "multi_replace_file_content"
 
 	if isWriteTool && filePath != "" {
