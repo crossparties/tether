@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/croosparties/tether/internal/adapter"
@@ -37,6 +38,8 @@ func main() {
 		cmdDoctor()
 	case "install":
 		cmdInstall()
+	case "proposal", "proposals":
+		cmdProposal(os.Args[2:])
 	case "run", "agent", "chat":
 		cmdRun(os.Args[2:])
 	case "version":
@@ -164,6 +167,144 @@ func cmdHook() {
 }
 
 // cmdMode inspects or toggles the execution mode (code | plan | review)
+// cmdProposal is the user's own key to the approval gate. It writes straight to
+// session.db and never goes through the model, so a decision cannot be forged or
+// skipped by the agent that is supposed to be asking for permission.
+func cmdProposal(args []string) {
+	workspace, err := core.DetectWorkspace(".")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	engine, err := core.NewEngine(workspace)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error initializing: %v\n", err)
+		os.Exit(1)
+	}
+	defer engine.Close()
+
+	if len(args) == 0 {
+		args = []string{"list"}
+	}
+
+	switch args[0] {
+	case "list", "ls":
+		proposals, err := engine.ListProposals("pending")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		if len(proposals) == 0 {
+			fmt.Println("No proposals awaiting approval. 🔓 Codebase writes are not blocked.")
+			return
+		}
+		fmt.Printf("🔒 %d proposal(s) awaiting your approval:\n\n", len(proposals))
+		for _, p := range proposals {
+			fmt.Printf("  #%d  %-18s %s\n", p.ID, p.Role, p.CreatedAt)
+			for _, line := range previewLines(p.Proposal, 3) {
+				fmt.Printf("       %s\n", line)
+			}
+			fmt.Println()
+		}
+		fmt.Println("Decide with:  tether proposal approve <id>   |   tether proposal reject <id>")
+
+	case "show":
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "usage: tether proposal show <id>")
+			os.Exit(1)
+		}
+		id, err := strconv.ParseInt(args[1], 10, 64)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "invalid proposal id %q\n", args[1])
+			os.Exit(1)
+		}
+		p, err := engine.GetProposalByID(id)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		if p == nil {
+			fmt.Fprintf(os.Stderr, "no proposal #%d\n", id)
+			os.Exit(1)
+		}
+		fmt.Printf("Proposal #%d\n", p.ID)
+		fmt.Printf("Role:   %s\n", p.Role)
+		fmt.Printf("Status: %s\n", p.Status)
+		fmt.Printf("Created: %s\n", p.CreatedAt)
+		fmt.Println(strings.Repeat("─", 60))
+		fmt.Println(p.Proposal)
+
+	case "approve", "reject":
+		verdict := args[0]
+		if len(args) < 2 {
+			fmt.Fprintf(os.Stderr, "usage: tether proposal %s <id|--all>\n", verdict)
+			os.Exit(1)
+		}
+
+		var affected int64
+		if args[1] == "--all" {
+			if verdict == "approve" {
+				affected, err = engine.ApproveProposal()
+			} else {
+				affected, err = engine.RejectProposal()
+			}
+		} else {
+			id, perr := strconv.ParseInt(args[1], 10, 64)
+			if perr != nil {
+				fmt.Fprintf(os.Stderr, "invalid proposal id %q\n", args[1])
+				os.Exit(1)
+			}
+			if verdict == "approve" {
+				affected, err = engine.ApproveProposalByID(id)
+			} else {
+				affected, err = engine.RejectProposalByID(id)
+			}
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		if affected == 0 {
+			fmt.Println("Nothing to decide — no pending proposal matched.")
+			return
+		}
+		icon, done := "✅", "approved"
+		if verdict == "reject" {
+			icon, done = "🚫", "rejected"
+		}
+		fmt.Printf("%s %d proposal(s) %s by you via CLI.\n", icon, affected, done)
+		fmt.Println("🔓 Codebase writes are no longer blocked.")
+
+	default:
+		fmt.Fprintf(os.Stderr, "unknown subcommand %q\n", args[0])
+		fmt.Fprintln(os.Stderr, "usage: tether proposal [list|show <id>|approve <id|--all>|reject <id|--all>]")
+		os.Exit(1)
+	}
+}
+
+// previewLines returns at most max non-empty lines from text, trimmed.
+func previewLines(text string, max int) []string {
+	var out []string
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if len(line) > 72 {
+			line = line[:72] + "…"
+		}
+		out = append(out, line)
+		if len(out) == max {
+			break
+		}
+	}
+	if len(out) == 0 {
+		out = []string{"(empty)"}
+	}
+	return out
+}
+
 func cmdMode() {
 	workspace, err := core.DetectWorkspace(".")
 	if err != nil {
@@ -297,6 +438,21 @@ func cmdStatus() {
 	}
 	fmt.Println("└─────────────────────────────────────────────────────────────────────────┘")
 	fmt.Println()
+
+	// A pending subagent proposal silently blocks every write. Never let the
+	// user discover that only when a mutation is refused mid-task.
+	if pending, perr := engine.ListProposals("pending"); perr == nil && len(pending) > 0 {
+		fmt.Printf("🔒 LOCKED: %d subagent proposal(s) awaiting your approval", len(pending))
+		if oldest := pending[0]; oldest.Role != "" {
+			fmt.Printf(" (oldest #%d from %s, %s)", oldest.ID, oldest.Role, oldest.CreatedAt)
+		}
+		fmt.Println()
+		fmt.Println("   Codebase writes are BLOCKED until you decide.")
+		fmt.Printf("   Review: tether proposal show %d\n", pending[0].ID)
+		fmt.Printf("   Decide: tether proposal approve %d  |  tether proposal reject %d\n", pending[0].ID, pending[0].ID)
+		fmt.Println()
+	}
+
 	if mode == "plan" {
 		fmt.Println("💡 Quick Action:  Run 'tether mode code' to unlock codebase mutation.")
 	} else {
@@ -461,6 +617,13 @@ func cmdRun(args []string) {
 		case "--base-url":
 			if i+1 < len(args) {
 				cfg.BaseURL = args[i+1]
+				i++
+			}
+		case "--max-steps":
+			if i+1 < len(args) {
+				if n, err := strconv.Atoi(args[i+1]); err == nil && n > 0 {
+					cfg.MaxSteps = n
+				}
 				i++
 			}
 		default:
