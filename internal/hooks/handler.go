@@ -4,19 +4,39 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/croosparties/tether/internal/core"
+	"github.com/croosparties/tether/internal/snapshot"
 )
 
 // Handler processes lifecycle hook events from agents
 type Handler struct {
-	engine *core.Engine
+	engine   *core.Engine
+	snapshot *snapshot.Store
 }
 
 func NewHandler(engine *core.Engine) *Handler {
-	return &Handler{engine: engine}
+	return &Handler{engine: engine, snapshot: snapshot.New(engine.Workspace)}
+}
+
+// captureBeforeWrite records the pre-write state of a file so the turn can be
+// undone. A failure here is reported but never blocks the write: the snapshot
+// exists to make mistakes recoverable, so it must not become a new way for
+// work to fail.
+func (h *Handler) captureBeforeWrite(filePath string) {
+	if filePath == "" || h.snapshot == nil {
+		return
+	}
+	turn, err := h.engine.GetProjectSetting("current_turn")
+	if err != nil || turn == "" {
+		return
+	}
+	if err := h.snapshot.Capture(turn, filePath); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not snapshot %s: %v\n", filePath, err)
+	}
 }
 
 // ToolCall represents the Antigravity/Gemini toolCall object
@@ -464,7 +484,11 @@ func (h *Handler) handlePreToolUse(input HookInput) HookOutput {
 	}
 
 	// 4. Main Agent in Code Mode:
-	// MCP calls (access to session.db) and dev tools are auto-approved for frictionless development
+	// MCP calls (access to session.db) and dev tools are auto-approved for frictionless development.
+	// Snapshot file writes first so the turn can be undone without git.
+	if isWriteTool(toolName) {
+		h.captureBeforeWrite(filePath)
+	}
 	return HookOutput{Decision: "allow", Reason: "Tether: main agent authorized"}
 }
 
@@ -508,3 +532,19 @@ func (h *Handler) handlePostToolUse(input HookInput) HookOutput {
 	return HookOutput{}
 }
 
+
+// writeToolNames are the tools that overwrite a single known file. sql_query,
+// session_save and the todo tools mutate state but have no single file to
+// snapshot, so they are deliberately excluded.
+var writeToolNames = map[string]bool{
+	"write_to_file":              true,
+	"write_file":                 true,
+	"edit_file":                  true,
+	"replace_file_content":       true,
+	"multi_replace_file_content": true,
+}
+
+// isWriteTool reports whether a tool writes to a single file path.
+func isWriteTool(name string) bool {
+	return writeToolNames[name]
+}

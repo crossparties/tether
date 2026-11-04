@@ -2,10 +2,13 @@ package hooks
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/croosparties/tether/internal/core"
+	"github.com/croosparties/tether/internal/snapshot"
 )
 
 func newTestEngine(t *testing.T) *core.Engine {
@@ -550,5 +553,85 @@ func TestGateReadsSnakeCaseToolCall(t *testing.T) {
 	}
 	if !strings.Contains(out, `"allow"`) {
 		t.Fatalf("ls should stay allowed, got %s", out)
+	}
+}
+
+// A file write must be snapshotted before it is allowed, so the turn can be
+// undone without relying on git.
+func TestPreToolUse_SnapshotsBeforeWrite(t *testing.T) {
+	e := newTestEngine(t)
+	h := NewHandler(e)
+	_ = e.SetMode("code")
+	if _, err := h.Handle("PreInvocation", strings.NewReader(`{"conversationId":"main-1"}`)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	target := filepath.Join(e.Workspace, "target.txt")
+	if err := os.WriteFile(target, []byte("original"), 0644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := e.SetProjectSetting("current_turn", "turn-test"); err != nil {
+		t.Fatalf("set turn: %v", err)
+	}
+
+	body := `{"tool_name":"write_file","tool_call":{"name":"write_file","args":{"path":"` +
+		filepath.ToSlash(target) + `","content":"changed"}}}`
+	out, err := h.Handle("PreToolUse", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if !strings.Contains(out, `"allow"`) {
+		t.Fatalf("expected allow, got %s", out)
+	}
+
+	// Simulate the write and then undo it.
+	if err := os.WriteFile(target, []byte("changed"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	store := snapshot.New(e.Workspace)
+	if _, err := store.Restore("turn-test", e.Workspace); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+
+	got, _ := os.ReadFile(target)
+	if string(got) != "original" {
+		t.Fatalf("after undo content = %q, want %q", got, "original")
+	}
+}
+
+// Snapshotting must never block a write: a missing turn or an unwritable
+// snapshot dir is a warning, not a denial.
+func TestPreToolUse_SnapshotFailureDoesNotBlockWrite(t *testing.T) {
+	e := newTestEngine(t)
+	h := NewHandler(e)
+	_ = e.SetMode("code")
+	if _, err := h.Handle("PreInvocation", strings.NewReader(`{"conversationId":"main-1"}`)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	// No current_turn set at all.
+	body := `{"tool_name":"write_file","tool_call":{"name":"write_file","args":{"path":"x/y.go","content":"package y"}}}`
+	out, err := h.Handle("PreToolUse", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if !strings.Contains(out, `"allow"`) {
+		t.Fatalf("write should stay allowed when snapshotting is unavailable, got %s", out)
+	}
+}
+
+// State tools have no single file to snapshot and must not attempt one.
+func TestIsWriteTool(t *testing.T) {
+	writes := []string{"write_file", "edit_file", "write_to_file", "replace_file_content", "multi_replace_file_content"}
+	for _, name := range writes {
+		if !isWriteTool(name) {
+			t.Errorf("%s should be treated as a file write", name)
+		}
+	}
+	notWrites := []string{"read_file", "run_command", "sql_query", "session_save", "todo_add"}
+	for _, name := range notWrites {
+		if isWriteTool(name) {
+			t.Errorf("%s must not be treated as a file write", name)
+		}
 	}
 }
