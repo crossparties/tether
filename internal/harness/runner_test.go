@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/croosparties/tether/internal/core"
+	"github.com/croosparties/tether/internal/ui"
 )
 
 func TestRunner_DeepSeekToolLoopAndPlanGuardrail(t *testing.T) {
@@ -222,7 +223,6 @@ func mustQuote(s string) string {
 	return string(b)
 }
 
-
 // The step budget must be configurable, and a project setting must win over the
 // built-in default so operators can tune it without a rebuild.
 func TestMaxStepsResolution(t *testing.T) {
@@ -304,5 +304,61 @@ func TestProducesMutation(t *testing.T) {
 		if got := producesMutation(tc.role, tc.output); got != tc.want {
 			t.Errorf("producesMutation(%q, ...) = %v, want %v", tc.role, got, tc.want)
 		}
+	}
+}
+
+// A write log and an approval request must be visually distinct. This pins the
+// distinction that the user reported missing: a diff printed after the fact
+// looked like a request for consent.
+func TestPrintToolActionLabelsWrite(t *testing.T) {
+	ui.SetEnabled(false)
+	t.Cleanup(ui.ClearOverride)
+
+	dir := t.TempDir()
+	e, err := core.NewEngine(dir)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	defer e.Close()
+
+	var buf bytes.Buffer
+	r := &Runner{engine: e, cfg: Config{Out: &buf}}
+	r.printToolAction("write_file", map[string]interface{}{
+		"path":    "internal/x.go",
+		"content": "package x\n",
+	})
+
+	out := buf.String()
+	if !strings.Contains(out, "WRITE") {
+		t.Fatalf("write log must be labelled WRITE, got:\n%s", out)
+	}
+	if strings.Contains(out, "APPROVAL") {
+		t.Fatalf("a write log must not claim to be an approval request:\n%s", out)
+	}
+	if !strings.Contains(out, "internal/x.go") {
+		t.Fatalf("write log must name the file:\n%s", out)
+	}
+}
+
+func TestPrintApprovalRequiredLabelsApproval(t *testing.T) {
+	ui.SetEnabled(false)
+	t.Cleanup(ui.ClearOverride)
+
+	var buf bytes.Buffer
+	r := &Runner{cfg: Config{Out: &buf}}
+	r.printApprovalRequired(7, "tether_qa", "some proposal")
+
+	out := buf.String()
+	if !strings.Contains(out, "APPROVAL REQUIRED") {
+		t.Fatalf("approval request must be labelled, got:\n%s", out)
+	}
+	if !strings.Contains(out, "#7") {
+		t.Fatalf("approval request must carry the proposal id, got:\n%s", out)
+	}
+	if !strings.Contains(out, "Nothing is written until you decide") {
+		t.Fatalf("approval request must state the consequence, got:\n%s", out)
+	}
+	if strings.Contains(out, "WRITE") {
+		t.Fatalf("an approval request must not look like a write log:\n%s", out)
 	}
 }

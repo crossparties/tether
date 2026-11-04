@@ -17,6 +17,7 @@ import (
 	"github.com/croosparties/tether/internal/core"
 	"github.com/croosparties/tether/internal/hooks"
 	"github.com/croosparties/tether/internal/mcp"
+	"github.com/croosparties/tether/internal/ui"
 )
 
 // Config holds Universal API Harness settings
@@ -220,6 +221,13 @@ func (r *Runner) Run(ctx context.Context, prompt string) (string, error) {
 	}
 
 	// 1. PreInvocation Hook: surgical context injection & task mode classification
+	// Mark the turn boundary so PreToolUse can snapshot the pre-write state of
+	// each file. Subagents share the parent's turn: their edits are part of the
+	// same undo unit.
+	if !r.isSubagent {
+		_ = r.engine.SetProjectSetting("current_turn", time.Now().UTC().Format("20060102T150405.000000000"))
+	}
+
 	preInvIn, _ := json.Marshal(hooks.HookInput{Prompt: prompt, AgentType: r.agentType, IsSubagent: r.isSubagent})
 	preInvRaw, _ := r.hooks.Handle("PreInvocation", bytes.NewReader(preInvIn))
 	var preInvOut hooks.HookOutput
@@ -434,19 +442,7 @@ func (r *Runner) runSubagent(args map[string]interface{}) string {
 	if recErr != nil {
 		fmt.Fprintf(r.cfg.Out, "⚠️  [subagent:%s] could not record proposal: %v\n", role, recErr)
 	} else {
-		// Speak to the user, not to the model: show what was proposed and how to
-		// decide, without leaking internal tool instructions into the terminal.
-		fmt.Fprintf(r.cfg.Out, "\n┌─ PROPOSAL #%d · %s ", proposalID, role)
-		fmt.Fprintf(r.cfg.Out, "%s\n", strings.Repeat("─", max(0, 44-len(role))))
-		for _, line := range firstLines(ans, 4) {
-			fmt.Fprintf(r.cfg.Out, "│ %s\n", line)
-		}
-		fmt.Fprintf(r.cfg.Out, "├───────────────────────────────────────────────────\n")
-		fmt.Fprintf(r.cfg.Out, "│ 🔒 Codebase writes are blocked until you decide.\n")
-		fmt.Fprintf(r.cfg.Out, "│ ✅ tether proposal approve %d\n", proposalID)
-		fmt.Fprintf(r.cfg.Out, "│ 🚫 tether proposal reject %d\n", proposalID)
-		fmt.Fprintf(r.cfg.Out, "│ 👁  tether proposal show %d\n", proposalID)
-		fmt.Fprintf(r.cfg.Out, "└───────────────────────────────────────────────────\n\n")
+		r.printApprovalRequired(proposalID, role, ans)
 	}
 
 	return fmt.Sprintf(
@@ -458,25 +454,30 @@ func (r *Runner) runSubagent(args map[string]interface{}) string {
 }
 
 func (r *Runner) printToolAction(name string, args map[string]interface{}) {
+	// File writes are labelled explicitly. A diff printed here reflects a
+	// change that is about to be applied automatically; it is a log, not a
+	// request for consent. Anything awaiting the user's decision is rendered by
+	// printApprovalRequired instead, so the two can never be confused.
 	switch name {
 	case "edit_file":
 		path, _ := args["path"].(string)
 		target, _ := args["target"].(string)
 		replacement, _ := args["replacement"].(string)
-		fmt.Fprintf(r.cfg.Out, "📝 [edit_file] %s\n", path)
+		fmt.Fprintf(r.cfg.Out, "%s %s\n", ui.Dim("WRITE"), ui.Path(path))
 		for _, line := range clipLines(target, 12) {
-			fmt.Fprintf(r.cfg.Out, "  \033[31m- %s\033[0m\n", line)
+			fmt.Fprintf(r.cfg.Out, "  %s\n", ui.DiffDel("- "+line))
 		}
 		for _, line := range clipLines(replacement, 12) {
-			fmt.Fprintf(r.cfg.Out, "  \033[32m+ %s\033[0m\n", line)
+			fmt.Fprintf(r.cfg.Out, "  %s\n", ui.DiffAdd("+ "+line))
 		}
 	case "write_file":
 		path, _ := args["path"].(string)
 		content, _ := args["content"].(string)
 		lines := strings.Split(strings.TrimSuffix(content, "\n"), "\n")
-		fmt.Fprintf(r.cfg.Out, "📝 [write_file] %s (%d lines)\n", path, len(lines))
+		fmt.Fprintf(r.cfg.Out, "%s %s %s\n",
+			ui.Dim("WRITE"), ui.Path(path), ui.Dim(fmt.Sprintf("(%d lines)", len(lines))))
 		for _, line := range clipLines(content, 8) {
-			fmt.Fprintf(r.cfg.Out, "  \033[32m+ %s\033[0m\n", line)
+			fmt.Fprintf(r.cfg.Out, "  %s\n", ui.DiffAdd("+ "+line))
 		}
 	case "read_file":
 		path, _ := args["path"].(string)
@@ -767,4 +768,24 @@ func producesMutation(role, output string) bool {
 		return hasActionable
 	}
 	return true
+}
+
+// printApprovalRequired renders a subagent proposal as an unmistakable request
+// for the user's decision. It must never look like the WRITE log that
+// printToolAction emits for an automatic change.
+func (r *Runner) printApprovalRequired(proposalID int64, role, summary string) {
+	preview := firstLines(summary, 4)
+
+	body := fmt.Sprintf("Role: %s\n\n", role)
+	body += strings.Join(preview, "\n")
+	if len(preview) == 4 {
+		body += "\n…"
+	}
+
+	fmt.Fprintf(r.cfg.Out, "\n%s\n", ui.Banner(
+		fmt.Sprintf("APPROVAL REQUIRED · PROPOSAL #%d", proposalID), body, ui.Warn))
+	fmt.Fprintf(r.cfg.Out, "%s\n", ui.Warn("   Nothing is written until you decide."))
+	fmt.Fprintf(r.cfg.Out, "   %s  %s\n", ui.Success("✅ tether proposal approve"), fmt.Sprint(proposalID))
+	fmt.Fprintf(r.cfg.Out, "   %s  %s\n", ui.Error("🚫 tether proposal reject"), fmt.Sprint(proposalID))
+	fmt.Fprintf(r.cfg.Out, "   %s  %s\n\n", ui.Dim("👁  tether proposal show"), fmt.Sprint(proposalID))
 }
