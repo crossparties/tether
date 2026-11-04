@@ -266,6 +266,9 @@ func (r *Runner) Run(ctx context.Context, prompt string) (string, error) {
 		if msg.ReasoningContent != "" {
 			fmt.Fprintf(r.cfg.Out, "💭 [reasoning] %s\n", strings.TrimSpace(msg.ReasoningContent))
 		}
+		if len(msg.ToolCalls) > 0 && strings.TrimSpace(msg.Content) != "" {
+			fmt.Fprintf(r.cfg.Out, "\n%s\n", strings.TrimSpace(msg.Content))
+		}
 		messages = append(messages, msg)
 
 		if len(msg.ToolCalls) == 0 {
@@ -330,12 +333,85 @@ func (r *Runner) executeGuardedTool(tc toolCall) string {
 		return "DENIED BY TETHER GUARD: " + preOut.Reason
 	}
 
-	fmt.Fprintf(r.cfg.Out, "🔧 [tool:%s]\n", tc.Function.Name)
-	res, _ := r.mcp.CallTool(tc.Function.Name, json.RawMessage(tc.Function.Arguments))
+	r.printToolAction(tc.Function.Name, argMap)
+	res, isErr := r.mcp.CallTool(tc.Function.Name, json.RawMessage(tc.Function.Arguments))
+	if tc.Function.Name == "edit_file" || tc.Function.Name == "write_file" {
+		if isErr {
+			fmt.Fprintf(r.cfg.Out, "  ✖ %s\n", res)
+		} else {
+			fmt.Fprintf(r.cfg.Out, "  ↳ %s\n", res)
+		}
+	}
 
 	// PostToolUse Auditor
 	_, _ = r.hooks.Handle("PostToolUse", mustJSONReader(hookIn))
 	return res
+}
+
+func (r *Runner) printToolAction(name string, args map[string]interface{}) {
+	switch name {
+	case "edit_file":
+		path, _ := args["path"].(string)
+		target, _ := args["target"].(string)
+		replacement, _ := args["replacement"].(string)
+		fmt.Fprintf(r.cfg.Out, "📝 [edit_file] %s\n", path)
+		for _, line := range clipLines(target, 12) {
+			fmt.Fprintf(r.cfg.Out, "  \033[31m- %s\033[0m\n", line)
+		}
+		for _, line := range clipLines(replacement, 12) {
+			fmt.Fprintf(r.cfg.Out, "  \033[32m+ %s\033[0m\n", line)
+		}
+	case "write_file":
+		path, _ := args["path"].(string)
+		content, _ := args["content"].(string)
+		lines := strings.Split(strings.TrimSuffix(content, "\n"), "\n")
+		fmt.Fprintf(r.cfg.Out, "📝 [write_file] %s (%d lines)\n", path, len(lines))
+		for _, line := range clipLines(content, 8) {
+			fmt.Fprintf(r.cfg.Out, "  \033[32m+ %s\033[0m\n", line)
+		}
+	case "read_file":
+		path, _ := args["path"].(string)
+		if s, ok := args["start_line"].(float64); ok && s > 0 {
+			e, _ := args["end_line"].(float64)
+			fmt.Fprintf(r.cfg.Out, "🔧 [read_file] %s (lines %.0f-%.0f)\n", path, s, e)
+		} else {
+			fmt.Fprintf(r.cfg.Out, "🔧 [read_file] %s\n", path)
+		}
+	case "run_command":
+		cmd, _ := args["command"].(string)
+		fmt.Fprintf(r.cfg.Out, "🔧 [run_command] $ %s\n", cmd)
+	case "kb_search":
+		q, _ := args["query"].(string)
+		fmt.Fprintf(r.cfg.Out, "🔧 [kb_search] %q\n", q)
+	case "kb_index":
+		p, _ := args["path"].(string)
+		fmt.Fprintf(r.cfg.Out, "🔧 [kb_index] %s\n", p)
+	case "sql_query":
+		q, _ := args["query"].(string)
+		fmt.Fprintf(r.cfg.Out, "🔧 [sql_query] %s\n", q)
+	case "decision_add":
+		t, _ := args["topic"].(string)
+		d, _ := args["decision"].(string)
+		fmt.Fprintf(r.cfg.Out, "🔧 [decision_add] [%s] %s\n", t, d)
+	case "pattern_add":
+		t, _ := args["type"].(string)
+		d, _ := args["description"].(string)
+		fmt.Fprintf(r.cfg.Out, "🔧 [pattern_add] [%s] %s\n", t, d)
+	case "todo_add":
+		d, _ := args["description"].(string)
+		fmt.Fprintf(r.cfg.Out, "🔧 [todo_add] %s\n", d)
+	default:
+		fmt.Fprintf(r.cfg.Out, "🔧 [tool:%s]\n", name)
+	}
+}
+
+func clipLines(s string, max int) []string {
+	lines := strings.Split(strings.TrimSuffix(strings.ReplaceAll(s, "\r\n", "\n"), "\n"), "\n")
+	if len(lines) > max {
+		out := append([]string{}, lines[:max]...)
+		return append(out, fmt.Sprintf("... (%d more lines)", len(lines)-max))
+	}
+	return lines
 }
 
 func (r *Runner) callAPI(ctx context.Context, messages []chatMessage, tools []openAITool) (chatMessage, error) {
