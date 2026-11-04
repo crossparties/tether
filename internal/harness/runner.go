@@ -142,22 +142,25 @@ func SaveAPIKey(provider, key string) error {
 
 // Runner executes the Tether-anchored autonomous agent loop for any LLM API
 type Runner struct {
-	engine  *core.Engine
-	hooks   *hooks.Handler
-	mcp     *mcp.Server
-	cfg     Config
-	client  *http.Client
-	history []chatMessage
+	engine     *core.Engine
+	hooks      *hooks.Handler
+	mcp        *mcp.Server
+	cfg        Config
+	client     *http.Client
+	history    []chatMessage
+	agentType  string
+	isSubagent bool
 }
 
 func NewRunner(engine *core.Engine, cfg Config) *Runner {
 	bootstrapSubstrate(engine)
 	return &Runner{
-		engine: engine,
-		hooks:  hooks.NewHandler(engine),
-		mcp:    mcp.NewServer(engine),
-		cfg:    ResolveConfig(engine, cfg),
-		client: &http.Client{Timeout: 120 * time.Second},
+		engine:    engine,
+		hooks:     hooks.NewHandler(engine),
+		mcp:       mcp.NewServer(engine),
+		cfg:       ResolveConfig(engine, cfg),
+		client:    &http.Client{Timeout: 120 * time.Second},
+		agentType: "main",
 	}
 }
 
@@ -210,20 +213,25 @@ func (r *Runner) Run(ctx context.Context, prompt string) (string, error) {
 	}
 
 	// 1. PreInvocation Hook: surgical context injection & task mode classification
-	preInvIn, _ := json.Marshal(hooks.HookInput{Prompt: prompt, AgentType: "main"})
+	preInvIn, _ := json.Marshal(hooks.HookInput{Prompt: prompt, AgentType: r.agentType, IsSubagent: r.isSubagent})
 	preInvRaw, _ := r.hooks.Handle("PreInvocation", bytes.NewReader(preInvIn))
 	var preInvOut hooks.HookOutput
 	_ = json.Unmarshal([]byte(preInvRaw), &preInvOut)
 
 	sysPrompt := "You are an autonomous coding agent anchored by Tether. Follow workspace guardrails strictly."
+	if r.isSubagent {
+		sysPrompt = fmt.Sprintf("You are subagent %q (SPECIALIST WORKER). You MUST NOT mutate files directly (write_file, edit_file, and mutative shell commands are blocked by Tether Guard). Analyze the codebase using read_file/kb_search and return your proposed diff and findings to the Main Agent.", r.agentType)
+	}
 	if len(preInvOut.InjectSteps) > 0 && preInvOut.InjectSteps[0].EphemeralMessage != "" {
 		sysPrompt += "\n\n" + preInvOut.InjectSteps[0].EphemeralMessage
 	}
 
-	_ = r.engine.AddContext(r.cfg.Provider, "user", prompt)
+	if !r.isSubagent {
+		_ = r.engine.AddContext(r.cfg.Provider, "user", prompt)
+	}
 
 	var messages []chatMessage
-	if len(r.history) == 0 {
+	if len(r.history) == 0 || r.isSubagent {
 		messages = []chatMessage{
 			{Role: "system", Content: sysPrompt},
 			{Role: "user", Content: prompt},
@@ -249,6 +257,23 @@ func (r *Runner) Run(ctx context.Context, prompt string) (string, error) {
 				Name:        t.Name,
 				Description: t.Description,
 				Parameters:  t.InputSchema,
+			},
+		})
+	}
+	if !r.isSubagent {
+		apiTools = append(apiTools, openAITool{
+			Type: "function",
+			Function: openAIFunction{
+				Name:        "spawn_subagent",
+				Description: "Spawn a specialist worker subagent (tether_architect, tether_qa, tether_frontend, tether_product). Subagents are restricted by Tether Guard to read-only analysis and diff drafting; they return their proposal to you (Main Agent).",
+				Parameters: mcp.InputSchema{
+					Type: "object",
+					Properties: map[string]mcp.Property{
+						"role": {Type: "string", Description: "Subagent role: tether_architect | tether_qa | tether_frontend | tether_product"},
+						"task": {Type: "string", Description: "Clear task instructions for the subagent"},
+					},
+					Required: []string{"role", "task"},
+				},
 			},
 		})
 	}
@@ -312,10 +337,15 @@ func (r *Runner) executeGuardedTool(tc toolCall) string {
 	var argMap map[string]interface{}
 	_ = json.Unmarshal([]byte(tc.Function.Arguments), &argMap)
 
+	if tc.Function.Name == "spawn_subagent" && !r.isSubagent {
+		return r.runSubagent(argMap)
+	}
+
 	hookIn := hooks.HookInput{
-		ToolName:  tc.Function.Name,
-		AgentType: "main",
-		ToolCall:  &hooks.ToolCall{Name: tc.Function.Name, Args: argMap},
+		ToolName:   tc.Function.Name,
+		AgentType:  r.agentType,
+		IsSubagent: r.isSubagent,
+		ToolCall:   &hooks.ToolCall{Name: tc.Function.Name, Args: argMap},
 	}
 	if cmd, ok := argMap["command"].(string); ok {
 		hookIn.Command = cmd
@@ -329,7 +359,7 @@ func (r *Runner) executeGuardedTool(tc toolCall) string {
 	var preOut hooks.HookOutput
 	_ = json.Unmarshal([]byte(preRaw), &preOut)
 	if preOut.Decision == "deny" {
-		fmt.Fprintf(r.cfg.Out, "🛑 [Tether Guard Blocked %s] %s\n", tc.Function.Name, preOut.Reason)
+		fmt.Fprintf(r.cfg.Out, "🛑 [Tether Guard Blocked %s (%s)] %s\n", tc.Function.Name, r.agentType, preOut.Reason)
 		return "DENIED BY TETHER GUARD: " + preOut.Reason
 	}
 
@@ -346,6 +376,39 @@ func (r *Runner) executeGuardedTool(tc toolCall) string {
 	// PostToolUse Auditor
 	_, _ = r.hooks.Handle("PostToolUse", mustJSONReader(hookIn))
 	return res
+}
+
+func (r *Runner) runSubagent(args map[string]interface{}) string {
+	role, _ := args["role"].(string)
+	task, _ := args["task"].(string)
+	if role == "" {
+		role = "tether_architect"
+	}
+	if strings.TrimSpace(task) == "" {
+		return "invalid params: task is required for spawn_subagent"
+	}
+
+	fmt.Fprintf(r.cfg.Out, "\n🤖 [spawn_subagent:%s] Task: %s\n", role, task)
+	subCfg := r.cfg
+	subCfg.MaxSteps = 12
+	subRunner := &Runner{
+		engine:     r.engine,
+		hooks:      r.hooks,
+		mcp:        r.mcp,
+		cfg:        subCfg,
+		client:     r.client,
+		agentType:  role,
+		isSubagent: true,
+	}
+
+	ans, err := subRunner.Run(context.Background(), task)
+	if err != nil {
+		fmt.Fprintf(r.cfg.Out, "🤖 [subagent:%s error] %v\n", role, err)
+		return fmt.Sprintf("subagent %s error: %v", role, err)
+	}
+	fmt.Fprintf(r.cfg.Out, "🤖 [subagent:%s completed] Returned proposal to Main Agent.\n\n", role)
+	_ = r.engine.AddContext(role, "plan", ans)
+	return fmt.Sprintf("[Subagent %s Report]:\n%s", role, ans)
 }
 
 func (r *Runner) printToolAction(name string, args map[string]interface{}) {
