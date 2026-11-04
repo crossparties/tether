@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -40,8 +41,11 @@ func DetectGitBranch(workspace string) string {
 	return "default"
 }
 
-// SchemaVersion tracks the database schema version for fast-path startup
-const SchemaVersion = 2
+// SchemaVersion tracks the database schema version for fast-path startup.
+// Bump this whenever the migrate() schema gains a table: migrate() exits early
+// when PRAGMA user_version >= SchemaVersion, so a new CREATE TABLE without a
+// bump is silently never executed on existing databases.
+const SchemaVersion = 3
 
 // NewEngine creates a new engine for the given workspace with optimized SQLite connection
 func NewEngine(workspace string) (*Engine, error) {
@@ -116,12 +120,51 @@ func (e *Engine) Close() error {
 	return nil
 }
 
+// requiredTables lists every table migrate() is responsible for. The fast path
+// only trusts PRAGMA user_version when these all actually exist, so a database
+// whose version was bumped without its DDL running gets repaired instead of
+// silently staying broken.
+var requiredTables = []string{
+	"sessions",
+	"session_context",
+	"decisions",
+	"learned_patterns",
+	"project_settings",
+	"kb_documents",
+	"todos",
+	"pending_proposals",
+}
+
+// missingTables returns the required tables absent from the database.
+func (e *Engine) missingTables() ([]string, error) {
+	var missing []string
+	for _, table := range requiredTables {
+		var name string
+		err := e.DB.QueryRow(
+			"SELECT name FROM sqlite_master WHERE type='table' AND name = ?", table).Scan(&name)
+		if err == sql.ErrNoRows {
+			missing = append(missing, table)
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	return missing, nil
+}
+
 // migrate creates all required tables (fast-paths if schema is already up-to-date)
 func (e *Engine) migrate() error {
 	var currentVersion int
 	_ = e.DB.QueryRow("PRAGMA user_version;").Scan(&currentVersion)
 	if currentVersion >= SchemaVersion {
-		return nil // fast path: schema is up to date, skip DDL overhead
+		// Fast path is only safe when the schema it claims to describe actually
+		// exists. A version bump without matching DDL (or a partially created
+		// database) must be repaired rather than trusted.
+		missing, err := e.missingTables()
+		if err == nil && len(missing) == 0 {
+			return nil
+		}
 	}
 
 	schema := `
@@ -209,6 +252,16 @@ func (e *Engine) migrate() error {
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		completed_at DATETIME
 	);
+
+	CREATE TABLE IF NOT EXISTS pending_proposals (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		session_id TEXT,
+		role TEXT DEFAULT '',
+		proposal TEXT DEFAULT '',
+		status TEXT DEFAULT 'pending',
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		approved_at DATETIME
+	);
 	`
 	if _, err := e.DB.Exec(schema); err != nil {
 		return err
@@ -220,6 +273,7 @@ func (e *Engine) migrate() error {
 	_, _ = e.DB.Exec("ALTER TABLE decisions ADD COLUMN git_branch TEXT DEFAULT 'default';")
 	_, _ = e.DB.Exec("ALTER TABLE todos ADD COLUMN git_branch TEXT DEFAULT 'default';")
 	_, _ = e.DB.Exec("ALTER TABLE todos ADD COLUMN version INTEGER DEFAULT 1;")
+	_, _ = e.DB.Exec("ALTER TABLE pending_proposals ADD COLUMN expires_at DATETIME;")
 
 	// Record schema version to fast-path all subsequent runs
 	_, _ = e.DB.Exec(fmt.Sprintf("PRAGMA user_version = %d;", SchemaVersion))
@@ -348,6 +402,208 @@ func (e *Engine) GetRecentContext(limit int) ([]ContextEntry, error) {
 		entries = append(entries, entry)
 	}
 	return entries, nil
+}
+
+// --- Subagent Proposal Approval ---
+
+// ProposalRecord describes a proposal a subagent returned to the Main Agent.
+type ProposalRecord struct {
+	ID         int64  `json:"id"`
+	SessionID  string `json:"session_id"`
+	Role       string `json:"role"`
+	Proposal   string `json:"proposal"`
+	Status     string `json:"status"`
+	CreatedAt  string `json:"created_at"`
+	ApprovedAt string `json:"approved_at,omitempty"`
+}
+
+// RecordProposal persists a subagent proposal so the Main Agent cannot mutate
+// the codebase until the user approves it.
+func (e *Engine) RecordProposal(role, proposal string) (int64, error) {
+	// expires_at is the safety valve: an abandoned proposal must not lock the
+	// workspace forever. The operator can raise or lower it via the
+	// proposal_ttl_minutes setting.
+	ttl := e.proposalTTLMinutes()
+	res, err := e.DB.Exec(`
+		INSERT INTO pending_proposals (session_id, role, proposal, status, expires_at)
+		VALUES (?, ?, ?, 'pending', datetime('now', ?))`,
+		e.SessionID, role, proposal, fmt.Sprintf("+%d minutes", ttl))
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// DefaultProposalTTLMinutes is how long an undecided proposal blocks writes.
+const DefaultProposalTTLMinutes = 120
+
+// proposalTTLMinutes resolves the proposal lifetime, defaulting when unset.
+func (e *Engine) proposalTTLMinutes() int {
+	if v, err := e.GetProjectSetting("proposal_ttl_minutes"); err == nil && v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return DefaultProposalTTLMinutes
+}
+
+// ExpireStaleProposals retires proposals past their TTL and reports how many it
+// retired. It is called before every gate read so the block always reflects a
+// live decision.
+func (e *Engine) ExpireStaleProposals() (int64, error) {
+	res, err := e.DB.Exec(`
+		UPDATE pending_proposals SET status = 'expired'
+		WHERE status = 'pending' AND expires_at IS NOT NULL AND expires_at <= datetime('now')`)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// GetPendingProposal returns the oldest live proposal for this session, or nil
+// when none. Expired proposals are retired first, and rows written before
+// session scoping (or belonging to another session) never block this one.
+func (e *Engine) GetPendingProposal() (*ProposalRecord, error) {
+	_, _ = e.ExpireStaleProposals()
+	row := e.DB.QueryRow(`
+		SELECT id, session_id, role, proposal, status, created_at
+		FROM pending_proposals
+		WHERE status = 'pending'
+		  AND (session_id = '' OR session_id IS NULL OR session_id = ?)
+		ORDER BY id ASC LIMIT 1`, e.SessionID)
+	var p ProposalRecord
+	if err := row.Scan(&p.ID, &p.SessionID, &p.Role, &p.Proposal, &p.Status, &p.CreatedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &p, nil
+}
+
+// ListProposals returns proposals in the given status ("" = all), newest last.
+func (e *Engine) ListProposals(status string) ([]ProposalRecord, error) {
+	// Keep the listing honest: retire anything past its TTL before reporting,
+	// otherwise an expired proposal keeps looking actionable.
+	if status == "pending" || status == "" {
+		_, _ = e.ExpireStaleProposals()
+	}
+	query := `SELECT id, session_id, role, proposal, status, created_at FROM pending_proposals`
+	var args []interface{}
+	if status != "" {
+		query += ` WHERE status = ?`
+		args = append(args, status)
+	}
+	query += ` ORDER BY id ASC`
+
+	rows, err := e.DB.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ProposalRecord
+	for rows.Next() {
+		var p ProposalRecord
+		if err := rows.Scan(&p.ID, &p.SessionID, &p.Role, &p.Proposal, &p.Status, &p.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// GetProposalByID returns a single proposal, or nil when it does not exist.
+func (e *Engine) GetProposalByID(id int64) (*ProposalRecord, error) {
+	row := e.DB.QueryRow(`
+		SELECT id, session_id, role, proposal, status, created_at
+		FROM pending_proposals WHERE id = ?`, id)
+	var p ProposalRecord
+	if err := row.Scan(&p.ID, &p.SessionID, &p.Role, &p.Proposal, &p.Status, &p.CreatedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &p, nil
+}
+
+// ApproveProposalByID approves exactly one proposal, leaving others untouched.
+// The decision is recorded in the session context so the audit trail survives
+// the proposal row itself.
+func (e *Engine) ApproveProposalByID(id int64) (int64, error) {
+	return e.resolveProposalByID(id, "approved", "cli")
+}
+
+// resolveProposalByID applies a verdict to one proposal and journals it.
+func (e *Engine) resolveProposalByID(id int64, status, source string) (int64, error) {
+	p, err := e.GetProposalByID(id)
+	if err != nil {
+		return 0, err
+	}
+	if p == nil || p.Status != "pending" {
+		return 0, nil
+	}
+
+	res, err := e.DB.Exec(`
+		UPDATE pending_proposals
+		SET status = ?, approved_at = CURRENT_TIMESTAMP
+		WHERE id = ? AND status = 'pending'`, status, id)
+	if err != nil {
+		return 0, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil || affected == 0 {
+		return affected, err
+	}
+
+	summary := p.Proposal
+	if len(summary) > 200 {
+		summary = summary[:200] + "…"
+	}
+	_ = e.AddContext("tether", "decision", fmt.Sprintf(
+		"Proposal #%d from %s %s by %s: %s", p.ID, p.Role, status, source, summary))
+	return affected, nil
+}
+
+// RejectProposalByID rejects exactly one proposal, leaving others untouched.
+func (e *Engine) RejectProposalByID(id int64) (int64, error) {
+	return e.resolveProposalByID(id, "rejected", "cli")
+}
+
+// ApproveProposal marks every pending proposal as approved by the user.
+func (e *Engine) ApproveProposal() (int64, error) {
+	res, err := e.DB.Exec(`
+		UPDATE pending_proposals
+		SET status = 'approved', approved_at = CURRENT_TIMESTAMP
+		WHERE status = 'pending'`)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// RejectProposal marks every pending proposal as rejected.
+func (e *Engine) RejectProposal() (int64, error) {
+	res, err := e.DB.Exec(`
+		UPDATE pending_proposals
+		SET status = 'rejected'
+		WHERE status = 'pending'`)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// ProposalGateBlocked reports whether a write must be refused because a
+// subagent proposal is still awaiting user approval. Mutation is gated in Code
+// mode and in Plan mode alike; only an explicit approval lifts it.
+func (e *Engine) ProposalGateBlocked() (bool, *ProposalRecord, error) {
+	p, err := e.GetPendingProposal()
+	if err != nil {
+		return false, nil, err
+	}
+	return p != nil, p, nil
 }
 
 // --- Project Settings ---
