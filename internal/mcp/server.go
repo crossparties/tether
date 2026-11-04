@@ -979,7 +979,8 @@ func (s *Server) toolWriteFile(args json.RawMessage) (string, bool) {
 	if err := os.WriteFile(fullPath, []byte(params.Content), 0644); err != nil {
 		return err.Error(), true
 	}
-	return fmt.Sprintf("wrote %d bytes to %s", len(params.Content), params.Path), false
+	_ = s.engine.IndexFile(fullPath)
+	return fmt.Sprintf("wrote %d bytes to %s%s", len(params.Content), params.Path, s.autoVerifyGo(fullPath)), false
 }
 
 func (s *Server) toolEditFile(args json.RawMessage) (string, bool) {
@@ -1003,10 +1004,28 @@ func (s *Server) toolEditFile(args json.RawMessage) (string, bool) {
 	if err := os.WriteFile(fullPath, []byte(updated), 0644); err != nil {
 		return err.Error(), true
 	}
-	return fmt.Sprintf("edited %s (match:%s)", params.Path, tier), false
+	_ = s.engine.IndexFile(fullPath)
+	return fmt.Sprintf("edited %s (match:%s)%s", params.Path, tier, s.autoVerifyGo(fullPath)), false
 }
 
-// applyFuzzyEdit implements a 3-Tier surgical matcher:
+func (s *Server) autoVerifyGo(fullPath string) string {
+	if !strings.HasSuffix(fullPath, ".go") {
+		return ""
+	}
+	if _, err := os.Stat(filepath.Join(s.engine.Workspace, "go.mod")); err != nil {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "go", "vet", "./...")
+	cmd.Dir = s.engine.Workspace
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "\n⚠ go vet failed:\n" + strings.TrimSpace(string(out))
+	}
+	return " | ✓ go vet passed"
+}
+
 // applyFuzzyEdit implements a 3-Tier surgical matcher:
 // Tier 1: Unique exact substring match (with ambiguity guard)
 // Tier 2: Unique CRLF-normalized match (with ambiguity guard)

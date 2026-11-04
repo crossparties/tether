@@ -143,11 +143,24 @@ func (h *Handler) handlePreInvocation(input HookInput) HookOutput {
 		context += fmt.Sprintf("- Session summary: %s\n", summary)
 	}
 
-	recent, _ := h.engine.GetRecentContext(5)
-	if len(recent) > 0 {
+	recent, _ := h.engine.GetRecentContext(50)
+	var meaningful []core.ContextEntry
+	for _, entry := range recent {
+		if entry.Role != "tool_use" {
+			meaningful = append(meaningful, entry)
+			if len(meaningful) >= 6 {
+				break
+			}
+		}
+	}
+	if len(meaningful) > 0 {
 		context += "\n### Recent Session Context\n"
-		for _, entry := range recent {
-			context += fmt.Sprintf("- [%s/%s] %s\n", entry.Agent, entry.Role, entry.Content)
+		for _, entry := range meaningful {
+			text := entry.Content
+			if runes := []rune(text); len(runes) > 300 {
+				text = string(runes[:300]) + "..."
+			}
+			context += fmt.Sprintf("- [%s/%s] %s\n", entry.Agent, entry.Role, text)
 		}
 	}
 
@@ -281,8 +294,7 @@ func (h *Handler) handlePreToolUse(input HookInput) HookOutput {
 		}
 
 		if toolName == "run_command" || toolName == "bash" {
-			cmdLower := strings.ToLower(command)
-			sanitized := strings.ReplaceAll(cmdLower, "2>&1", "")
+			sanitized := sanitizeRedirections(strings.ToLower(command))
 			mutativeSignals := []string{">", ">>", "sed -i", "rm ", "mv ", "git checkout", "git reset", "git push", "mkdir "}
 			for _, sig := range mutativeSignals {
 				if strings.Contains(sanitized, sig) {
@@ -332,8 +344,7 @@ func (h *Handler) handlePreToolUse(input HookInput) HookOutput {
 
 		// Shell mutative command risk tiering
 		if toolName == "run_command" || toolName == "bash" {
-			cmd := strings.ToLower(command)
-			sanitized := strings.ReplaceAll(cmd, "2>&1", "")
+			sanitized := sanitizeRedirections(strings.ToLower(command))
 			mutativeSignals := []string{">", ">>", "sed -i", "rm ", "mv ", "git checkout", "git reset", "git push"}
 			for _, sig := range mutativeSignals {
 				if strings.Contains(sanitized, sig) {
@@ -349,6 +360,13 @@ func (h *Handler) handlePreToolUse(input HookInput) HookOutput {
 	// 4. Main Agent in Code Mode:
 	// MCP calls (access to session.db) and dev tools are auto-approved for frictionless development
 	return HookOutput{Decision: "allow", Reason: "Tether: main agent authorized"}
+}
+
+func sanitizeRedirections(cmd string) string {
+	for _, r := range []string{"2>&1", ">/dev/null", "> /dev/null"} {
+		cmd = strings.ReplaceAll(cmd, r, "")
+	}
+	return cmd
 }
 
 // handlePostToolUse logs tool usage + tracks modified files to session

@@ -554,11 +554,19 @@ func (e *Engine) IndexFile(filePath string) error {
 // IndexDirectory indexes all files in a directory recursively
 func (e *Engine) IndexDirectory(dirPath string, extensions []string) (int, error) {
 	count := 0
-	err := filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
+	// Clean the root so ".", "./", and trailing slashes normalize consistently.
+	// Without this, walking "." yields a root whose Base() is "." and the
+	// hidden-dir skip below would SkipDir on the root itself, indexing nothing.
+	root := filepath.Clean(dirPath)
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil // skip errors
 		}
 		if info.IsDir() {
+			// Never skip the root we were asked to index.
+			if path == root {
+				return nil
+			}
 			// Skip hidden dirs and common non-source dirs
 			base := filepath.Base(path)
 			if strings.HasPrefix(base, ".") || base == "node_modules" || base == "vendor" || base == "__pycache__" {

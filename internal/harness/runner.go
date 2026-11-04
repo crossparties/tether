@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -99,7 +100,7 @@ func ResolveConfig(engine *core.Engine, cfg Config) Config {
 		cfg.APIKey = loadSavedKey(cfg.Provider)
 	}
 	if cfg.MaxSteps <= 0 {
-		cfg.MaxSteps = 15
+		cfg.MaxSteps = 35
 	}
 	if cfg.Out == nil {
 		cfg.Out = os.Stdout
@@ -146,15 +147,29 @@ type Runner struct {
 	mcp     *mcp.Server
 	cfg     Config
 	client  *http.Client
+	history []chatMessage
 }
 
 func NewRunner(engine *core.Engine, cfg Config) *Runner {
+	bootstrapSubstrate(engine)
 	return &Runner{
 		engine: engine,
 		hooks:  hooks.NewHandler(engine),
 		mcp:    mcp.NewServer(engine),
 		cfg:    ResolveConfig(engine, cfg),
 		client: &http.Client{Timeout: 120 * time.Second},
+	}
+}
+
+// bootstrapSubstrate ensures project settings and FTS5 KB are populated on first launch
+func bootstrapSubstrate(engine *core.Engine) {
+	if settings, err := engine.GetAllProjectSettings(); err == nil && len(settings) == 0 {
+		for k, v := range core.DetectProjectSettings(engine.Workspace) {
+			_ = engine.SetProjectSetting(k, v)
+		}
+	}
+	if stats, err := engine.KBStatus(); err == nil && stats.TotalFiles == 0 {
+		_, _ = engine.IndexDirectory(engine.Workspace, []string{"go", "md", "py", "js", "ts", "java", "rs"})
 	}
 }
 
@@ -207,9 +222,23 @@ func (r *Runner) Run(ctx context.Context, prompt string) (string, error) {
 
 	_ = r.engine.AddContext(r.cfg.Provider, "user", prompt)
 
-	messages := []chatMessage{
-		{Role: "system", Content: sysPrompt},
-		{Role: "user", Content: prompt},
+	var messages []chatMessage
+	if len(r.history) == 0 {
+		messages = []chatMessage{
+			{Role: "system", Content: sysPrompt},
+			{Role: "user", Content: prompt},
+		}
+	} else {
+		messages = make([]chatMessage, len(r.history))
+		copy(messages, r.history)
+		messages[0] = chatMessage{Role: "system", Content: sysPrompt}
+		// Strip prior-turn reasoning_content before starting a new user turn (DeepSeek API spec)
+		for i := range messages {
+			if messages[i].Role == "assistant" {
+				messages[i].ReasoningContent = ""
+			}
+		}
+		messages = append(messages, chatMessage{Role: "user", Content: prompt})
 	}
 
 	var apiTools []openAITool
@@ -224,9 +253,11 @@ func (r *Runner) Run(ctx context.Context, prompt string) (string, error) {
 		})
 	}
 
+	keepTurns, maxRunes := r.compactionLimits()
+
 	// 2. Agentic Tool-Execution Loop
 	for step := 0; step < r.cfg.MaxSteps; step++ {
-		messages = compactMessages(messages)
+		messages = compactMessagesWithLimits(messages, keepTurns, maxRunes)
 		msg, err := r.callAPI(ctx, messages, apiTools)
 		if err != nil {
 			return "", err
@@ -238,6 +269,7 @@ func (r *Runner) Run(ctx context.Context, prompt string) (string, error) {
 		messages = append(messages, msg)
 
 		if len(msg.ToolCalls) == 0 {
+			r.history = compactMessagesWithLimits(messages, keepTurns, maxRunes)
 			_ = r.engine.AddContext(r.cfg.Provider, "assistant", msg.Content)
 			return msg.Content, nil
 		}
@@ -252,7 +284,25 @@ func (r *Runner) Run(ctx context.Context, prompt string) (string, error) {
 		}
 	}
 
-	return "", fmt.Errorf("exceeded max agent steps (%d)", r.cfg.MaxSteps)
+	r.history = compactMessagesWithLimits(messages, keepTurns, maxRunes)
+	_ = r.engine.AddContext(r.cfg.Provider, "assistant", fmt.Sprintf("[paused after %d tool steps — type 'continue' to resume]", r.cfg.MaxSteps))
+	return "", fmt.Errorf("paused after %d steps (type 'continue' or 'lanjutkan' to resume)", r.cfg.MaxSteps)
+}
+
+func (r *Runner) compactionLimits() (int, int) {
+	keepTurns := 2
+	maxRunes := 800
+	if v, err := r.engine.GetProjectSetting("keep_assistant_turns"); err == nil && v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			keepTurns = n
+		}
+	}
+	if v, err := r.engine.GetProjectSetting("max_stale_tool_runes"); err == nil && v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 200 {
+			maxRunes = n
+		}
+	}
+	return keepTurns, maxRunes
 }
 
 func (r *Runner) executeGuardedTool(tc toolCall) string {
@@ -404,29 +454,36 @@ func (r *Runner) RunInteractive(ctx context.Context, in io.Reader) error {
 				}
 				continue
 			case "/status":
-				fmt.Fprintf(r.cfg.Out, "Workspace: %s | Session: %s | Mode: %s | Provider: %s (%s)\n",
-					r.engine.Workspace, r.engine.SessionID, r.engine.GetMode(), r.cfg.Provider, r.cfg.Model)
+				kbStats, _ := r.engine.KBStatus()
+				fmt.Fprintf(r.cfg.Out, "Workspace: %s | Session: %s | Mode: %s | KB: %d files | Provider: %s (%s)\n",
+					r.engine.Workspace, r.engine.SessionID, r.engine.GetMode(), kbStats.TotalFiles, r.cfg.Provider, r.cfg.Model)
+				continue
+			case "/clear":
+				r.history = nil
+				fmt.Fprintln(r.cfg.Out, "✓ Conversation history cleared (substrate memory in session.db retained).")
 				continue
 			}
 		}
 
 		ans, err := r.Run(ctx, line)
 		if err != nil {
-			fmt.Fprintf(r.cfg.Out, "✖ Error: %v\n\n", err)
+			fmt.Fprintf(r.cfg.Out, "✖ %v\n\n", err)
 			continue
 		}
 		fmt.Fprintf(r.cfg.Out, "\n%s\n\n", ans)
 	}
 }
 
-// compactMessages implements surgical turn-aware context management:
-// - Keeps system prompt (idx 0), user prompt (idx 1), and the last 2 full assistant turns
+func compactMessages(messages []chatMessage) []chatMessage {
+	return compactMessagesWithLimits(messages, 2, 800)
+}
+
+// compactMessagesWithLimits implements surgical turn-aware context management:
+// - Keeps system prompt (idx 0), user prompt (idx 1), and the last keepAssistantTurns full turns
 //   (including all parallel tool responses in those turns) at 100% fidelity.
 // - For older turns outside the active window: strips stale reasoning_content and compacts
-//   large tool outputs (>800 runes) using UTF-8 rune-safe head+tail summarization.
-func compactMessages(messages []chatMessage) []chatMessage {
-	const keepAssistantTurns = 2
-	const maxStaleToolRunes = 800
+//   large tool outputs (>maxStaleToolRunes) using UTF-8 rune-safe head+tail summarization.
+func compactMessagesWithLimits(messages []chatMessage, keepAssistantTurns, maxStaleToolRunes int) []chatMessage {
 
 	cutoff := len(messages)
 	turnsSeen := 0
