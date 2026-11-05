@@ -801,6 +801,35 @@ func (e *Engine) GetDecisions() ([]Decision, error) {
 	return decisions, nil
 }
 
+// InjectDecisions returns at most limit of the most recent decisions, newest
+// first, for prompt injection.
+//
+// Injection is a cache, not an archive: every decision injected here is re-sent
+// to the model on every turn of every session, so an unbounded query turns the
+// prompt into a monotonically growing transcript. The full history stays
+// reachable through GetDecisions and sql_query. rowid breaks created_at ties,
+// which happen whenever two decisions land in the same second.
+func (e *Engine) InjectDecisions(limit int) ([]Decision, error) {
+	rows, err := e.DB.Query(`
+		SELECT topic, decision, reason, created_at FROM decisions
+		ORDER BY created_at DESC, rowid DESC LIMIT ?
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var decisions []Decision
+	for rows.Next() {
+		var d Decision
+		if err := rows.Scan(&d.Topic, &d.Decision, &d.Reason, &d.CreatedAt); err != nil {
+			return nil, err
+		}
+		decisions = append(decisions, d)
+	}
+	return decisions, nil
+}
+
 // --- Learned Patterns ---
 
 func (e *Engine) AddPattern(patternType, description string) error {
@@ -811,6 +840,29 @@ func (e *Engine) AddPattern(patternType, description string) error {
 
 func (e *Engine) GetPatterns() ([]Pattern, error) {
 	rows, err := e.DB.Query(`SELECT pattern_type, description, created_at FROM learned_patterns ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var patterns []Pattern
+	for rows.Next() {
+		var p Pattern
+		if err := rows.Scan(&p.Type, &p.Description, &p.CreatedAt); err != nil {
+			return nil, err
+		}
+		patterns = append(patterns, p)
+	}
+	return patterns, nil
+}
+
+// InjectPatterns mirrors InjectDecisions: the prompt only carries the newest
+// few patterns, while the archive stays available in full through GetPatterns.
+func (e *Engine) InjectPatterns(limit int) ([]Pattern, error) {
+	rows, err := e.DB.Query(`
+		SELECT pattern_type, description, created_at FROM learned_patterns
+		ORDER BY created_at DESC, rowid DESC LIMIT ?
+	`, limit)
 	if err != nil {
 		return nil, err
 	}

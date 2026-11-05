@@ -169,6 +169,29 @@ func (h *Handler) Handle(hookType string, input io.Reader) (string, error) {
 	return string(out), nil
 }
 
+// Prompt-injection budget.
+//
+// Everything below is re-sent to the model on every turn of every session, so
+// it is a cache rather than an archive. Recent context was already capped; the
+// decisions and patterns queries were not, which made the prompt grow without
+// bound as a project accumulated memory. The full history stays queryable
+// through sql_query, so capping here costs nothing except a lookup.
+const (
+	injectDecisionLimit = 5
+	injectPatternLimit  = 5
+	injectEntryMaxRunes = 300
+)
+
+// truncate shortens s to at most max runes, appending an ellipsis when it cuts.
+// Runes rather than bytes so multi-byte text is never split mid-character.
+func truncate(s string, max int) string {
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	return string(runes[:max]) + "..."
+}
+
 // handlePreInvocation injects workspace context + task routing hint before model runs
 func (h *Handler) handlePreInvocation(input HookInput) HookOutput {
 	// A subagent must never claim the main conversation identity. Without this
@@ -180,8 +203,8 @@ func (h *Handler) handlePreInvocation(input HookInput) HookOutput {
 	}
 
 	settings, _ := h.engine.GetAllProjectSettings()
-	decisions, _ := h.engine.GetDecisions()
-	patterns, _ := h.engine.GetPatterns()
+	decisions, _ := h.engine.InjectDecisions(injectDecisionLimit)
+	patterns, _ := h.engine.InjectPatterns(injectPatternLimit)
 	summary, _ := h.engine.GetSessionSummary()
 
 	context := "## Tether Context (auto-injected)\n"
@@ -207,32 +230,29 @@ func (h *Handler) handlePreInvocation(input HookInput) HookOutput {
 	if len(meaningful) > 0 {
 		context += "\n### Recent Session Context\n"
 		for _, entry := range meaningful {
-			text := entry.Content
-			if runes := []rune(text); len(runes) > 300 {
-				text = string(runes[:300]) + "..."
-			}
-			context += fmt.Sprintf("- [%s/%s] %s\n", entry.Agent, entry.Role, text)
+			context += fmt.Sprintf("- [%s/%s] %s\n", entry.Agent, entry.Role, truncate(entry.Content, 300))
 		}
 	}
 
 	if len(settings) > 0 {
 		context += "\n### Project Settings\n"
 		for k, v := range settings {
-			context += fmt.Sprintf("- %s: %s\n", k, v)
+			context += fmt.Sprintf("- %s: %s\n", k, truncate(v, 240))
 		}
 	}
 
 	if len(decisions) > 0 {
-		context += "\n### Previous Decisions\n"
+		context += fmt.Sprintf("\n### Previous Decisions (newest %d; full history via sql_query)\n", len(decisions))
 		for _, d := range decisions {
-			context += fmt.Sprintf("- [%s] %s (reason: %s)\n", d.Topic, d.Decision, d.Reason)
+			context += fmt.Sprintf("- [%s] %s (reason: %s)\n",
+				d.Topic, truncate(d.Decision, injectEntryMaxRunes), truncate(d.Reason, injectEntryMaxRunes))
 		}
 	}
 
 	if len(patterns) > 0 {
-		context += "\n### Learned Patterns\n"
+		context += fmt.Sprintf("\n### Learned Patterns (newest %d; full history via sql_query)\n", len(patterns))
 		for _, p := range patterns {
-			context += fmt.Sprintf("- [%s] %s\n", p.Type, p.Description)
+			context += fmt.Sprintf("- [%s] %s\n", p.Type, truncate(p.Description, injectEntryMaxRunes))
 		}
 	}
 
