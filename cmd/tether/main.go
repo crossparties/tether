@@ -71,9 +71,9 @@ func cmdInit() {
 	}
 	defer engine.Close()
 
-	fmt.Printf("✓ Initialized tether in %s\n", workspace)
-	fmt.Printf("  → session.db created\n")
-	fmt.Printf("  → .gitignore updated\n")
+	fmt.Printf("%s in %s\n", ui.Success("✓ Initialized tether"), ui.Path(workspace))
+	fmt.Printf("  %s session.db created\n", ui.Dim("→"))
+	fmt.Printf("  %s .gitignore updated\n", ui.Dim("→"))
 
 	// Detect and store project settings
 	settings := core.DetectProjectSettings(workspace)
@@ -499,7 +499,7 @@ func cmdUndo(args []string) {
 		fmt.Printf("↩ restored %s\n", ui.Path(path))
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "⚠ Undo partially failed for turn %s: %v\n", ui.Bold(turn), err)
+		fmt.Fprintf(os.Stderr, "%s for turn %s: %v\n", ui.Warn("⚠ Undo partially failed"), ui.Bold(turn), err)
 		if len(restored) == 0 {
 			os.Exit(1)
 		}
@@ -719,7 +719,7 @@ func cmdDoctor() {
 	if failed > 0 {
 		fmt.Println("\n🛠  Remediation: Run 'tether init' to initialize missing components.")
 	} else {
-		fmt.Println("✓ Substrate is healthy and ready for agent execution.")
+		fmt.Println(ui.Success("✓ Substrate is healthy and ready for agent execution."))
 	}
 	fmt.Println("───────────────────────────────────────────────────────────────────────────")
 	fmt.Println()
@@ -746,7 +746,7 @@ func cmdInstall() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("✓ Tether installed for %s\n", agent)
+	fmt.Printf("%s for %s\n", ui.Success("✓ Tether installed"), ui.Bold(agent))
 }
 
 // cmdRun launches the Interactive Agent REPL (when no prompt is passed) or runs a prompt directly
