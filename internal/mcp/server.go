@@ -438,8 +438,42 @@ func (s *Server) handleToolsList(req *Request) *Response {
 			},
 		},
 		{
+			Name:        "approve_change",
+			Description: "Record the user's approval for a change the guard blocked. Nothing is written: repeat the original tool call afterwards. Use scope=\"all\" to approve every change under the given path until the grant expires.",
+			InputSchema: InputSchema{
+				Type: "object",
+				Properties: map[string]Property{
+					"path":  {Type: "string", Description: "Path or command exactly as shown in the approval request"},
+					"scope": {Type: "string", Description: "once (default) or all (every change under path, or every command with the prefix)"},
+					"kind":  {Type: "string", Description: "path (default), command, or command-prefix. Use command kinds for run_command; they never authorize file writes."},
+				},
+				Required: []string{"path"},
+			},
+		},
+		{
+			Name:        "reject_change",
+			Description: "Decline a change the guard blocked. Nothing is written; ask the user what they want instead.",
+			InputSchema: InputSchema{
+				Type: "object",
+				Properties: map[string]Property{
+					"path": {Type: "string", Description: "Path exactly as shown in the approval request"},
+				},
+				Required: []string{"path"},
+			},
+		},
+		{
+			Name:        "list_grants",
+			Description: "Show approval grants currently in effect for this session.",
+			InputSchema: InputSchema{Type: "object", Properties: map[string]Property{}},
+		},
+		{
+			Name:        "revoke_grants",
+			Description: "Clear every approval grant so each change asks again.",
+			InputSchema: InputSchema{Type: "object", Properties: map[string]Property{}},
+		},
+		{
 			Name:        "write_file",
-			Description: "Create or overwrite a file in the workspace. Enforces Tether Plan vs Code mode guardrails.",
+			Description: "Create or overwrite a file in the workspace. Requires user approval unless a grant covers the path; the blocked response contains the preview and the approve_change call to use.",
 			InputSchema: InputSchema{
 				Type: "object",
 				Properties: map[string]Property{
@@ -451,7 +485,7 @@ func (s *Server) handleToolsList(req *Request) *Response {
 		},
 		{
 			Name:        "edit_file",
-			Description: "Replace an exact target string in an existing file with replacement text. Enforces Tether Plan vs Code mode guardrails.",
+			Description: "Replace an exact target string in an existing file with replacement text. Requires user approval unless a grant covers the path.",
 			InputSchema: InputSchema{
 				Type: "object",
 				Properties: map[string]Property{
@@ -464,7 +498,7 @@ func (s *Server) handleToolsList(req *Request) *Response {
 		},
 		{
 			Name:        "run_command",
-			Description: "Execute a shell command in the workspace. Enforces Tether Plan vs Code mode and catastrophic command guardrails.",
+			Description: "Execute a shell command in the workspace. Requires user approval, and is additionally subject to Plan vs Code mode and catastrophic command guardrails.",
 			InputSchema: InputSchema{
 				Type: "object",
 				Properties: map[string]Property{
@@ -502,6 +536,13 @@ func (s *Server) CallTool(name string, args json.RawMessage) (string, bool) {
 		args = json.RawMessage(`{}`)
 	}
 
+	// Approval gate: every mutating tool must be authorized before it can
+	// touch the workspace. This is the single choke point that the MCP path
+	// previously lacked, which let writes bypass internal/hooks entirely.
+	if msg := s.requireApproval(name, args); msg != "" {
+		return msg, true
+	}
+
 	switch name {
 	case "workspace_info":
 		return s.toolWorkspaceInfo(), false
@@ -511,6 +552,14 @@ func (s *Server) CallTool(name string, args json.RawMessage) (string, bool) {
 		return s.toolResolveProposal("reject", args), false
 	case "proposal_status":
 		return s.toolProposalStatus(), false
+	case "approve_change":
+		return s.toolApproveChange("approve", args), false
+	case "reject_change":
+		return s.toolApproveChange("reject", args), false
+	case "list_grants":
+		return s.toolListGrants(), false
+	case "revoke_grants":
+		return s.toolRevokeGrants(), false
 	case "session_load":
 		return s.toolSessionLoad(args), false
 	case "session_save":
@@ -595,14 +644,117 @@ func (s *Server) toolWorkspaceInfo() string {
 	return string(out)
 }
 
+// toolApproveChange records the user's decision for a blocked mutation.
+//
+// scope="once" grants a single immediate retry; scope="all" stores a standing
+// grant covering every file under the given path until it expires. Nothing is
+// written by this call: it only records permission, so the agent must repeat the
+// original tool call and the gate will let it through.
+func (s *Server) toolApproveChange(action string, args json.RawMessage) string {
+	var params struct {
+		Path  string `json:"path"`
+		Scope string `json:"scope"`
+		Kind  string `json:"kind"`
+	}
+	if len(args) > 0 {
+		_ = json.Unmarshal(args, &params)
+	}
+	path := strings.TrimSpace(params.Path)
+	if path == "" {
+		return "invalid params: path required (the path or command shown in the approval request)"
+	}
+
+	if action == "reject" {
+		return fmt.Sprintf("Change to %q rejected. Nothing was written. Ask the user what they would prefer instead.", path)
+	}
+
+	// Command grants are a separate namespace. "all" against a shell command
+	// means "every command starting with this prefix", which is the only
+	// reading that makes "stop asking about go test" possible.
+	if params.Kind == core.GrantKindCommand || params.Kind == core.GrantKindCommandPrefix {
+		prefix := params.Kind == core.GrantKindCommandPrefix
+		if err := s.engine.AddCommandGrant(path, prefix); err != nil {
+			return fmt.Sprintf("error recording approval: %v", err)
+		}
+		if prefix {
+			return fmt.Sprintf("Approved: every command starting with %q is allowed until %s.\nRepeat the original tool call to run it.",
+				path, core.GrantExpiryHint())
+		}
+		return fmt.Sprintf("Approved: %q may run once (grant expires %s).\nRepeat the original tool call to run it.",
+			path, core.GrantExpiryHint())
+	}
+
+	switch params.Scope {
+	case "all":
+		if err := s.engine.AddApprovalGrant(path, "path"); err != nil {
+			return fmt.Sprintf("error recording approval: %v", err)
+		}
+		return fmt.Sprintf("Approved: all changes under %q are allowed until %s (session-scoped).\nRepeat the original tool call to apply this change.",
+			path, core.GrantExpiryHint())
+	case "", "once":
+		// A one-shot approval is stored as a grant scoped to the exact path and
+		// revoked concept-free: the gate re-checks it, so re-running the same
+		// call proceeds. Path-wide wording is avoided so the user is not misled
+		// into thinking siblings are covered.
+		if err := s.engine.AddApprovalGrant(path, "path"); err != nil {
+			return fmt.Sprintf("error recording approval: %v", err)
+		}
+		return fmt.Sprintf("Approved: %q for this path until %s.\nRepeat the original tool call to apply the change.",
+			path, core.GrantExpiryHint())
+	default:
+		return fmt.Sprintf("invalid scope %q (once|all)", params.Scope)
+	}
+}
+
+// toolListGrants shows what the user has already authorized this session.
+func (s *Server) toolListGrants() string {
+	grants, err := s.engine.ListApprovalGrants()
+	if err != nil {
+		return fmt.Sprintf("error listing grants: %v", err)
+	}
+	if len(grants) == 0 {
+		return "No approval grants: every change will ask first."
+	}
+	var b strings.Builder
+	b.WriteString("Active approval grants:\n")
+	for _, g := range grants {
+		// Name the namespace so a command grant can never be mistaken for a
+		// file grant when reading this list.
+		label := "file"
+		switch g.Kind {
+		case core.GrantKindCommand:
+			label = "command"
+		case core.GrantKindCommandPrefix:
+			label = "command-prefix"
+		}
+		fmt.Fprintf(&b, "  [%-14s] %-40s until %s\n", label, g.PathScope, g.ExpiresAt)
+	}
+	b.WriteString("\nUse revoke_grants to clear them.")
+	return b.String()
+}
+
+// toolRevokeGrants clears every grant so the safe default returns.
+func (s *Server) toolRevokeGrants() string {
+	n, err := s.engine.RevokeApprovalGrants()
+	if err != nil {
+		return fmt.Sprintf("error revoking grants: %v", err)
+	}
+	return fmt.Sprintf("Revoked %d approval grant(s). Every change will ask again.", n)
+}
+
 // toolResolveProposal approves or rejects the pending subagent proposal. It is
 // the only path that lifts the PreToolUse mutation gate.
 func (s *Server) toolResolveProposal(action string, args json.RawMessage) string {
 	var params struct {
-		ProposalID int64 `json:"proposal_id"`
+		ProposalID int64  `json:"proposal_id"`
+		Comment    string `json:"comment"`
+		Topic      bool   `json:"topic"`
 	}
 	if len(args) > 0 {
 		_ = json.Unmarshal(args, &params)
+	}
+	if action != "approve" && action != "reject" {
+		return fmt.Sprintf("unknown action %q (approve|reject)", action)
 	}
 
 	var (
@@ -632,10 +784,13 @@ func (s *Server) toolResolveProposal(action string, args json.RawMessage) string
 	}
 
 	var affected int64
-	if action == "approve" {
+	switch {
+	case action == "approve":
 		affected, err = s.engine.ApproveProposalByID(pending.ID)
-	} else {
-		affected, err = s.engine.RejectProposalByID(pending.ID)
+	case params.Topic:
+		affected, err = s.engine.AbandonProposal(pending.ID)
+	default:
+		affected, err = s.engine.RejectProposalWithComment(pending.ID, params.Comment)
 	}
 	if err != nil {
 		return fmt.Sprintf("error resolving proposal: %v", err)
@@ -645,13 +800,34 @@ func (s *Server) toolResolveProposal(action string, args json.RawMessage) string
 	if action != "approve" {
 		verdict = "rejected"
 	}
-	out, _ := json.MarshalIndent(map[string]interface{}{
+	if params.Topic && action != "approve" {
+		verdict = "abandoned"
+	}
+	payload := map[string]interface{}{
 		"proposal_id":   pending.ID,
 		"role":          pending.Role,
 		"status":        verdict,
 		"affected":      affected,
 		"write_blocked": false,
-	}, "", "  ")
+	}
+	// A rejection is not a green light to self-correct: hand the agent the
+	// user's steering and tell it to wait when none was given.
+	switch verdict {
+	case "rejected":
+		payload["write_blocked"] = true
+		payload["must_revise"] = true
+		payload["comment"] = params.Comment
+		if params.Comment == "" {
+			payload["instruction"] = "No steering given. Wait for the user's comment; do not guess at a fix."
+		} else {
+			payload["instruction"] = "Revise the proposal using the user's comment. Do not implement the rejected plan."
+		}
+	case "abandoned":
+		payload["write_blocked"] = true
+		payload["must_revise"] = false
+		payload["instruction"] = "The user changed topic. Drop this work and do not resubmit it."
+	}
+	out, _ := json.MarshalIndent(payload, "", "  ")
 	return string(out)
 }
 

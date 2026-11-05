@@ -61,7 +61,7 @@ func TestProposalCLIWritesWithoutLLM(t *testing.T) {
 			t.Fatalf("cmdProposal must not invoke the model path (%q found); the user's decision has to go straight to the database", forbidden)
 		}
 	}
-	for _, required := range []string{"ApproveProposalByID", "RejectProposalByID", "ListProposals"} {
+	for _, required := range []string{"ApproveProposalByID", "RejectProposalWithComment", "ListProposals"} {
 		if !regexp.MustCompile(regexp.QuoteMeta(required)).MatchString(body) {
 			t.Fatalf("cmdProposal does not use %s", required)
 		}

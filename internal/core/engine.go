@@ -277,6 +277,11 @@ func (e *Engine) migrate() error {
 	_, _ = e.DB.Exec("ALTER TABLE pending_proposals ADD COLUMN expires_at DATETIME;")
 	_, _ = e.DB.Exec("ALTER TABLE pending_proposals ADD COLUMN comment TEXT DEFAULT '';")
 
+	// Approval grants back the "approve every change on this path" option.
+	if err := e.ensureApprovalGrants(); err != nil {
+		return err
+	}
+
 	// Record schema version to fast-path all subsequent runs
 	_, _ = e.DB.Exec(fmt.Sprintf("PRAGMA user_version = %d;", SchemaVersion))
 

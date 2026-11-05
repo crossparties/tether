@@ -120,6 +120,20 @@ func TestMCPServer_SQLQuery(t *testing.T) {
 }
 
 
+// runTool calls a tool with JSON arguments and returns its text payload.
+func runTool(t *testing.T, server *Server, tool string, args map[string]interface{}) string {
+	t.Helper()
+	raw, err := json.Marshal(args)
+	if err != nil {
+		t.Fatalf("marshal args: %v", err)
+	}
+	out, isErr := server.CallTool(tool, raw)
+	if isErr {
+		t.Fatalf("%s returned error: %s", tool, out)
+	}
+	return out
+}
+
 func TestProposalApprovalTools(t *testing.T) {
 	e := newTestEngine(t)
 	server := NewServer(e)
@@ -168,14 +182,85 @@ func TestProposalApprovalTools(t *testing.T) {
 		t.Fatalf("RecordProposal: %v", err)
 	}
 	rejected := run("reject_proposal")
-	if !strings.Contains(rejected, "rejected") || !strings.Contains(rejected, `"write_blocked": false`) {
+	if !strings.Contains(rejected, "rejected") || !strings.Contains(rejected, `"write_blocked": true`) {
 		t.Fatalf("reject_proposal = %s", rejected)
+	}
+	if !strings.Contains(rejected, "Wait for the user") {
+		t.Fatalf("rejection without a comment must tell the agent to wait, got %s", rejected)
 	}
 	if got := run("proposal_status"); !strings.Contains(got, `"pending": false`) {
 		t.Fatalf("proposal_status after reject = %s", got)
 	}
 
 	_ = id
+}
+
+// Rejecting with steering hands the comment to the agent and keeps the gate
+// shut: a rejection is not permission to self-correct.
+func TestRejectWithCommentCarriesSteering(t *testing.T) {
+	e := newTestEngine(t)
+	server := NewServer(e)
+
+	if _, err := e.RecordProposal("tether_architect", "rewrite the hook layer"); err != nil {
+		t.Fatalf("RecordProposal: %v", err)
+	}
+	pending, err := e.GetPendingProposal()
+	if err != nil || pending == nil {
+		t.Fatalf("GetPendingProposal: %v", err)
+	}
+
+	out := runTool(t, server, "reject_proposal", map[string]interface{}{
+		"proposal_id": pending.ID,
+		"comment":     "use stdlib only, no new dependency",
+	})
+	if !strings.Contains(out, `"write_blocked": true`) || !strings.Contains(out, "must_revise") {
+		t.Fatalf("reject_proposal = %s", out)
+	}
+	if !strings.Contains(out, "no new dependency") {
+		t.Fatalf("steering should be echoed back, got %s", out)
+	}
+
+	stored, err := e.GetProposalByID(pending.ID)
+	if err != nil || stored == nil {
+		t.Fatalf("GetProposalByID: %v", err)
+	}
+	if stored.Status != core.ProposalRejected {
+		t.Fatalf("status = %q, want rejected", stored.Status)
+	}
+	if stored.Comment != "use stdlib only, no new dependency" {
+		t.Fatalf("comment not persisted: %q", stored.Comment)
+	}
+
+	feedback, err := e.GetRejectionFeedback(5)
+	if err != nil || len(feedback) != 1 || feedback[0].Comment == "" {
+		t.Fatalf("GetRejectionFeedback = %+v, err=%v", feedback, err)
+	}
+}
+
+// --topic abandons the work instead of inviting a revision.
+func TestAbandonedProposalIsNotRevisable(t *testing.T) {
+	e := newTestEngine(t)
+	server := NewServer(e)
+
+	if _, err := e.RecordProposal("tether_architect", "add a spec subsystem"); err != nil {
+		t.Fatalf("RecordProposal: %v", err)
+	}
+	pending, _ := e.GetPendingProposal()
+	if pending == nil {
+		t.Fatal("expected a pending proposal")
+	}
+
+	out := runTool(t, server, "reject_proposal", map[string]interface{}{
+		"proposal_id": pending.ID,
+		"topic":       true,
+	})
+	if !strings.Contains(out, `"status": "abandoned"`) || !strings.Contains(out, `"must_revise": false`) {
+		t.Fatalf("abandon = %s", out)
+	}
+	stored, _ := e.GetProposalByID(pending.ID)
+	if stored.Status != core.ProposalAbandoned {
+		t.Fatalf("status = %q, want abandoned", stored.Status)
+	}
 }
 
 // The approval tools must be advertised to clients.

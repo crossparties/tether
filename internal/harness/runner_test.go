@@ -115,6 +115,12 @@ func TestRunner_DeepSeekToolLoopAndPlanGuardrail(t *testing.T) {
 		Out:      &logBuf,
 	})
 
+	// The approval gate requires a grant before any write. Grant the workspace
+	// for this test so the guard does not mask what is being verified here.
+	if err := engine.AddApprovalGrant(".", "all"); err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+
 	ans, err := runner.Run(context.Background(), "Write hello.go and test plan lock")
 	if err != nil {
 		t.Fatalf("Runner.Run: %v", err)
@@ -142,6 +148,12 @@ func TestFuzzyEditAndLineRangeRead(t *testing.T) {
 	defer engine.Close()
 
 	runner := NewRunner(engine, Config{Provider: "ollama"})
+
+	// Approve writes for this workspace; the test exercises edit matching, not
+	// the approval gate.
+	if err := engine.AddApprovalGrant(".", "all"); err != nil {
+		t.Fatalf("grant: %v", err)
+	}
 
 	// Create a Go file indented with tabs, nested if block, blank line inside function, and duplicate "return nil"
 	initial := "package main\n\nfunc a() error {\n\treturn nil\n}\n\nfunc greet(ok bool) error {\n\tfmt.Println(\"old\")\n\n\tif ok {\n\t\tfmt.Println(\"inner\")\n\t}\n\treturn nil\n}\n"
