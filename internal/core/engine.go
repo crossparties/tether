@@ -45,7 +45,7 @@ func DetectGitBranch(workspace string) string {
 // Bump this whenever the migrate() schema gains a table: migrate() exits early
 // when PRAGMA user_version >= SchemaVersion, so a new CREATE TABLE without a
 // bump is silently never executed on existing databases.
-const SchemaVersion = 3
+const SchemaVersion = 4
 
 // NewEngine creates a new engine for the given workspace with optimized SQLite connection
 func NewEngine(workspace string) (*Engine, error) {
@@ -260,7 +260,8 @@ func (e *Engine) migrate() error {
 		proposal TEXT DEFAULT '',
 		status TEXT DEFAULT 'pending',
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-		approved_at DATETIME
+		approved_at DATETIME,
+		comment TEXT DEFAULT ''
 	);
 	`
 	if _, err := e.DB.Exec(schema); err != nil {
@@ -274,6 +275,7 @@ func (e *Engine) migrate() error {
 	_, _ = e.DB.Exec("ALTER TABLE todos ADD COLUMN git_branch TEXT DEFAULT 'default';")
 	_, _ = e.DB.Exec("ALTER TABLE todos ADD COLUMN version INTEGER DEFAULT 1;")
 	_, _ = e.DB.Exec("ALTER TABLE pending_proposals ADD COLUMN expires_at DATETIME;")
+	_, _ = e.DB.Exec("ALTER TABLE pending_proposals ADD COLUMN comment TEXT DEFAULT '';")
 
 	// Record schema version to fast-path all subsequent runs
 	_, _ = e.DB.Exec(fmt.Sprintf("PRAGMA user_version = %d;", SchemaVersion))
@@ -343,6 +345,13 @@ func (e *Engine) loadOrCreateSession() error {
 		if err != nil {
 			return err
 		}
+		e.SessionID = id
+		e.mode = mode
+		e.adoptPreviousTODOs(id)
+
+		// Touch updated_at and update branch
+		_, _ = e.DB.Exec(`UPDATE sessions SET updated_at = CURRENT_TIMESTAMP, git_branch = ? WHERE id = ?`, e.Branch, id)
+		return nil
 	} else if err != nil {
 		return err
 	}
@@ -354,6 +363,62 @@ func (e *Engine) loadOrCreateSession() error {
 	_, _ = e.DB.Exec(`UPDATE sessions SET updated_at = CURRENT_TIMESTAMP, git_branch = ? WHERE id = ?`, e.Branch, id)
 
 	return nil
+}
+
+// adoptPreviousTODOs carries open work forward into a freshly created session.
+//
+// todo_list filters on session_id, so without this a new session starts empty
+// and unfinished tasks from the previous session become invisible. Users read
+// that as "nothing left to do", which is why the backlog silently rots.
+//
+// Only pending todos whose session belongs to the same git branch are adopted,
+// and the original row is marked superseded via the details field so history
+// stays intact instead of being rewritten.
+func (e *Engine) adoptPreviousTODOs(newSessionID string) {
+	rows, err := e.DB.Query(`
+		SELECT id, description, details FROM todos
+		WHERE status = 'pending'
+		  AND session_id <> ?
+		  AND session_id IN (SELECT id FROM sessions WHERE git_branch = ?)
+		ORDER BY id
+	`, newSessionID, e.Branch)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	type pendingTodo struct {
+		id          int
+		description string
+		details     string
+	}
+	var carry []pendingTodo
+	for rows.Next() {
+		var t pendingTodo
+		if err := rows.Scan(&t.id, &t.description, &t.details); err != nil {
+			return
+		}
+		carry = append(carry, t)
+	}
+	if err := rows.Err(); err != nil || len(carry) == 0 {
+		return
+	}
+
+	for _, t := range carry {
+		details := t.details
+		if details != "" {
+			details += "\n\n"
+		}
+		details += fmt.Sprintf("(carried over from todo #%d)", t.id)
+		if _, err := e.DB.Exec(`
+			INSERT INTO todos (session_id, git_branch, description, details, status)
+			VALUES (?, ?, ?, ?, 'pending')
+		`, newSessionID, e.Branch, t.description, details); err != nil {
+			continue
+		}
+		// Retire the original so the same task is not adopted twice.
+		_, _ = e.DB.Exec(`UPDATE todos SET status = 'carried' WHERE id = ?`, t.id)
+	}
 }
 
 // --- Session Operations ---
@@ -415,7 +480,20 @@ type ProposalRecord struct {
 	Status     string `json:"status"`
 	CreatedAt  string `json:"created_at"`
 	ApprovedAt string `json:"approved_at,omitempty"`
+	// Comment carries the user's steering when a proposal is rejected. It is
+	// deliberately empty for approvals: a comment only exists to redirect work.
+	Comment string `json:"comment,omitempty"`
 }
+
+// Proposal statuses. A proposal is only ever gated while 'pending'; the two
+// rejection flavours stay readable so the agent can wait for direction instead
+// of guessing at a fix.
+const (
+	ProposalPending   = "pending"
+	ProposalApproved  = "approved"
+	ProposalRejected  = "rejected"  // user pushed back: revise using Comment
+	ProposalAbandoned = "abandoned" // user changed topic: do not resubmit
+)
 
 // RecordProposal persists a subagent proposal so the Main Agent cannot mutate
 // the codebase until the user approves it.
@@ -516,10 +594,12 @@ func (e *Engine) ListProposals(status string) ([]ProposalRecord, error) {
 // GetProposalByID returns a single proposal, or nil when it does not exist.
 func (e *Engine) GetProposalByID(id int64) (*ProposalRecord, error) {
 	row := e.DB.QueryRow(`
-		SELECT id, session_id, role, proposal, status, created_at
+		SELECT id, session_id, role, proposal, status, created_at,
+		       COALESCE(approved_at, ''), COALESCE(comment, '')
 		FROM pending_proposals WHERE id = ?`, id)
 	var p ProposalRecord
-	if err := row.Scan(&p.ID, &p.SessionID, &p.Role, &p.Proposal, &p.Status, &p.CreatedAt); err != nil {
+	if err := row.Scan(&p.ID, &p.SessionID, &p.Role, &p.Proposal, &p.Status, &p.CreatedAt,
+		&p.ApprovedAt, &p.Comment); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
@@ -532,11 +612,12 @@ func (e *Engine) GetProposalByID(id int64) (*ProposalRecord, error) {
 // The decision is recorded in the session context so the audit trail survives
 // the proposal row itself.
 func (e *Engine) ApproveProposalByID(id int64) (int64, error) {
-	return e.resolveProposalByID(id, "approved", "cli")
+	return e.resolveProposalByID(id, ProposalApproved, "cli", "")
 }
 
 // resolveProposalByID applies a verdict to one proposal and journals it.
-func (e *Engine) resolveProposalByID(id int64, status, source string) (int64, error) {
+// comment is the user's steering on a rejection; it is ignored on approval.
+func (e *Engine) resolveProposalByID(id int64, status, source, comment string) (int64, error) {
 	p, err := e.GetProposalByID(id)
 	if err != nil {
 		return 0, err
@@ -547,8 +628,8 @@ func (e *Engine) resolveProposalByID(id int64, status, source string) (int64, er
 
 	res, err := e.DB.Exec(`
 		UPDATE pending_proposals
-		SET status = ?, approved_at = CURRENT_TIMESTAMP
-		WHERE id = ? AND status = 'pending'`, status, id)
+		SET status = ?, approved_at = CURRENT_TIMESTAMP, comment = ?
+		WHERE id = ? AND status = 'pending'`, status, comment, id)
 	if err != nil {
 		return 0, err
 	}
@@ -561,14 +642,60 @@ func (e *Engine) resolveProposalByID(id int64, status, source string) (int64, er
 	if len(summary) > 200 {
 		summary = summary[:200] + "…"
 	}
-	_ = e.AddContext("tether", "decision", fmt.Sprintf(
-		"Proposal #%d from %s %s by %s: %s", p.ID, p.Role, status, source, summary))
+	entry := fmt.Sprintf("Proposal #%d from %s %s by %s: %s", p.ID, p.Role, status, source, summary)
+	if comment != "" {
+		entry += " | user said: " + comment
+	}
+	_ = e.AddContext("tether", "decision", entry)
 	return affected, nil
 }
 
 // RejectProposalByID rejects exactly one proposal, leaving others untouched.
 func (e *Engine) RejectProposalByID(id int64) (int64, error) {
-	return e.resolveProposalByID(id, "rejected", "cli")
+	return e.resolveProposalByID(id, ProposalRejected, "cli", "")
+}
+
+// RejectProposalWithComment rejects a proposal and records the user's steering.
+// The proposal stays visible to the agent as rejected but no longer opens the
+// write gate: the agent must wait for direction, not silently "fix" it.
+func (e *Engine) RejectProposalWithComment(id int64, comment string) (int64, error) {
+	return e.resolveProposalByID(id, ProposalRejected, "cli", strings.TrimSpace(comment))
+}
+
+// AbandonProposal closes a proposal because the user changed topic. Unlike a
+// rejection it is not offered back for revision; the work is dropped, not fixed.
+func (e *Engine) AbandonProposal(id int64) (int64, error) {
+	return e.resolveProposalByID(id, ProposalAbandoned, "cli", "")
+}
+
+// GetRejectionFeedback returns rejected proposals that still carry an
+// unresolved verdict, newest first. The agent reads this after a rejection
+// instead of auto-correcting: an empty Comment means "wait for the user".
+func (e *Engine) GetRejectionFeedback(limit int) ([]ProposalRecord, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+	rows, err := e.DB.Query(`
+		SELECT id, session_id, role, proposal, status, created_at,
+		       COALESCE(approved_at, ''), COALESCE(comment, '')
+		FROM pending_proposals
+		WHERE status IN ('rejected', 'abandoned')
+		ORDER BY id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ProposalRecord
+	for rows.Next() {
+		var p ProposalRecord
+		if err := rows.Scan(&p.ID, &p.SessionID, &p.Role, &p.Proposal,
+			&p.Status, &p.CreatedAt, &p.ApprovedAt, &p.Comment); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }
 
 // ApproveProposal marks every pending proposal as approved by the user.
