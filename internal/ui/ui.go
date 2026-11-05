@@ -126,8 +126,12 @@ func Pad(s string, width int) string {
 	return s + repeat(" ", width-visible)
 }
 
-// VisibleLen returns the number of printable runes in s, skipping ANSI SGR
-// escape sequences so callers can align coloured text.
+// VisibleLen returns the number of terminal columns s occupies, skipping ANSI
+// SGR escape sequences so callers can align coloured text.
+//
+// Wide runes (emoji, CJK) occupy two columns. Counting them as one made every
+// boxed layout drift by one column per emoji, which is why the status box used
+// to look ragged next to the mode badge.
 func VisibleLen(s string) int {
 	count := 0
 	inEscape := false
@@ -142,9 +146,37 @@ func VisibleLen(s string) int {
 			inEscape = true
 			continue
 		}
-		count++
+		count += runeWidth(r)
 	}
 	return count
+}
+
+// runeWidth reports the terminal column width of r: 2 for East Asian wide and
+// emoji runes, 0 for combining marks, 1 otherwise.
+func runeWidth(r rune) int {
+	switch {
+	case r == 0:
+		return 0
+	// Combining marks attach to the previous cell.
+	case r >= 0x0300 && r <= 0x036F:
+		return 0
+	// Zero-width joiners and variation selectors carry no width of their own.
+	case r == 0x200D, r == 0xFE0F, r == 0xFE0E:
+		return 0
+	// Emoji and pictographs.
+	case r >= 0x1F300 && r <= 0x1FAFF:
+		return 2
+	// CJK, Hangul, and fullwidth forms.
+	case r >= 0x1100 && r <= 0x115F,
+		r >= 0x2E80 && r <= 0xA4CF,
+		r >= 0xAC00 && r <= 0xD7A3,
+		r >= 0xF900 && r <= 0xFAFF,
+		r >= 0xFE30 && r <= 0xFE6F,
+		r >= 0xFF00 && r <= 0xFF60,
+		r >= 0xFFE0 && r <= 0xFFE6:
+		return 2
+	}
+	return 1
 }
 
 // Title styles a heading.
