@@ -159,6 +159,16 @@ func TestCommandPrefixSuggestion(t *testing.T) {
 		"make":              "make",
 		"npm run build":     "npm run",
 		"rm -rf node_modules": "rm",
+		// Binaries that take a positional argument, not a subcommand. Widening
+		// these to two words yields a prefix that matches nothing else.
+		"echo first":  "echo",
+		"echo hello":  "echo",
+		"cat a.txt":   "cat",
+		"grep -rn x .": "grep",
+		// Subcommand tools still widen.
+		"go build ./...":  "go build",
+		"docker ps -a":    "docker ps",
+		"cargo test":      "cargo test",
 	}
 	for cmd, want := range cases {
 		if got := commandPrefix(cmd); got != want {

@@ -211,10 +211,28 @@ func commandPrefix(cmd string) string {
 		return ""
 	}
 	keep := 1
-	if len(fields) > 1 && !looksLikeArg(fields[1]) {
+	// Only widen to a subcommand when the binary actually takes one. "echo
+	// first" must grant "echo", not "echo first": a prefix of "echo first"
+	// matches that one line and nothing else, so the user would approve a
+	// grant that never fires again.
+	if len(fields) > 1 && takesSubcommand(fields[0]) && !looksLikeArg(fields[1]) {
 		keep = 2
 	}
 	return strings.Join(fields[:keep], " ")
+}
+
+// takesSubcommand reports whether name is a tool whose second bare word is a
+// subcommand ("git commit") rather than a positional argument ("echo hello").
+// The list is deliberately small: widening incorrectly hands out a prefix that
+// authorizes less than it claims, which is worse than granting one token less.
+func takesSubcommand(name string) bool {
+	switch name {
+	case "git", "go", "npm", "yarn", "pnpm", "cargo", "docker", "kubectl",
+		"make", "systemctl", "apt", "apt-get", "brew", "pip", "pip3", "poetry",
+		"terraform", "helm", "rustc", "gcloud", "aws", "gh":
+		return true
+	}
+	return false
 }
 
 // looksLikeArg reports whether a token is an argument rather than a subcommand.
