@@ -303,16 +303,10 @@ func (h *Handler) handlePreToolUse(input HookInput) HookOutput {
 
 	// 1. Catastrophic command protection (always active across all agents and modes)
 	if toolName == "run_command" || toolName == "bash" {
-		cmdLower := strings.ToLower(command)
-		catastrophic := []string{"rm -rf /", "rm -rf ~", "rm -rf /*", "mkfs"}
-		for _, cat := range catastrophic {
-			if strings.Contains(cmdLower, cat) {
-				return HookOutput{
-					Decision: "deny",
-					Reason:   fmt.Sprintf("Tether Guard: Catastrophic shell command '%s' is strictly blocked.", cat),
-				}
-			}
+		if d := classifyCommand(command); d.level == deny {
+			return HookOutput{Decision: "deny", Reason: d.describe()}
 		}
+		cmdLower := strings.ToLower(command)
 
 		// Prevent raw bash sqlite3/session.db hacks that trigger CLI permission prompts
 		if strings.Contains(cmdLower, "session.db") || (strings.Contains(cmdLower, "sqlite3") && strings.Contains(cmdLower, ".db")) {
