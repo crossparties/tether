@@ -47,7 +47,7 @@ func main() {
 	case "run", "agent", "chat":
 		cmdRun(os.Args[2:])
 	case "version":
-		fmt.Printf("tether v%s\n", version)
+		fmt.Printf("tether v%s\n", ui.Bold(version))
 	case "help", "--help", "-h":
 		printUsage()
 	default:
@@ -60,13 +60,13 @@ func main() {
 func cmdInit() {
 	workspace, err := core.DetectWorkspace(".")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		fatalf("%v", err)
 		os.Exit(1)
 	}
 
 	engine, err := core.NewEngine(workspace)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error initializing: %v\n", err)
+		fatalf("initializing: %v", err)
 		os.Exit(1)
 	}
 	defer engine.Close()
@@ -79,7 +79,7 @@ func cmdInit() {
 	settings := core.DetectProjectSettings(workspace)
 	for k, v := range settings {
 		engine.SetProjectSetting(k, v)
-		fmt.Printf("  → detected %s: %s\n", k, v)
+		fmt.Printf("  %s detected %s: %s\n", ui.Dim("→"), ui.Bold(k), v)
 	}
 }
 
@@ -87,21 +87,20 @@ func cmdInit() {
 func cmdMCP() {
 	workspace, err := core.DetectWorkspace(".")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		fatalf("%v", err)
 		os.Exit(1)
 	}
 
 	engine, err := core.NewEngine(workspace)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		fatalf("%v", err)
 		os.Exit(1)
 	}
 	defer engine.Close()
 
 	server := mcp.NewServer(engine)
 	if err := server.Serve(); err != nil {
-		fmt.Fprintf(os.Stderr, "mcp server error: %v\n", err)
-		os.Exit(1)
+		fatalf("mcp server: %v", err)
 	}
 }
 
@@ -114,13 +113,13 @@ func cmdHook() {
 
 	workspace, err := core.DetectWorkspace(".")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		fatalf("%v", err)
 		os.Exit(1)
 	}
 
 	engine, err := core.NewEngine(workspace)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		fatalf("%v", err)
 		os.Exit(1)
 	}
 	defer engine.Close()
@@ -177,13 +176,13 @@ func cmdHook() {
 func cmdProposal(args []string) {
 	workspace, err := core.DetectWorkspace(".")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		fatalf("%v", err)
 		os.Exit(1)
 	}
 
 	engine, err := core.NewEngine(workspace)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error initializing: %v\n", err)
+		fatalf("initializing: %v", err)
 		os.Exit(1)
 	}
 	defer engine.Close()
@@ -196,60 +195,62 @@ func cmdProposal(args []string) {
 	case "list", "ls":
 		proposals, err := engine.ListProposals("pending")
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			fatalf("%v", err)
 			os.Exit(1)
 		}
 		if len(proposals) == 0 {
-			fmt.Println("No proposals awaiting approval. 🔓 Codebase writes are not blocked.")
+			fmt.Println(ui.Success("No proposals awaiting approval.") + " 🔓 Codebase writes are not blocked.")
 			return
 		}
-		fmt.Printf("🔒 %d proposal(s) awaiting your approval:\n\n", len(proposals))
+		fmt.Printf("%s %s awaiting your approval:\n\n",
+			ui.Error("🔒"), ui.Bold(fmt.Sprintf("%d proposal(s)", len(proposals))))
 		for _, p := range proposals {
-			fmt.Printf("  #%d  %-18s %s\n", p.ID, p.Role, p.CreatedAt)
+			fmt.Printf("  %s  %s %s\n",
+				ui.Accent(fmt.Sprintf("#%d", p.ID)),
+				ui.Bold(ui.Pad(p.Role, 18)),
+				ui.Dim(p.CreatedAt))
 			for _, line := range previewLines(p.Proposal, 3) {
-				fmt.Printf("       %s\n", line)
+				fmt.Printf("       %s\n", ui.Dim(line))
 			}
 			fmt.Println()
 		}
-		fmt.Println("Decide with:  tether proposal approve <id>   |   tether proposal reject <id>")
+		fmt.Println(ui.Dim("Decide with:  ") + ui.Bold("tether proposal approve <id>") +
+			ui.Dim("   |   ") + ui.Bold("tether proposal reject <id>"))
 
 	case "show":
 		if len(args) < 2 {
-			fmt.Fprintln(os.Stderr, "usage: tether proposal show <id>")
-			os.Exit(1)
+			fatalf("usage: tether proposal show <id>")
 		}
 		id, err := strconv.ParseInt(args[1], 10, 64)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "invalid proposal id %q\n", args[1])
-			os.Exit(1)
+			fatalf("invalid proposal id %q", args[1])
 		}
 		p, err := engine.GetProposalByID(id)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			fatalf("%v", err)
 			os.Exit(1)
 		}
 		if p == nil {
-			fmt.Fprintf(os.Stderr, "no proposal #%d\n", id)
-			os.Exit(1)
+			fatalf("no proposal #%d", id)
 		}
-		fmt.Printf("Proposal #%d\n", p.ID)
-		fmt.Printf("Role:   %s\n", p.Role)
-		fmt.Printf("Status: %s\n", p.Status)
-		fmt.Printf("Created: %s\n", p.CreatedAt)
+		fmt.Printf("%s %s\n", ui.Dim("Proposal"), ui.Bold(ui.Accent(fmt.Sprintf("#%d", p.ID))))
+		fmt.Printf("%s %s\n", ui.Dim(ui.Pad("Role:", 8)), ui.Bold(p.Role))
+		fmt.Printf("%s %s\n", ui.Dim(ui.Pad("Status:", 8)), ui.Warn(p.Status))
+		fmt.Printf("%s %s\n", ui.Dim(ui.Pad("Created:", 8)), ui.Dim(p.CreatedAt))
 		if p.Role == "spec" {
-			fmt.Println("Note:   this is a plan to review, not a code patch.")
+			fmt.Println(ui.Warn("Note:   this is a plan to review, not a code patch."))
 		}
-		fmt.Println(strings.Repeat("─", 60))
+		fmt.Println(ui.Dim(strings.Repeat("─", 60)))
 		fmt.Println(p.Proposal)
 		if p.Comment != "" {
-			fmt.Println(strings.Repeat("─", 60))
-			fmt.Printf("Your steering: %s\n", p.Comment)
+			fmt.Println(ui.Dim(strings.Repeat("─", 60)))
+			fmt.Printf("%s %s\n", ui.Dim("Your steering:"), ui.Bold(p.Comment))
 		}
 
 	case "approve", "reject", "abandon":
 		verdict := args[0]
 		if len(args) < 2 {
-			fmt.Fprintf(os.Stderr, "usage: tether proposal %s <id|--all> [-m \"steering\"] [--topic]\n", verdict)
+			fatalf("usage: tether proposal %s <id|--all> [-m \"steering\"] [--topic]", verdict)
 			os.Exit(1)
 		}
 
@@ -257,11 +258,11 @@ func cmdProposal(args []string) {
 		// user changed topic (drop the work, do not resubmit).
 		comment, topic, rest := parseVerdictFlags(args[2:])
 		if len(rest) > 0 {
-			fmt.Fprintf(os.Stderr, "unexpected argument %q\n", rest[0])
+			fatalf("unexpected argument %q", rest[0])
 			os.Exit(1)
 		}
 		if verdict != "reject" && (comment != "" || topic) {
-			fmt.Fprintf(os.Stderr, "-m/--topic only apply to reject\n")
+			fatalf("-m/--topic only apply to reject")
 			os.Exit(1)
 		}
 
@@ -276,7 +277,7 @@ func cmdProposal(args []string) {
 		default:
 			id, perr := strconv.ParseInt(args[1], 10, 64)
 			if perr != nil {
-				fmt.Fprintf(os.Stderr, "invalid proposal id %q\n", args[1])
+				fatalf("invalid proposal id %q", args[1])
 				os.Exit(1)
 			}
 			switch {
@@ -289,60 +290,64 @@ func cmdProposal(args []string) {
 			}
 		}
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			fatalf("%v", err)
 			os.Exit(1)
 		}
 		if affected == 0 {
-			fmt.Println("Nothing to decide — no pending proposal matched.")
+			fmt.Println(ui.Dim("Nothing to decide — no pending proposal matched."))
 			return
 		}
-		icon, done := "✅", "approved"
+		icon, done := ui.Success("✅"), "approved"
 		switch {
 		case verdict == "reject" || topic:
-			icon, done = "🚫", "rejected"
+			icon, done = ui.Error("🚫"), "rejected"
 		}
-		fmt.Printf("%s %d proposal(s) %s by you via CLI.\n", icon, affected, done)
+		fmt.Printf("%s %s proposal(s) %s by you via CLI.\n", icon, ui.Bold(fmt.Sprintf("%d", affected)), ui.Bold(done))
 		if verdict == "approve" {
-			fmt.Println("🔓 Codebase writes are no longer blocked.")
+			fmt.Println(ui.Success("🔓 Codebase writes are no longer blocked."))
 			return
 		}
-		fmt.Println("🔒 Writes stay blocked until a new proposal is approved.")
+		fmt.Println(ui.Warn("🔒 Writes stay blocked until a new proposal is approved."))
 		if topic {
-			fmt.Println("Topic dropped — the agent must not resubmit this work.")
+			fmt.Println(ui.Warn("Topic dropped — the agent must not resubmit this work."))
 		} else if comment != "" {
-			fmt.Printf("Steering recorded: %s\n", comment)
-			fmt.Println("The agent must revise with this direction, not guess at a fix.")
+			fmt.Printf("%s %s\n", ui.Dim("Steering recorded:"), ui.Bold(comment))
+			fmt.Println(ui.Dim("The agent must revise with this direction, not guess at a fix."))
 		} else {
-			fmt.Println("No steering given — the agent must wait for your comment.")
+			fmt.Println(ui.Dim("No steering given — the agent must wait for your comment."))
 		}
 
 	case "feedback":
 		feedback, ferr := engine.GetRejectionFeedback(10)
 		if ferr != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", ferr)
+			fatalf("%v", ferr)
 			os.Exit(1)
 		}
 		if len(feedback) == 0 {
-			fmt.Println("No rejections to answer. Nothing is waiting on you.")
+			fmt.Println(ui.Dim("No rejections to answer. Nothing is waiting on you."))
 			return
 		}
 		for _, p := range feedback {
-			fmt.Printf("#%d  %-12s %-10s %s\n", p.ID, p.Role, p.Status, p.CreatedAt)
+			fmt.Printf("%s  %s %s %s\n",
+				ui.Accent(fmt.Sprintf("#%d", p.ID)),
+				ui.Bold(ui.Pad(p.Role, 12)),
+				ui.Warn(ui.Pad(p.Status, 10)),
+				ui.Dim(p.CreatedAt))
 			for _, line := range previewLines(p.Proposal, 2) {
-				fmt.Printf("      %s\n", line)
+				fmt.Printf("      %s\n", ui.Dim(line))
 			}
 			if p.Comment == "" {
-				fmt.Println("      ↳ waiting for your direction (tether proposal show " +
-					strconv.FormatInt(p.ID, 10) + ")")
+				fmt.Printf("%s %s\n", ui.Dim("      ↳ waiting for your direction:"),
+					ui.Bold("tether proposal show "+strconv.FormatInt(p.ID, 10)))
 			} else {
-				fmt.Printf("      ↳ you said: %s\n", p.Comment)
+				fmt.Printf("%s %s\n", ui.Dim("      ↳ you said:"), ui.Bold(p.Comment))
 			}
 			fmt.Println()
 		}
 
 	default:
-		fmt.Fprintf(os.Stderr, "unknown subcommand %q\n", args[0])
-		fmt.Fprintln(os.Stderr, "usage: tether proposal [list|show <id>|approve <id|--all>|reject <id|--all> [-m \"steering\"|--topic]|abandon <id>|feedback]")
+		fatalf("unknown subcommand %q", args[0])
+		fatalf("usage: tether proposal [list|show <id>|approve <id|--all>|reject <id|--all>]")
 		os.Exit(1)
 	}
 }
@@ -357,7 +362,7 @@ func parseVerdictFlags(args []string) (comment string, topic bool, rest []string
 			topic = true
 		case arg == "-m" || arg == "--message" || arg == "--comment":
 			if i+1 >= len(args) {
-				fmt.Fprintf(os.Stderr, "%s needs a value\n", arg)
+				fatalf("%s needs a value", arg)
 				os.Exit(1)
 			}
 			comment = args[i+1]
@@ -400,52 +405,52 @@ func previewLines(text string, max int) []string {
 func cmdMode() {
 	workspace, err := core.DetectWorkspace(".")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		fatalf("%v", err)
 		os.Exit(1)
 	}
 
 	engine, err := core.NewEngine(workspace)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error initializing: %v\n", err)
+		fatalf("initializing: %v", err)
 		os.Exit(1)
 	}
 	defer engine.Close()
 
 	if len(os.Args) < 3 {
 		mode := engine.GetMode()
-		fmt.Printf("Current Tether mode: [%s]\n", strings.ToUpper(mode))
+		fmt.Printf("Current Tether mode: [%s]\n", ui.Bold(strings.ToUpper(mode)))
 		if mode == "plan" {
-			fmt.Println("  • Codebase writes: BLOCKED")
-			fmt.Println("  • Plan writes:    ALLOWED in docs/** and .agents/**")
-			fmt.Println("  • To unlock:      Run 'tether mode code'")
+			fmt.Printf("  %s Codebase writes: %s\n", ui.Dim("•"), ui.Error("BLOCKED"))
+			fmt.Printf("  %s Plan writes:    %s\n", ui.Dim("•"), ui.Success("ALLOWED in docs/** and .agents/**"))
+			fmt.Printf("  %s To unlock:      Run 'tether mode code'\n", ui.Dim("•"))
 		} else {
-			fmt.Println("  • Codebase writes: UNRESTRICTED")
-			fmt.Println("  • To plan:        Run 'tether mode plan'")
+			fmt.Printf("  %s Codebase writes: %s\n", ui.Dim("•"), ui.Success("UNRESTRICTED"))
+			fmt.Printf("  %s To plan:        Run 'tether mode plan'\n", ui.Dim("•"))
 		}
 		return
 	}
 
 	targetMode := strings.ToLower(os.Args[2])
 	if targetMode != "code" && targetMode != "plan" && targetMode != "review" {
-		fmt.Fprintf(os.Stderr, "error: invalid mode '%s'. Valid modes: 'code', 'plan', 'review'\n", targetMode)
+		fatalf("invalid mode '%s'. Valid modes: 'code', 'plan', 'review'", targetMode)
 		os.Exit(1)
 	}
 
 	if err := engine.SetMode(targetMode); err != nil {
-		fmt.Fprintf(os.Stderr, "error setting mode: %v\n", err)
+		fatalf("setting mode: %v", err)
 		os.Exit(1)
 	}
 
 	if targetMode == "plan" {
-		fmt.Println("🔒 Switched to [PLAN MODE]")
-		fmt.Println("  • Codebase mutations are now BLOCKED.")
-		fmt.Println("  • Plan artifacts in docs/ are permitted.")
+		fmt.Println(ui.Warn("🔒 Switched to [PLAN MODE]"))
+		fmt.Printf("  %s Codebase mutations are now %s.\n", ui.Dim("•"), ui.Error("BLOCKED"))
+		fmt.Printf("  %s Plan artifacts in docs/ are permitted.\n", ui.Dim("•"))
 	} else if targetMode == "code" {
-		fmt.Println("🔓 Switched to [CODE MODE]")
-		fmt.Println("  • Codebase mutations are now UNLOCKED.")
+		fmt.Println(ui.Success("🔓 Switched to [CODE MODE]"))
+		fmt.Printf("  %s Codebase mutations are now %s.\n", ui.Dim("•"), ui.Success("UNLOCKED"))
 	} else {
-		fmt.Println("👁️ Switched to [REVIEW MODE]")
-		fmt.Println("  • Read-only inspection mode active.")
+		fmt.Println(ui.Accent("👁️ Switched to [REVIEW MODE]"))
+		fmt.Printf("  %s Read-only inspection mode active.\n", ui.Dim("•"))
 	}
 }
 
@@ -457,14 +462,14 @@ func cmdUndo(args []string) {
 		switch args[i] {
 		case "--turn", "-t":
 			if i+1 >= len(args) {
-				fmt.Fprintln(os.Stderr, "error: --turn requires a value")
+				fatalf("--turn requires a value")
 				os.Exit(1)
 			}
 			i++
 			turn = args[i]
 		default:
 			if strings.HasPrefix(args[i], "-") {
-				fmt.Fprintf(os.Stderr, "error: unknown flag %q\n", args[i])
+				fatalf("unknown flag %q", args[i])
 				os.Exit(1)
 			}
 			// A bare argument is treated as the turn id.
@@ -474,7 +479,7 @@ func cmdUndo(args []string) {
 
 	workspace, err := core.DetectWorkspace(".")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		fatalf("%v", err)
 		os.Exit(1)
 	}
 
@@ -483,7 +488,7 @@ func cmdUndo(args []string) {
 	if turn == "" {
 		last, err := store.LastTurn()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: could not read snapshots: %v\n", err)
+			fatalf("could not read snapshots: %v", err)
 			os.Exit(1)
 		}
 		if last == "" {
@@ -503,7 +508,7 @@ func cmdUndo(args []string) {
 		if len(restored) == 0 {
 			os.Exit(1)
 		}
-		fmt.Println("  Files listed above were restored; the rest were left untouched.")
+		fmt.Println(ui.Dim("  Files listed above were restored; the rest were left untouched."))
 		return
 	}
 	if len(restored) == 0 {
@@ -518,13 +523,13 @@ func cmdUndo(args []string) {
 func cmdStatus() {
 	workspace, err := core.DetectWorkspace(".")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		fatalf("%v", err)
 		os.Exit(1)
 	}
 
 	engine, err := core.NewEngine(workspace)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error initializing: %v\n", err)
+		fatalf("initializing: %v", err)
 		os.Exit(1)
 	}
 	defer engine.Close()
@@ -553,28 +558,28 @@ func cmdStatus() {
 	}
 
 	fmt.Println()
-	fmt.Println("  ╺┳╸┏━╸╺┳╸┓ ┏┓┏━╸┏━┓   TETHER v" + version)
-	fmt.Println("   ┃ ┣╸  ┃ ┣━┫┣╸ ┣┳┛   Deterministic Cognitive Substrate")
-	fmt.Println("   ╹ ┗━╸ ╹ ╹ ┗┗━╸╹┗━   Local-First AI Agent Gatekeeper")
+	fmt.Println("  " + ui.Bold("╺┳╸┏━╸╺┳╸┓ ┏┓┏━╸┏━┓") + "   " + ui.Title("TETHER v"+version))
+	fmt.Println("   " + ui.Dim("┃ ┣╸  ┃ ┣━┫┣╸ ┣┳┛") + "   " + ui.Dim("Deterministic Cognitive Substrate"))
+	fmt.Println("   " + ui.Dim("╹ ┗━╸ ╹ ╹ ┗┗━╸╹┗━") + "   " + ui.Dim("Local-First AI Agent Gatekeeper"))
 	fmt.Println()
-	fmt.Println("┌─ WORKSPACE & IDENTITY ──────────────────────────────────────────────────┐")
-	fmt.Printf("│ Directory:    %-58s│\n", truncateStr(engine.Workspace, 58))
-	fmt.Printf("│ Git Branch:   %-58s│\n", truncateStr(engine.Branch, 58))
-	fmt.Printf("│ Session ID:   %-58s│\n", truncateStr(engine.SessionID, 58))
-	fmt.Println("└─────────────────────────────────────────────────────────────────────────┘")
-	fmt.Println("┌─ GOVERNANCE ENGINE ─────────────────────────────────────────────────────┐")
-	fmt.Printf("│ Substrate Mode:   %s│\n", ui.Pad(modeBadge, 54))
-	fmt.Printf("│ Write Boundary:   %-54s│\n", truncateStr(writeBoundary, 54))
-	fmt.Printf("│ MCP Protocol:     READY (stdio ndjson JSON-RPC 2.0)                     │\n")
-	fmt.Println("└─────────────────────────────────────────────────────────────────────────┘")
-	fmt.Println("┌─ SUBSTRATE MEMORY ──────────────────────────────────────────────────────┐")
-	fmt.Printf("│ Decisions:        %-54s│\n", fmt.Sprintf("%d recorded", len(decisions)))
-	fmt.Printf("│ Learned Patterns: %-54s│\n", fmt.Sprintf("%d active", len(patterns)))
-	fmt.Printf("│ Knowledge Base:   %-54s│\n", fmt.Sprintf("%d files (%d FTS5 chunks)", kbStats.TotalFiles, kbStats.TotalChunks))
-	fmt.Println("└─────────────────────────────────────────────────────────────────────────┘")
-	fmt.Printf("┌─ TASKS & TODOS [%d pending, %d completed] ──────────────────────────────┐\n", pendingCount, completedCount)
+	fmt.Println(ui.Dim("┌─ ") + ui.Title("WORKSPACE & IDENTITY") + ui.Dim(" ──────────────────────────────────────────────────┐"))
+	fmt.Printf("%s%s%s%s\n", ui.Dim("│ "), ui.Dim(fmt.Sprintf("%-14s", "Directory:")), ui.Pad(ui.Path(truncateStr(engine.Workspace, 58)), 58), ui.Dim("│"))
+	fmt.Printf("%s%s%s%s\n", ui.Dim("│ "), ui.Dim(fmt.Sprintf("%-14s", "Git Branch:")), ui.Pad(ui.Bold(truncateStr(engine.Branch, 58)), 58), ui.Dim("│"))
+	fmt.Printf("%s%s%s%s\n", ui.Dim("│ "), ui.Dim(fmt.Sprintf("%-14s", "Session ID:")), ui.Pad(ui.Dim(truncateStr(engine.SessionID, 58)), 58), ui.Dim("│"))
+	fmt.Println(ui.Dim("└─────────────────────────────────────────────────────────────────────────┘"))
+	fmt.Println(ui.Dim("┌─ ") + ui.Title("GOVERNANCE ENGINE") + ui.Dim(" ─────────────────────────────────────────────────────┐"))
+	fmt.Printf("%s%s%s%s\n", ui.Dim("│ "), ui.Dim(fmt.Sprintf("%-18s", "Substrate Mode:")), ui.Pad(modeBadge, 54), ui.Dim("│"))
+	fmt.Printf("%s%s%s%s\n", ui.Dim("│ "), ui.Dim(fmt.Sprintf("%-18s", "Write Boundary:")), ui.Pad(truncateStr(writeBoundary, 54), 54), ui.Dim("│"))
+	fmt.Printf("%s%s%s%s\n", ui.Dim("│ "), ui.Dim(fmt.Sprintf("%-18s", "MCP Protocol:")), ui.Pad(ui.Success("READY")+" (stdio ndjson JSON-RPC 2.0)", 54), ui.Dim("│"))
+	fmt.Println(ui.Dim("└─────────────────────────────────────────────────────────────────────────┘"))
+	fmt.Println(ui.Dim("┌─ ") + ui.Title("SUBSTRATE MEMORY") + ui.Dim(" ──────────────────────────────────────────────────────┐"))
+	fmt.Printf("%s%s%s%s\n", ui.Dim("│ "), ui.Dim(fmt.Sprintf("%-18s", "Decisions:")), ui.Pad(fmt.Sprintf("%d recorded", len(decisions)), 54), ui.Dim("│"))
+	fmt.Printf("%s%s%s%s\n", ui.Dim("│ "), ui.Dim(fmt.Sprintf("%-18s", "Learned Patterns:")), ui.Pad(fmt.Sprintf("%d active", len(patterns)), 54), ui.Dim("│"))
+	fmt.Printf("%s%s%s%s\n", ui.Dim("│ "), ui.Dim(fmt.Sprintf("%-18s", "Knowledge Base:")), ui.Pad(fmt.Sprintf("%d files (%d FTS5 chunks)", kbStats.TotalFiles, kbStats.TotalChunks), 54), ui.Dim("│"))
+	fmt.Println(ui.Dim("└─────────────────────────────────────────────────────────────────────────┘"))
+	fmt.Println(ui.Dim("┌─ ") + ui.Title(fmt.Sprintf("TASKS & TODOS [%d pending, %d completed]", pendingCount, completedCount)) + ui.Dim(" ───────────────────────────────┐"))
 	if len(todos) == 0 {
-		fmt.Println("│   No tasks recorded for this session.                                   │")
+		fmt.Println(ui.Dim("│ ") + ui.Pad(ui.Dim("No tasks recorded for this session."), 71) + ui.Dim("│"))
 	} else {
 		limit := 5
 		if len(todos) < limit {
@@ -582,18 +587,18 @@ func cmdStatus() {
 		}
 		for i := 0; i < limit; i++ {
 			t := todos[i]
-			icon := "◻"
+			icon := ui.Dim("◻")
 			if t.Status == "completed" {
-				icon = "✔"
+				icon = ui.Success("✔")
 			}
-			line := fmt.Sprintf("  %s #%d %s", icon, t.ID, t.Description)
-			fmt.Printf("│ %-72s│\n", truncateStr(line, 72))
+			line := ui.Pad(fmt.Sprintf("%s #%d %s", icon, t.ID, truncateStr(t.Description, 60)), 71)
+			fmt.Println(ui.Dim("│ ") + line + ui.Dim("│"))
 		}
 		if len(todos) > limit {
-			fmt.Printf("│   ... and %d more tasks                                                 │\n", len(todos)-limit)
+			fmt.Printf("%s %s\n", ui.Dim("│ "+fmt.Sprintf("  ... and %d more tasks", len(todos)-limit)), ui.Dim("                                                  │"))
 		}
 	}
-	fmt.Println("└─────────────────────────────────────────────────────────────────────────┘")
+	fmt.Println(ui.Dim("└─────────────────────────────────────────────────────────────────────────┘"))
 	fmt.Println()
 
 	// A pending subagent proposal silently blocks every write. Never let the
@@ -601,19 +606,21 @@ func cmdStatus() {
 	if pending, perr := engine.ListProposals("pending"); perr == nil && len(pending) > 0 {
 		fmt.Printf("%s %d subagent proposal(s) awaiting your approval", ui.Error("🔒 LOCKED:"), len(pending))
 		if oldest := pending[0]; oldest.Role != "" {
-			fmt.Printf(" (oldest #%d from %s, %s)", oldest.ID, oldest.Role, oldest.CreatedAt)
+			fmt.Printf("%s\n", ui.Dim(fmt.Sprintf(" (oldest #%d from %s, %s)", oldest.ID, oldest.Role, oldest.CreatedAt)))
 		}
 		fmt.Println()
 		fmt.Println(ui.Error("   Codebase writes are BLOCKED until you decide."))
-		fmt.Printf("   Review: tether proposal show %d\n", pending[0].ID)
-		fmt.Printf("   Decide: tether proposal approve %d  |  tether proposal reject %d\n", pending[0].ID, pending[0].ID)
+		fmt.Printf("%s %s\n", ui.Dim("   Review:"), ui.Bold(fmt.Sprintf("tether proposal show %d", pending[0].ID)))
+		fmt.Printf("%s %s %s %s %s\n", ui.Dim("   Decide:"),
+			ui.Bold(fmt.Sprintf("tether proposal approve %d", pending[0].ID)), ui.Dim("|"),
+			ui.Bold(fmt.Sprintf("tether proposal reject %d", pending[0].ID)), ui.Dim(""))
 		fmt.Println()
 	}
 
 	if mode == "plan" {
-		fmt.Println("💡 Quick Action:  Run 'tether mode code' to unlock codebase mutation.")
+		fmt.Println(ui.Accent("💡 Quick Action:") + "  " + ui.Dim("Run 'tether mode code' to unlock codebase mutation."))
 	} else {
-		fmt.Println("💡 Quick Action:  Run 'tether mode plan' to lock codebase in planning mode.")
+		fmt.Println(ui.Accent("💡 Quick Action:") + "  " + ui.Dim("Run 'tether mode plan' to lock codebase in planning mode."))
 	}
 	fmt.Println()
 }
@@ -622,14 +629,14 @@ func cmdStatus() {
 func cmdDoctor() {
 	workspace, err := core.DetectWorkspace(".")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		fatalf("%v", err)
 		os.Exit(1)
 	}
 
 	fmt.Println()
-	fmt.Println("  ╺┳╸┏━╸╺┳╸┓ ┏┓┏━╸┏━┓   TETHER DOCTOR")
-	fmt.Println("   ┃ ┣╸  ┃ ┣━┫┣╸ ┣┳┛   Environment & Substrate Diagnostic")
-	fmt.Println("   ╹ ┗━╸ ╹ ╹ ┗┗━╸╹┗━   Checking agent substrate integrity...")
+	fmt.Println("  " + ui.Bold("╺┳╸┏━╸╺┳╸┓ ┏┓┏━╸┏━┓") + "   " + ui.Title("TETHER DOCTOR"))
+	fmt.Println("   " + ui.Dim("┃ ┣╸  ┃ ┣━┫┣╸ ┣┳┛") + "   " + ui.Dim("Environment & Substrate Diagnostic"))
+	fmt.Println("   " + ui.Dim("╹ ┗━╸ ╹ ╹ ┗┗━╸╹┗━") + "   " + ui.Dim("Checking agent substrate integrity..."))
 	fmt.Println()
 
 	passed := 0
@@ -637,92 +644,108 @@ func cmdDoctor() {
 	failed := 0
 
 	// 1. Storage & SQLite
-	fmt.Println("[1/4] Core Substrate & Storage")
+	fmt.Println(ui.Title("[1/4] Core Substrate & Storage"))
 	dbPath := filepath.Join(workspace, "session.db")
 	if _, err := os.Stat(dbPath); err == nil {
-		fmt.Println("  ✔ Database File:        session.db accessible")
+		fmt.Println(doctorLine(ui.Success("✔"), "Database File:", "session.db accessible"))
 		passed++
 	} else {
-		fmt.Println("  ▲ Database File:        session.db not found (run 'tether init')")
+		fmt.Println(doctorLine(ui.Warn("▲"), "Database File:", "session.db not found (run 'tether init')"))
 		warnings++
 	}
 
 	walPath := filepath.Join(workspace, "session.db-wal")
 	if _, err := os.Stat(walPath); err == nil {
-		fmt.Println("  ✔ WAL Mode:             ACTIVE (session.db-wal present)")
+		fmt.Println(doctorLine(ui.Success("✔"), "WAL Mode:", "ACTIVE (session.db-wal present)"))
 		passed++
 	} else {
-		fmt.Println("  ✔ WAL Mode:             Configured in PRAGMA")
+		fmt.Println(doctorLine(ui.Success("✔"), "WAL Mode:", "Configured in PRAGMA"))
 		passed++
 	}
 
 	gitignorePath := filepath.Join(workspace, ".gitignore")
 	if content, err := os.ReadFile(gitignorePath); err == nil {
 		if strings.Contains(string(content), "session.db") {
-			fmt.Println("  ✔ Git Hygiene:          session.db ignored in .gitignore")
+			fmt.Println(doctorLine(ui.Success("✔"), "Git Hygiene:", "session.db ignored in .gitignore"))
 			passed++
 		} else {
-			fmt.Println("  ✖ Git Hygiene:          session.db NOT in .gitignore!")
+			fmt.Println(doctorLine(ui.Error("✖"), "Git Hygiene:", "session.db NOT in .gitignore!"))
 			failed++
 		}
 	} else {
-		fmt.Println("  ▲ Git Hygiene:          .gitignore not found")
+		fmt.Println(doctorLine(ui.Warn("▲"), "Git Hygiene:", ".gitignore not found"))
 		warnings++
 	}
 
 	// 2. Engine & Session
-	fmt.Println("\n[2/4] Engine & Session Health")
+	fmt.Println("\n" + ui.Title("[2/4] Engine & Session Health"))
 	engine, err := core.NewEngine(workspace)
 	if err != nil {
-		fmt.Printf("  ✖ Engine Init:          Failed (%v)\n", err)
+		fmt.Println(doctorLine(ui.Error("✖"), "Engine Init:", fmt.Sprintf("Failed (%v)", err)))
 		failed++
 	} else {
 		defer engine.Close()
-		fmt.Println("  ✔ Engine Init:          SQLite connected with WAL & 5000ms busy timeout")
-		fmt.Printf("  ✔ Session ID:           %s\n", engine.SessionID)
-		fmt.Printf("  ✔ Current Mode:         %s\n", engine.GetMode())
+		fmt.Println(doctorLine(ui.Success("✔"), "Engine Init:", "SQLite connected with WAL & 5000ms busy timeout"))
+		fmt.Println(doctorLine(ui.Success("✔"), "Session ID:", ui.Dim(engine.SessionID)))
+		fmt.Println(doctorLine(ui.Success("✔"), "Current Mode:", ui.Bold(engine.GetMode())))
 		passed += 3
 	}
 
 	// 3. Agent Configurations
-	fmt.Println("\n[3/4] Agent Wiring & Hooks")
+	fmt.Println("\n" + ui.Title("[3/4] Agent Wiring & Hooks"))
 	home, _ := os.UserHomeDir()
 	agyHooksPath := filepath.Join(home, ".gemini", "config", "hooks.json")
 	if _, err := os.Stat(agyHooksPath); err == nil {
-		fmt.Println("  ✔ Antigravity (agy):    Configured in ~/.gemini/config/hooks.json")
+		fmt.Println(doctorLine(ui.Success("✔"), "Antigravity (agy):", "Configured in ~/.gemini/config/hooks.json"))
 		passed++
 	} else {
-		fmt.Println("  ▲ Antigravity (agy):    ~/.gemini/config/hooks.json not found (run 'tether install agy')")
+		fmt.Println(doctorLine(ui.Warn("▲"), "Antigravity (agy):", "not configured (run 'tether install agy')"))
 		warnings++
 	}
 
 	claudeConfigPath := filepath.Join(home, ".claude", "mcp_config.json")
 	if _, err := os.Stat(claudeConfigPath); err == nil {
-		fmt.Println("  ✔ Claude Code:          Configured in ~/.claude/mcp_config.json")
+		fmt.Println(doctorLine(ui.Success("✔"), "Claude Code:", "Configured in ~/.claude/mcp_config.json"))
 		passed++
 	} else {
-		fmt.Println("  - Claude Code:          Not installed / config not found")
+		fmt.Println(doctorLine(ui.Dim("-"), "Claude Code:", ui.Dim("Not installed / config not found")))
 	}
 
 	// 4. Protocol & Binary
-	fmt.Println("\n[4/4] Binary & Runtime Health")
+	fmt.Println("\n" + ui.Title("[4/4] Binary & Runtime Health"))
 	selfPath, err := os.Executable()
 	if err == nil {
-		fmt.Printf("  ✔ Binary Location:      %s\n", selfPath)
+		fmt.Println(doctorLine(ui.Success("✔"), "Binary Location:", ui.Path(selfPath)))
 		passed++
 	}
-	fmt.Printf("  ✔ Tether Version:       v%s\n", version)
+	fmt.Println(doctorLine(ui.Success("✔"), "Tether Version:", "v"+version))
 	passed++
 
-	fmt.Println("\n───────────────────────────────────────────────────────────────────────────")
-	fmt.Printf("Diagnostic Summary: %d Passed, %d Warnings, %d Failed\n", passed, warnings, failed)
+	fmt.Println("\n" + ui.Dim("───────────────────────────────────────────────────────────────────────────"))
+	fmt.Printf("Diagnostic Summary: %s Passed, %s Warnings, %s Failed\n",
+		ui.Success(fmt.Sprintf("%d", passed)),
+		ui.Warn(fmt.Sprintf("%d", warnings)),
+		func() string {
+			if failed > 0 {
+				return ui.Error(fmt.Sprintf("%d", failed))
+			}
+			return ui.Dim("0")
+		}())
 	if failed > 0 {
-		fmt.Println("\n🛠  Remediation: Run 'tether init' to initialize missing components.")
+		fmt.Println("\n" + ui.Warn("🛠  Remediation: Run 'tether init' to initialize missing components."))
 	} else {
 		fmt.Println(ui.Success("✓ Substrate is healthy and ready for agent execution."))
 	}
-	fmt.Println("───────────────────────────────────────────────────────────────────────────")
+	fmt.Println(ui.Dim("───────────────────────────────────────────────────────────────────────────"))
 	fmt.Println()
+}
+
+// fatalf prints a styled error to stderr and exits. Every command funnels its
+// failures through here so error output reads the same everywhere, and so the
+// "error: " prefix is written once instead of at 25 call sites.
+func fatalf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "%s %s\n", ui.Error("error:"), fmt.Sprintf(format, args...))
+	os.Exit(1)
 }
 
 // truncateStr truncates a string to maxLen runes or pads with spaces if shorter
@@ -734,6 +757,12 @@ func truncateStr(s string, maxLen int) string {
 	return s
 }
 
+// doctorLine renders one doctor row. The label is padded while still plain
+// text, before any styling, so colour codes never shift the value column.
+func doctorLine(mark, label, value string) string {
+	return fmt.Sprintf("  %s %s %s", mark, ui.Pad(label, 22), value)
+}
+
 // cmdInstall wires tether into the specified agent
 func cmdInstall() {
 	agent := "agy" // default
@@ -742,7 +771,7 @@ func cmdInstall() {
 	}
 
 	if err := adapter.Install(agent); err != nil {
-		fmt.Fprintf(os.Stderr, "install error: %v\n", err)
+		fatalf("install: %v", err)
 		os.Exit(1)
 	}
 
@@ -790,13 +819,13 @@ func cmdRun(args []string) {
 
 	workspace, err := core.DetectWorkspace(".")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		fatalf("%v", err)
 		os.Exit(1)
 	}
 
 	engine, err := core.NewEngine(workspace)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		fatalf("%v", err)
 		os.Exit(1)
 	}
 	defer engine.Close()
@@ -810,17 +839,16 @@ func cmdRun(args []string) {
 	prompt := strings.TrimSpace(strings.Join(promptParts, " "))
 	if prompt == "" {
 		if err := runner.RunInteractive(context.Background(), os.Stdin); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			os.Exit(1)
+			fatalf("%v", err)
 		}
 		return
 	}
 
 	out, err := runner.Run(context.Background(), prompt)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "harness error: %v\n", err)
-		os.Exit(1)
+		fatalf("harness: %v", err)
 	}
+	// Agent output is streamed verbatim: it may contain its own formatting.
 	fmt.Println(out)
 }
 

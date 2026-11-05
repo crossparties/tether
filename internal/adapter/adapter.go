@@ -271,8 +271,8 @@ func installClaude() error {
 		return fmt.Errorf("write hooks.json: %w", err)
 	}
 
-	fmt.Printf("  → MCP server configured: %s\n", mcpPath)
-	fmt.Printf("  → Lifecycle hooks configured: %s\n", hooksPath)
+	fmt.Printf("  %s MCP server configured: %s\n", ui.Success("→"), ui.Path(mcpPath))
+	fmt.Printf("  %s Lifecycle hooks configured: %s\n", ui.Success("→"), ui.Path(hooksPath))
 	return nil
 }
 
@@ -307,7 +307,7 @@ func installGenericMCP(relDir, fileName string) error {
 		return fmt.Errorf("write %s: %w", fileName, err)
 	}
 
-	fmt.Printf("  → MCP server configured: %s\n", mcpPath)
+	fmt.Printf("  %s MCP server configured: %s\n", ui.Success("→"), ui.Path(mcpPath))
 	return nil
 }
 
