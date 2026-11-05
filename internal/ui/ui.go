@@ -115,6 +115,38 @@ func style(s string, codes ...string) string {
 	return out + s + reset
 }
 
+// Pad right-pads s with spaces to width printable characters. Unlike the
+// %-Ns verb it ignores SGR escape sequences, so coloured text still lines up in
+// boxed output. Strings at or past width are returned unchanged.
+func Pad(s string, width int) string {
+	visible := VisibleLen(s)
+	if visible >= width {
+		return s
+	}
+	return s + repeat(" ", width-visible)
+}
+
+// VisibleLen returns the number of printable runes in s, skipping ANSI SGR
+// escape sequences so callers can align coloured text.
+func VisibleLen(s string) int {
+	count := 0
+	inEscape := false
+	for _, r := range s {
+		if inEscape {
+			if r == 'm' {
+				inEscape = false
+			}
+			continue
+		}
+		if r == '\x1b' {
+			inEscape = true
+			continue
+		}
+		count++
+	}
+	return count
+}
+
 // Title styles a heading.
 func Title(s string) string { return style(s, bold, cyan) }
 

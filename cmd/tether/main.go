@@ -14,6 +14,7 @@ import (
 	"github.com/croosparties/tether/internal/hooks"
 	"github.com/croosparties/tether/internal/mcp"
 	"github.com/croosparties/tether/internal/snapshot"
+	"github.com/croosparties/tether/internal/ui"
 )
 
 const version = "0.2.0"
@@ -486,8 +487,8 @@ func cmdUndo(args []string) {
 			os.Exit(1)
 		}
 		if last == "" {
-			fmt.Println("ℹ Nothing to undo — no snapshot recorded yet.")
-			fmt.Println("  Snapshots are taken before each file write, so run the agent first.")
+			fmt.Println(ui.Dim("ℹ Nothing to undo — no snapshot recorded yet."))
+			fmt.Println(ui.Dim("  Snapshots are taken before each file write, so run the agent first."))
 			return
 		}
 		turn = last
@@ -495,10 +496,10 @@ func cmdUndo(args []string) {
 
 	restored, err := store.Restore(turn, workspace)
 	for _, path := range restored {
-		fmt.Printf("↩ restored %s\n", path)
+		fmt.Printf("↩ restored %s\n", ui.Path(path))
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "⚠ Undo partially failed for turn %s: %v\n", turn, err)
+		fmt.Fprintf(os.Stderr, "⚠ Undo partially failed for turn %s: %v\n", ui.Bold(turn), err)
 		if len(restored) == 0 {
 			os.Exit(1)
 		}
@@ -506,10 +507,11 @@ func cmdUndo(args []string) {
 		return
 	}
 	if len(restored) == 0 {
-		fmt.Printf("ℹ Turn %s had no captured files.\n", turn)
+		fmt.Printf("ℹ Turn %s had no captured files.\n", ui.Bold(turn))
 		return
 	}
-	fmt.Printf("✓ Undo complete — %d file(s) restored from turn %s.\n", len(restored), turn)
+	fmt.Printf("%s — %d file(s) restored from turn %s.\n",
+		ui.Success("✓ Undo complete"), len(restored), ui.Bold(turn))
 }
 
 // cmdStatus prints the substrate observability dashboard
@@ -528,10 +530,10 @@ func cmdStatus() {
 	defer engine.Close()
 
 	mode := engine.GetMode()
-	modeBadge := "🟢 [ CODE MODE ]  (mutation allowed)"
+	modeBadge := ui.Success("🟢 [ CODE MODE ]") + "  (mutation allowed)"
 	writeBoundary := "UNRESTRICTED (full file write access)"
 	if mode == "plan" {
-		modeBadge = "🟡 [ PLAN MODE ]  (mutation restricted)"
+		modeBadge = ui.Warn("🟡 [ PLAN MODE ]") + "  (mutation restricted)"
 		writeBoundary = "RESTRICTED (writes allowed ONLY in docs/** and .agents/**)"
 	}
 
@@ -561,7 +563,7 @@ func cmdStatus() {
 	fmt.Printf("│ Session ID:   %-58s│\n", truncateStr(engine.SessionID, 58))
 	fmt.Println("└─────────────────────────────────────────────────────────────────────────┘")
 	fmt.Println("┌─ GOVERNANCE ENGINE ─────────────────────────────────────────────────────┐")
-	fmt.Printf("│ Substrate Mode:   %-54s│\n", modeBadge)
+	fmt.Printf("│ Substrate Mode:   %s│\n", ui.Pad(modeBadge, 54))
 	fmt.Printf("│ Write Boundary:   %-54s│\n", truncateStr(writeBoundary, 54))
 	fmt.Printf("│ MCP Protocol:     READY (stdio ndjson JSON-RPC 2.0)                     │\n")
 	fmt.Println("└─────────────────────────────────────────────────────────────────────────┘")
@@ -597,12 +599,12 @@ func cmdStatus() {
 	// A pending subagent proposal silently blocks every write. Never let the
 	// user discover that only when a mutation is refused mid-task.
 	if pending, perr := engine.ListProposals("pending"); perr == nil && len(pending) > 0 {
-		fmt.Printf("🔒 LOCKED: %d subagent proposal(s) awaiting your approval", len(pending))
+		fmt.Printf("%s %d subagent proposal(s) awaiting your approval", ui.Error("🔒 LOCKED:"), len(pending))
 		if oldest := pending[0]; oldest.Role != "" {
 			fmt.Printf(" (oldest #%d from %s, %s)", oldest.ID, oldest.Role, oldest.CreatedAt)
 		}
 		fmt.Println()
-		fmt.Println("   Codebase writes are BLOCKED until you decide.")
+		fmt.Println(ui.Error("   Codebase writes are BLOCKED until you decide."))
 		fmt.Printf("   Review: tether proposal show %d\n", pending[0].ID)
 		fmt.Printf("   Decide: tether proposal approve %d  |  tether proposal reject %d\n", pending[0].ID, pending[0].ID)
 		fmt.Println()

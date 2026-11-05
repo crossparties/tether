@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/croosparties/tether/internal/ui"
 )
 
 // Install wires tether into the specified agent's configuration
@@ -135,9 +137,9 @@ func installAgy() error {
 		fmt.Fprintf(os.Stderr, "warning: could not update settings.json: %v\n", err)
 	}
 
-	fmt.Printf("  → MCP server configured: %s\n", mcpPath)
-	fmt.Printf("  → Lifecycle hooks configured: %s\n", hooksPath)
-	fmt.Printf("  → Auto-approve permissions enabled for Tether MCP\n")
+	fmt.Printf("  %s MCP server configured: %s\n", ui.Success("→"), ui.Path(mcpPath))
+	fmt.Printf("  %s Lifecycle hooks configured: %s\n", ui.Success("→"), ui.Path(hooksPath))
+	fmt.Printf("  %s Auto-approve permissions enabled for Tether MCP\n", ui.Success("→"))
 	return nil
 }
 

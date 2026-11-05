@@ -133,3 +133,43 @@ func TestSplitWidthPreservesParagraphs(t *testing.T) {
 		t.Fatalf("content lost: %v", lines)
 	}
 }
+
+// TestVisibleLenIgnoresEscapeCodes pins the reason Pad exists: boxed output
+// must align even when the text inside carries colour.
+func TestVisibleLenIgnoresEscapeCodes(t *testing.T) {
+	SetEnabled(true)
+	t.Cleanup(func() { SetEnabled(false) })
+
+	coloured := Success("OK")
+	if got := VisibleLen(coloured); got != 2 {
+		t.Fatalf("VisibleLen(%q) = %d, want 2", coloured, got)
+	}
+	if got := VisibleLen("plain"); got != 5 {
+		t.Fatalf("VisibleLen(plain) = %d, want 5", got)
+	}
+}
+
+// TestPadAlignsColouredText is the regression guard for status boxes: a colour
+// escape must not consume padding, otherwise the right border drifts.
+func TestPadAlignsColouredText(t *testing.T) {
+	SetEnabled(true)
+	t.Cleanup(func() { SetEnabled(false) })
+
+	padded := Pad(Success("OK"), 10)
+	if got := VisibleLen(padded); got != 10 {
+		t.Fatalf("padded width = %d, want 10", got)
+	}
+	if !strings.HasSuffix(strings.TrimRight(padded, " "), "OK") &&
+		!strings.Contains(padded, "OK") {
+		t.Fatalf("content lost from padded output: %q", padded)
+	}
+
+	// Plain text behaves like %-10s.
+	if got := Pad("abc", 6); got != "abc   " {
+		t.Fatalf("Pad without colour = %q, want %q", got, "abc   ")
+	}
+	// Already-wide input is untouched.
+	if got := Pad("abcdef", 3); got != "abcdef" {
+		t.Fatalf("Pad must not truncate, got %q", got)
+	}
+}
