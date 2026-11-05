@@ -213,19 +213,46 @@ func DiffAdd(s string) string { return style(s, green) }
 func DiffDel(s string) string { return style(s, red) }
 
 // Banner renders a boxed, unmissable notice. width is the inner text width.
+// Rule renders a horizontal rule of the given total width with label centred
+// in it:
+//
+//	━━━━━━━━━━━━━━━━━━━━━━ label ━━━━━━━━━━━━━━━━━━━━━━
+//
+// Width is measured in display columns, so a label containing emoji or CJK
+// still produces an evenly filled rule. When the label does not fit, the rule
+// is omitted and only the label is returned.
+func Rule(label string) string {
+	return RuleWidth(label, 72)
+}
+
+// RuleWidth is Rule with an explicit total display width.
+func RuleWidth(label string, width int) string {
+	const heavy = "━"
+	labelCols := VisibleLen(label)
+	// " label " needs labelCols + 2 columns.
+	remaining := width - labelCols - 2
+	if remaining < 6 {
+		return label
+	}
+	left := remaining / 2
+	right := remaining - left
+	return repeat(heavy, left) + " " + label + " " + repeat(heavy, right)
+}
+
+// Banner renders a boxed callout.
 func Banner(label, body string, colour func(string) string) string {
 	const width = 56
 	top := "╔" + repeat("═", width) + "╗"
 	bottom := "╚" + repeat("═", width) + "╝"
 
 	head := fmt.Sprintf(" %s", label)
-	head += repeat(" ", max(0, width-len([]rune(head))))
+	head += repeat(" ", max(0, width-VisibleLen(head)))
 	lines := []string{top, "║" + head + "║"}
 
 	if body != "" {
 		lines = append(lines, "║"+repeat(" ", width)+"║")
 		for _, line := range splitWidth(body, width-2) {
-			pad := repeat(" ", max(0, width-2-len([]rune(line))))
+			pad := repeat(" ", max(0, width-2-VisibleLen(line)))
 			lines = append(lines, "║ "+line+pad+" ║")
 		}
 	}

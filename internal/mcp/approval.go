@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/croosparties/tether/internal/preview"
+	"github.com/croosparties/tether/internal/ui"
 )
 
 // This file is the approval gate for the MCP path.
@@ -195,10 +196,20 @@ func (s *Server) tag(m *mutation) approvalTag {
 
 // approvalRequest renders the blocking message. It must tell the user what will
 // change, where, and exactly what to call to allow it.
+//
+// The block is fenced by a coloured rule carrying the request identity. A plain
+// header line was not enough: the message is emitted between tool output, so
+// without a rule at both ends a run of blocked calls blends into the output
+// above and below it and the user cannot see where one request ends and the
+// next begins. The rule carries the sequence number and fingerprint so the
+// fence also says which request it is closing.
 func (s *Server) approvalRequest(m *mutation) string {
 	t := s.tag(m)
 
 	var b strings.Builder
+	b.WriteString(approvalRule(fmt.Sprintf("approval #%d  %s", t.seq, t.fp)))
+	b.WriteString("\n")
+
 	if t.seen {
 		fmt.Fprintf(&b, "APPROVAL REQUIRED #%d %s — repeated request, same change as before.\n", t.seq, t.fp)
 	} else {
@@ -234,13 +245,23 @@ func (s *Server) approvalRequest(m *mutation) string {
 		b.WriteString("This change cannot be approved because it targets no known path or command.\n")
 	}
 
-	b.WriteString("\nRepeat the same tool call after approval; the guard re-checks the grant each time.")
+	b.WriteString("\nRepeat the same tool call after approval; the guard re-checks the grant each time.\n")
 
-	// Close the block with its own identity. Without a trailing marker the next
-	// tool's output starts on the line after this prose and the two blends
-	// together, so a long run of blocked calls reads as one wall of text.
-	fmt.Fprintf(&b, "\n──── end of approval #%d %s ────\n", t.seq, t.fp)
+	// Close the block with a matching rule. The trailing newline after it keeps
+	// the next tool's output from butting against the fence.
+	b.WriteString(approvalRule(fmt.Sprintf("end of approval #%d  %s", t.seq, t.fp)))
+	b.WriteString("\n")
 	return b.String()
+}
+
+// approvalRule renders a full-width coloured rule with an inline label, e.g.
+//
+//	━━━━━━━━━━━━━━━━━━━━ approval #7  7486658a ━━━━━━━━━━━━━━━━━━━━
+//
+// It is built with the same rune-width accounting as the rest of the CLI, so
+// the rule stays the same length whether or not colour is enabled.
+func approvalRule(label string) string {
+	return ui.Warn(ui.Rule(label))
 }
 
 // commandPrefix picks the token run a prefix grant should cover. Offering the

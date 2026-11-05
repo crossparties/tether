@@ -68,16 +68,26 @@ func TestRepeatedApprovalIsMarkedAsRepeat(t *testing.T) {
 	}
 }
 
-// The block must end with a marker so the next tool's output cannot be read as
-// part of the approval text.
-func TestApprovalBlockHasTrailingMarker(t *testing.T) {
+// The block must start and end with a visible rule, so the next tool's output
+// cannot be read as part of the approval text and one request cannot be
+// confused with the next.
+func TestApprovalBlockIsFenced(t *testing.T) {
 	s, _ := newApprovalTestServer(t)
 
 	out := s.approvalRequest(changeFor("a.txt", "x"))
-	trimmed := strings.TrimRight(out, "\n")
-	lastLine := trimmed[strings.LastIndex(trimmed, "\n")+1:]
-	if !strings.HasPrefix(lastLine, "──── end of approval #") {
-		t.Fatalf("block should end with an approval marker, last line was:\n%s", lastLine)
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	first, last := lines[0], lines[len(lines)-1]
+
+	if !strings.Contains(first, "approval #1") {
+		t.Fatalf("opening rule should carry the request identity, got:\n%s", first)
+	}
+	if !strings.Contains(last, "end of approval #1") {
+		t.Fatalf("closing rule should carry the request identity, got:\n%s", last)
+	}
+	for _, l := range []string{first, last} {
+		if !strings.Contains(l, "━") {
+			t.Fatalf("fence lines must contain rule characters, got:\n%s", l)
+		}
 	}
 }
 
