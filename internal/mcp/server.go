@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/croosparties/tether/internal/core"
@@ -19,6 +20,13 @@ import (
 // Server implements MCP protocol over stdio
 type Server struct {
 	engine *core.Engine
+
+	// Approval request identity. A run of blocked calls otherwise prints the
+	// same opening words and boilerplate every time, so the reader cannot tell
+	// which request they are looking at or whether they already answered it.
+	mu           sync.Mutex
+	approvalSeq  int
+	approvalSeen map[string]bool
 }
 
 func NewServer(engine *core.Engine) *Server {

@@ -1,6 +1,8 @@
 package mcp
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -156,11 +158,52 @@ func (s *Server) requireApproval(tool string, args json.RawMessage) string {
 	return s.approvalRequest(m)
 }
 
+// approvalTag identifies one approval request so a reader can tell a fresh
+// request from a repeat of an older one.
+//
+// Without it every block opened with the same words and the same boilerplate,
+// so a run of blocked calls read as one undifferentiated wall: the user could
+// not say which request they were looking at, or whether they had already
+// answered it. The sequence number orders requests; the fingerprint survives a
+// retry, so re-asking about an identical change is visibly the same request.
+type approvalTag struct {
+	seq  int
+	fp   string // short fingerprint of what would change
+	seen bool   // this exact change was already asked about
+}
+
+// tag records this request and reports how to label it.
+func (s *Server) tag(m *mutation) approvalTag {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.approvalSeq++
+	key := m.tool + "\x00" + m.scope + "\x00" + m.command + "\x00" +
+		m.change.Path + "\x00" + m.change.Before + "\x00" + m.change.After
+
+	sum := sha256.Sum256([]byte(key))
+	fp := hex.EncodeToString(sum[:4]) // 8 hex chars is plenty to disambiguate
+
+	if s.approvalSeen == nil {
+		s.approvalSeen = make(map[string]bool)
+	}
+	seen := s.approvalSeen[key]
+	s.approvalSeen[key] = true
+
+	return approvalTag{seq: s.approvalSeq, fp: fp, seen: seen}
+}
+
 // approvalRequest renders the blocking message. It must tell the user what will
 // change, where, and exactly what to call to allow it.
 func (s *Server) approvalRequest(m *mutation) string {
+	t := s.tag(m)
+
 	var b strings.Builder
-	b.WriteString("APPROVAL REQUIRED — nothing has been written yet.\n\n")
+	if t.seen {
+		fmt.Fprintf(&b, "APPROVAL REQUIRED #%d %s — repeated request, same change as before.\n", t.seq, t.fp)
+	} else {
+		fmt.Fprintf(&b, "APPROVAL REQUIRED #%d %s — nothing has been written yet.\n", t.seq, t.fp)
+	}
 	b.WriteString("Proposed change:\n")
 	b.WriteString(m.change.Render())
 	b.WriteString("\n\n")
@@ -192,6 +235,11 @@ func (s *Server) approvalRequest(m *mutation) string {
 	}
 
 	b.WriteString("\nRepeat the same tool call after approval; the guard re-checks the grant each time.")
+
+	// Close the block with its own identity. Without a trailing marker the next
+	// tool's output starts on the line after this prose and the two blends
+	// together, so a long run of blocked calls reads as one wall of text.
+	fmt.Fprintf(&b, "\n──── end of approval #%d %s ────\n", t.seq, t.fp)
 	return b.String()
 }
 
