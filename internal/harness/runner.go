@@ -17,6 +17,7 @@ import (
 	"github.com/croosparties/tether/internal/core"
 	"github.com/croosparties/tether/internal/hooks"
 	"github.com/croosparties/tether/internal/mcp"
+	"github.com/croosparties/tether/internal/snapshot"
 	"github.com/croosparties/tether/internal/ui"
 )
 
@@ -212,6 +213,44 @@ type openAIFunction struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
 	Parameters  mcp.InputSchema `json:"parameters"`
+}
+
+// undo restores the files captured during a turn. When turn is empty the most
+// recently snapshotted turn is used. It reports progress on the REPL output and
+// never returns an error: an undo that cannot run is a message, not a crash.
+func (r *Runner) undo(turn string) {
+	store := snapshot.New(r.engine.Workspace)
+
+	if turn == "" {
+		last, err := store.LastTurn()
+		if err != nil {
+			fmt.Fprintf(r.cfg.Out, "✖ Could not read snapshots: %v\n\n", err)
+			return
+		}
+		if last == "" {
+			fmt.Fprintln(r.cfg.Out, "ℹ Nothing to undo — no snapshot recorded yet.")
+			fmt.Fprintln(r.cfg.Out, "  Snapshots are taken before each file write, so run the agent first.")
+			fmt.Fprintln(r.cfg.Out)
+			return
+		}
+		turn = last
+	}
+
+	restored, err := store.Restore(turn, r.engine.Workspace)
+	if len(restored) == 0 && err == nil {
+		fmt.Fprintf(r.cfg.Out, "ℹ Turn %s had no captured files.\n\n", ui.Bold(turn))
+		return
+	}
+	for _, path := range restored {
+		fmt.Fprintf(r.cfg.Out, "↩ restored %s\n", path)
+	}
+	if err != nil {
+		fmt.Fprintf(r.cfg.Out, "⚠ Undo partially failed for turn %s: %v\n", ui.Bold(turn), err)
+		fmt.Fprintln(r.cfg.Out, "  Files listed above were restored; the rest were left untouched.")
+		fmt.Fprintln(r.cfg.Out)
+		return
+	}
+	fmt.Fprintf(r.cfg.Out, "✓ Undo complete — %d file(s) restored from turn %s.\n\n", len(restored), ui.Bold(turn))
 }
 
 // Run executes a prompt through PreInvocation -> LLM Tool Loop (PreToolUse -> CallTool -> PostToolUse)
@@ -651,6 +690,13 @@ func (r *Runner) RunInteractive(ctx context.Context, in io.Reader) error {
 			case "/clear":
 				r.history = nil
 				fmt.Fprintln(r.cfg.Out, "✓ Conversation history cleared (substrate memory in session.db retained).")
+				continue
+			case "/undo":
+				turn := ""
+				if len(parts) >= 2 {
+					turn = parts[1]
+				}
+				r.undo(turn)
 				continue
 			}
 		}

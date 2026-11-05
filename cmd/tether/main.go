@@ -13,6 +13,7 @@ import (
 	"github.com/croosparties/tether/internal/harness"
 	"github.com/croosparties/tether/internal/hooks"
 	"github.com/croosparties/tether/internal/mcp"
+	"github.com/croosparties/tether/internal/snapshot"
 )
 
 const version = "0.2.0"
@@ -32,6 +33,8 @@ func main() {
 		cmdHook()
 	case "mode":
 		cmdMode()
+	case "undo":
+		cmdUndo(os.Args[2:])
 	case "status":
 		cmdStatus()
 	case "doctor":
@@ -232,33 +235,56 @@ func cmdProposal(args []string) {
 		fmt.Printf("Role:   %s\n", p.Role)
 		fmt.Printf("Status: %s\n", p.Status)
 		fmt.Printf("Created: %s\n", p.CreatedAt)
+		if p.Role == "spec" {
+			fmt.Println("Note:   this is a plan to review, not a code patch.")
+		}
 		fmt.Println(strings.Repeat("─", 60))
 		fmt.Println(p.Proposal)
+		if p.Comment != "" {
+			fmt.Println(strings.Repeat("─", 60))
+			fmt.Printf("Your steering: %s\n", p.Comment)
+		}
 
-	case "approve", "reject":
+	case "approve", "reject", "abandon":
 		verdict := args[0]
 		if len(args) < 2 {
-			fmt.Fprintf(os.Stderr, "usage: tether proposal %s <id|--all>\n", verdict)
+			fmt.Fprintf(os.Stderr, "usage: tether proposal %s <id|--all> [-m \"steering\"] [--topic]\n", verdict)
+			os.Exit(1)
+		}
+
+		// A rejection may carry steering (revisit with direction) or mean the
+		// user changed topic (drop the work, do not resubmit).
+		comment, topic, rest := parseVerdictFlags(args[2:])
+		if len(rest) > 0 {
+			fmt.Fprintf(os.Stderr, "unexpected argument %q\n", rest[0])
+			os.Exit(1)
+		}
+		if verdict != "reject" && (comment != "" || topic) {
+			fmt.Fprintf(os.Stderr, "-m/--topic only apply to reject\n")
 			os.Exit(1)
 		}
 
 		var affected int64
-		if args[1] == "--all" {
+		switch {
+		case args[1] == "--all":
 			if verdict == "approve" {
 				affected, err = engine.ApproveProposal()
 			} else {
 				affected, err = engine.RejectProposal()
 			}
-		} else {
+		default:
 			id, perr := strconv.ParseInt(args[1], 10, 64)
 			if perr != nil {
 				fmt.Fprintf(os.Stderr, "invalid proposal id %q\n", args[1])
 				os.Exit(1)
 			}
-			if verdict == "approve" {
+			switch {
+			case verdict == "approve":
 				affected, err = engine.ApproveProposalByID(id)
-			} else {
-				affected, err = engine.RejectProposalByID(id)
+			case verdict == "abandon" || topic:
+				affected, err = engine.AbandonProposal(id)
+			default:
+				affected, err = engine.RejectProposalWithComment(id, comment)
 			}
 		}
 		if err != nil {
@@ -270,17 +296,82 @@ func cmdProposal(args []string) {
 			return
 		}
 		icon, done := "✅", "approved"
-		if verdict == "reject" {
+		switch {
+		case verdict == "reject" || topic:
 			icon, done = "🚫", "rejected"
 		}
 		fmt.Printf("%s %d proposal(s) %s by you via CLI.\n", icon, affected, done)
-		fmt.Println("🔓 Codebase writes are no longer blocked.")
+		if verdict == "approve" {
+			fmt.Println("🔓 Codebase writes are no longer blocked.")
+			return
+		}
+		fmt.Println("🔒 Writes stay blocked until a new proposal is approved.")
+		if topic {
+			fmt.Println("Topic dropped — the agent must not resubmit this work.")
+		} else if comment != "" {
+			fmt.Printf("Steering recorded: %s\n", comment)
+			fmt.Println("The agent must revise with this direction, not guess at a fix.")
+		} else {
+			fmt.Println("No steering given — the agent must wait for your comment.")
+		}
+
+	case "feedback":
+		feedback, ferr := engine.GetRejectionFeedback(10)
+		if ferr != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", ferr)
+			os.Exit(1)
+		}
+		if len(feedback) == 0 {
+			fmt.Println("No rejections to answer. Nothing is waiting on you.")
+			return
+		}
+		for _, p := range feedback {
+			fmt.Printf("#%d  %-12s %-10s %s\n", p.ID, p.Role, p.Status, p.CreatedAt)
+			for _, line := range previewLines(p.Proposal, 2) {
+				fmt.Printf("      %s\n", line)
+			}
+			if p.Comment == "" {
+				fmt.Println("      ↳ waiting for your direction (tether proposal show " +
+					strconv.FormatInt(p.ID, 10) + ")")
+			} else {
+				fmt.Printf("      ↳ you said: %s\n", p.Comment)
+			}
+			fmt.Println()
+		}
 
 	default:
 		fmt.Fprintf(os.Stderr, "unknown subcommand %q\n", args[0])
-		fmt.Fprintln(os.Stderr, "usage: tether proposal [list|show <id>|approve <id|--all>|reject <id|--all>]")
+		fmt.Fprintln(os.Stderr, "usage: tether proposal [list|show <id>|approve <id|--all>|reject <id|--all> [-m \"steering\"|--topic]|abandon <id>|feedback]")
 		os.Exit(1)
 	}
+}
+
+// parseVerdictFlags splits trailing reject options from positional arguments.
+// It accepts -m/--message/--comment with a value, and --topic as a bare flag.
+func parseVerdictFlags(args []string) (comment string, topic bool, rest []string) {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--topic":
+			topic = true
+		case arg == "-m" || arg == "--message" || arg == "--comment":
+			if i+1 >= len(args) {
+				fmt.Fprintf(os.Stderr, "%s needs a value\n", arg)
+				os.Exit(1)
+			}
+			comment = args[i+1]
+			i++
+		case strings.HasPrefix(arg, "--message="):
+			comment = strings.TrimPrefix(arg, "--message=")
+		case strings.HasPrefix(arg, "--comment="):
+			comment = strings.TrimPrefix(arg, "--comment=")
+		case strings.HasPrefix(arg, "-m="):
+			comment = strings.TrimPrefix(arg, "-m=")
+		default:
+			rest = append(rest, arg)
+		}
+	}
+	return comment, topic, rest
 }
 
 // previewLines returns at most max non-empty lines from text, trimmed.
@@ -355,6 +446,70 @@ func cmdMode() {
 		fmt.Println("👁️ Switched to [REVIEW MODE]")
 		fmt.Println("  • Read-only inspection mode active.")
 	}
+}
+
+// cmdUndo restores files captured by the snapshot store for a given turn, or
+// for the most recent turn when no --turn flag is supplied.
+func cmdUndo(args []string) {
+	turn := ""
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--turn", "-t":
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "error: --turn requires a value")
+				os.Exit(1)
+			}
+			i++
+			turn = args[i]
+		default:
+			if strings.HasPrefix(args[i], "-") {
+				fmt.Fprintf(os.Stderr, "error: unknown flag %q\n", args[i])
+				os.Exit(1)
+			}
+			// A bare argument is treated as the turn id.
+			turn = args[i]
+		}
+	}
+
+	workspace, err := core.DetectWorkspace(".")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	store := snapshot.New(workspace)
+
+	if turn == "" {
+		last, err := store.LastTurn()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: could not read snapshots: %v\n", err)
+			os.Exit(1)
+		}
+		if last == "" {
+			fmt.Println("ℹ Nothing to undo — no snapshot recorded yet.")
+			fmt.Println("  Snapshots are taken before each file write, so run the agent first.")
+			return
+		}
+		turn = last
+	}
+
+	restored, err := store.Restore(turn, workspace)
+	for _, path := range restored {
+		fmt.Printf("↩ restored %s\n", path)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "⚠ Undo partially failed for turn %s: %v\n", turn, err)
+		if len(restored) == 0 {
+			os.Exit(1)
+		}
+		fmt.Println("  Files listed above were restored; the rest were left untouched.")
+		return
+	}
+	if len(restored) == 0 {
+		fmt.Printf("ℹ Turn %s had no captured files.\n", turn)
+		return
+	}
+	fmt.Printf("✓ Undo complete — %d file(s) restored from turn %s.\n", len(restored), turn)
 }
 
 // cmdStatus prints the substrate observability dashboard

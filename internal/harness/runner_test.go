@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/croosparties/tether/internal/core"
+	"github.com/croosparties/tether/internal/snapshot"
 	"github.com/croosparties/tether/internal/ui"
 )
 
@@ -360,5 +361,68 @@ func TestPrintApprovalRequiredLabelsApproval(t *testing.T) {
 	}
 	if strings.Contains(out, "WRITE") {
 		t.Fatalf("an approval request must not look like a write log:\n%s", out)
+	}
+}
+
+// TestUndoReportsNothingWhenNoSnapshotExists proves /undo degrades to a message
+// rather than an error on a fresh workspace, which is the state most users hit
+// the first time they type it.
+func TestUndoReportsNothingWhenNoSnapshotExists(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := core.NewEngine(dir)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	defer engine.Close()
+
+	var buf bytes.Buffer
+	r := NewRunner(engine, Config{Out: &buf})
+	r.undo("")
+
+	out := buf.String()
+	if !strings.Contains(out, "Nothing to undo") {
+		t.Fatalf("expected a friendly empty-state message, got:\n%s", out)
+	}
+	if strings.Contains(out, "✓ Undo complete") {
+		t.Fatalf("must not claim success when nothing was restored:\n%s", out)
+	}
+}
+
+// TestUndoRestoresModifiedFile drives the full path: a captured file is changed
+// on disk, then /undo puts the original contents back.
+func TestUndoRestoresModifiedFile(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := core.NewEngine(dir)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	defer engine.Close()
+
+	target := filepath.Join(dir, "config.go")
+	if err := os.WriteFile(target, []byte("ORIGINAL"), 0644); err != nil {
+		t.Fatalf("write original: %v", err)
+	}
+
+	store := snapshot.New(engine.Workspace)
+	if err := store.Capture("turn-undo", "config.go"); err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	if err := os.WriteFile(target, []byte("MODIFIED"), 0644); err != nil {
+		t.Fatalf("write modified: %v", err)
+	}
+
+	var buf bytes.Buffer
+	r := NewRunner(engine, Config{Out: &buf})
+	r.undo("")
+
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read restored file: %v", err)
+	}
+	if string(got) != "ORIGINAL" {
+		t.Fatalf("file was not restored, contents = %q", string(got))
+	}
+	if out := buf.String(); !strings.Contains(out, "Undo complete") {
+		t.Fatalf("expected a success message, got:\n%s", out)
 	}
 }

@@ -68,6 +68,14 @@ func (s *Store) Capture(turn, path string) error {
 		return err
 	}
 
+	// Resolve relative paths against the workspace, not the process CWD. A
+	// relative path means "this file in the project", and the process may have
+	// been started from an unrelated directory.
+	path, err = s.resolve(path)
+	if err != nil {
+		return err
+	}
+
 	stored, err := s.relativePath(path)
 	if err != nil {
 		return err
@@ -208,6 +216,20 @@ func (s *Store) save(turn string, index *Index) error {
 		return err
 	}
 	return os.WriteFile(filepath.Join(dir, "index.json"), data, 0644)
+}
+
+// resolve turns a path into an absolute one, interpreting relative paths as
+// being inside the workspace rather than relative to the process working
+// directory. Without this, "main.go" captured from a different CWD would point
+// at the wrong file and undo would restore the wrong contents.
+func (s *Store) resolve(path string) (string, error) {
+	if filepath.IsAbs(path) {
+		return filepath.Clean(path), nil
+	}
+	// Relative paths mean "this file in the project", so anchor them at the
+	// workspace. Anchoring at the CWD would make capture and restore disagree
+	// whenever the process was started from a subdirectory.
+	return filepath.Join(filepath.Dir(filepath.Dir(s.root)), path), nil
 }
 
 // relativePath expresses path relative to the snapshot root's workspace when
