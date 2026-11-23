@@ -23,6 +23,8 @@ func setupTestWorkspace(t *testing.T) string {
 		"vendor/mod/mod.go":         "package mod\n",
 		".bin/tether":               "binary-stub",
 		".tether/snapshots/turn1":   "snapshot",
+		".tether/session.db":        "sqlite-tether-main",
+		".tether/cache.db":          "sqlite-tether-cache",
 		"session.db":                "sqlite-main",
 		"session.db-wal":            "sqlite-wal",
 		"session.db-shm":            "sqlite-shm",
@@ -82,6 +84,8 @@ func TestIndexerScanIgnoresExcludedPaths(t *testing.T) {
 		"vendor/mod/mod.go",
 		".bin/tether",
 		".tether/snapshots/turn1",
+		".tether/session.db",
+		".tether/cache.db",
 		"session.db",
 		"session.db-wal",
 		"session.db-shm",
@@ -231,6 +235,12 @@ func TestSafeReadWorkspaceFileSecurityBoundaries(t *testing.T) {
 	}
 
 	if _, _, err := SafeReadWorkspaceFile(root, "session.db", 4096); err == nil {
-		t.Error("expected error when attempting to read session.db, got nil")
+		t.Error("expected error when attempting to read legacy session.db, got nil")
+	}
+	if _, _, err := SafeReadWorkspaceFile(root, ".tether/session.db", 4096); err == nil {
+		t.Error("expected error when attempting to read .tether/session.db, got nil")
+	}
+	if _, _, err := SafeReadWorkspaceFile(root, ".tether/cache.db", 4096); err == nil {
+		t.Error("expected error when attempting to read .tether/cache.db, got nil")
 	}
 }

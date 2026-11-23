@@ -44,7 +44,7 @@ func (m Model) collectCopyText(mode string) string {
 	default:
 		for i := len(m.Stream) - 1; i >= 0; i-- {
 			e := m.Stream[i]
-			if e.Kind == StreamMainAgent || e.Kind == StreamSubAgent || e.Kind == StreamSideChat {
+			if e.Kind == StreamMainAgent || e.Kind == StreamSideChat {
 				return strings.Join(e.Body, "\n")
 			}
 		}

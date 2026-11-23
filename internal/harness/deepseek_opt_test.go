@@ -61,40 +61,19 @@ func TestDeepSeekOptimizationAndTokenEfficiency(t *testing.T) {
 		t.Fatalf("expected >=85%% deterministic prefix stability for DeepSeek Context Caching, got %.1f%%", prefixRatio)
 	}
 
-	// 2. Measure Sub-Agent Tool Schema Token Savings (6 read-only tools vs all MCP tools)
+	// 2. Verify legacy subagent/proposal tools are omitted from MCP tool schema
 	runner := NewRunner(engine, Config{Provider: "deepseek", Model: "deepseek-chat", APIKey: "sk-test"})
-	allTools := runner.mcp.ListTools()
-	allToolsJSON, _ := json.Marshal(allTools)
-
-	subagentAllowedTools := map[string]bool{
-		"read_file":    true,
-		"kb_search":    true,
-		"kb_status":    true,
-		"session_load": true,
-		"todo_list":    true,
-		"run_command":  true,
-	}
-	var filteredTools []interface{}
-	for _, tool := range allTools {
-		if subagentAllowedTools[tool.Name] {
-			filteredTools = append(filteredTools, tool)
+	for _, tool := range runner.mcp.ListTools() {
+		switch tool.Name {
+		case "spawn_subagent", "approve_proposal", "reject_proposal", "proposal_status", "subagent_spawn_rules":
+			t.Fatalf("unexpected legacy subagent/proposal tool still registered: %s", tool.Name)
 		}
-	}
-	filteredJSON, _ := json.Marshal(filteredTools)
-
-	oldEstTokens := len(allToolsJSON) / 4
-	newEstTokens := len(filteredJSON) / 4
-	savedPct := (float64(oldEstTokens-newEstTokens) * 100.0) / float64(oldEstTokens)
-	t.Logf("[Sub-Agent Tool Schema] Before: %d tools (~%d tokens/step) -> After: %d tools (~%d tokens/step) | Saved: %.1f%% per API call",
-		len(allTools), oldEstTokens, len(filteredTools), newEstTokens, savedPct)
-	if savedPct < 50.0 {
-		t.Fatalf("expected at least 50%% tool schema token reduction for subagents, got %.1f%%", savedPct)
 	}
 
 	// 3. Verify DeepSeek-Reasoner Active Tool-Loop reasoning_content Preservation vs Old Turn Compaction
 	longToolOutput := strings.Repeat("package tui // line of code\n", 120) // ~3360 chars
 	conversation := []chatMessage{
-		{Role: "system", Content: "You are Main Orchestrator."},
+		{Role: "system", Content: "You are Main Agent."},
 		// Completed Turn 1 (older user turn: reasoning_content MUST be stripped)
 		{Role: "user", Content: "Turn 1 question"},
 		{Role: "assistant", ReasoningContent: strings.Repeat("Old thinking trace from turn 1. ", 40), Content: "Turn 1 answer"},

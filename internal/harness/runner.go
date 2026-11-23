@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,7 +12,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/crossparties/tether/internal/core"
@@ -153,36 +151,20 @@ func SaveAPIKey(provider, key string) error {
 
 // Runner executes the Tether-anchored autonomous agent loop for any LLM API
 type Runner struct {
-	engine     *core.Engine
-	hooks      *hooks.Handler
-	mcp        *mcp.Server
-	cfg        Config
-	client     *http.Client
-	history    []chatMessage
-	agentType  string
-	isSubagent bool
-
-	// depth is how many spawn_subagent hops separate this runner from the
-	// session the user is talking to. A sub-runner inherits the spawn tool, so
-	// without a counter the recursion is bounded only by the model's restraint.
-	depth int
-
-	// steps counts tool-loop iterations in the last Run. It is reported in the
-	// subagent summary: the user wants to know whether a worker did eight
-	// things or hit its forty-step ceiling.
-	steps int
+	engine    *core.Engine
+	hooks     *hooks.Handler
+	mcp       *mcp.Server
+	cfg       Config
+	client    *http.Client
+	history   []chatMessage
+	agentType string
 
 	// DeepSeek Context Caching metrics from the latest API call
 	lastCacheHitTokens  int
 	lastCacheMissTokens int
 
-	// onSubagent receives live lifecycle events of every worker this runner spawns
-	// (start, tool steps, done). Set once at startup; nil keeps the plain-text output.
-	onSubagent func(SubagentEvent)
-
 	// onDelta, when set, switches callAPI to SSE streaming and receives live token
-	// deltas (kind: "content" | "reasoning" | "endstep"). Only the Main Agent runner
-	// sets it; subagent runners are separate structs and always use the buffered path.
+	// deltas (kind: "content" | "reasoning" | "endstep").
 	onDelta func(kind, text string)
 }
 
@@ -286,39 +268,23 @@ func (r *Runner) Run(ctx context.Context, prompt string) (string, error) {
 
 	// 1. PreInvocation Hook: surgical context injection & task mode classification
 	// Mark the turn boundary so PreToolUse can snapshot the pre-write state of
-	// each file. Subagents share the parent's turn: their edits are part of the
-	// same undo unit.
-	if !r.isSubagent {
-		_ = r.engine.SetProjectSetting("current_turn", time.Now().UTC().Format("20060102T150405.000000000"))
-	}
+	// each file.
+	_ = r.engine.SetProjectSetting("current_turn", time.Now().UTC().Format("20060102T150405.000000000"))
 
-	preInvIn, _ := json.Marshal(hooks.HookInput{Prompt: prompt, AgentType: r.agentType, IsSubagent: r.isSubagent})
+	preInvIn, _ := json.Marshal(hooks.HookInput{Prompt: prompt, AgentType: r.agentType})
 	preInvRaw, _ := r.hooks.Handle("PreInvocation", bytes.NewReader(preInvIn))
 	var preInvOut hooks.HookOutput
 	_ = json.Unmarshal([]byte(preInvRaw), &preInvOut)
 
-	sysPrompt := "You are the Main Orchestrator of an autonomous coding agent CLI anchored by Tether. Be concise, direct, and technical. Avoid filler or repetitive preamble. When delegating to multiple SDLC subagents, spawn them together in a single batch and synthesize their findings clearly."
-	if r.isSubagent {
-		sysPrompt = fmt.Sprintf(
-			"You are specialist subagent %q (READ-ONLY WORKER). "+
-				"Rules:\n"+
-				"1. Complete your analysis in at most 2-4 tool calls using kb_search or read_file. Do NOT over-explore or repeat searches.\n"+
-				"2. Never attempt to mutate files or run mutative shell commands.\n"+
-				"3. Be concise and structured (bullet points, key findings, and diff only if code changes were explicitly requested).\n"+
-				"4. You MUST end your response with the exact line:\nSTATUS: READY_FOR_REVIEW",
-			r.agentType,
-		)
-	}
+	sysPrompt := "You are Tether, a local-first autonomous coding agent CLI. Be concise, direct, and technical. Avoid filler or repetitive preamble."
 	if len(preInvOut.InjectSteps) > 0 && preInvOut.InjectSteps[0].EphemeralMessage != "" {
 		sysPrompt += "\n\n" + preInvOut.InjectSteps[0].EphemeralMessage
 	}
 
-	if !r.isSubagent {
-		_ = r.engine.AddContext(r.cfg.Provider, "user", prompt)
-	}
+	_ = r.engine.AddContext(r.cfg.Provider, "user", prompt)
 
 	var messages []chatMessage
-	if len(r.history) == 0 || r.isSubagent {
+	if len(r.history) == 0 {
 		messages = []chatMessage{
 			{Role: "system", Content: sysPrompt},
 			{Role: "user", Content: prompt},
@@ -336,19 +302,8 @@ func (r *Runner) Run(ctx context.Context, prompt string) (string, error) {
 		messages = append(messages, chatMessage{Role: "user", Content: prompt})
 	}
 
-	subagentAllowedTools := map[string]bool{
-		"read_file":    true,
-		"kb_search":    true,
-		"kb_status":    true,
-		"session_load": true,
-		"todo_list":    true,
-		"run_command":  true,
-	}
 	var apiTools []openAITool
 	for _, t := range r.mcp.ListTools() {
-		if r.isSubagent && !subagentAllowedTools[t.Name] {
-			continue
-		}
 		apiTools = append(apiTools, openAITool{
 			Type: "function",
 			Function: openAIFunction{
@@ -358,29 +313,11 @@ func (r *Runner) Run(ctx context.Context, prompt string) (string, error) {
 			},
 		})
 	}
-	if !r.isSubagent {
-		apiTools = append(apiTools, openAITool{
-			Type: "function",
-			Function: openAIFunction{
-				Name:        "spawn_subagent",
-				Description: "Spawn a specialist worker subagent (tether_architect, tether_qa, tether_frontend, tether_product). Subagents are restricted by Tether Guard to read-only analysis and diff drafting; they return their proposal to you (Main Agent).",
-				Parameters: mcp.InputSchema{
-					Type: "object",
-					Properties: map[string]mcp.Property{
-						"role": {Type: "string", Description: "Subagent role: tether_architect | tether_qa | tether_frontend | tether_product"},
-						"task": {Type: "string", Description: "Clear task instructions for the subagent"},
-					},
-					Required: []string{"role", "task"},
-				},
-			},
-		})
-	}
 
 	keepTurns, maxRunes := r.compactionLimits()
 
 	// 2. Agentic Tool-Execution Loop
 	for step := 0; step < r.cfg.MaxSteps; step++ {
-		r.steps = step + 1
 		messages = compactMessagesWithLimits(messages, keepTurns, maxRunes)
 		msg, err := r.callAPI(ctx, messages, apiTools)
 		if err != nil {
@@ -403,41 +340,13 @@ func (r *Runner) Run(ctx context.Context, prompt string) (string, error) {
 			return msg.Content, nil
 		}
 
-		// Execute parallel spawn_subagent calls concurrently when the model dispatches multiple subagents in one turn
-		allSubagents := len(msg.ToolCalls) > 1 && !r.isSubagent
 		for _, tc := range msg.ToolCalls {
-			if tc.Function.Name != "spawn_subagent" {
-				allSubagents = false
-				break
-			}
-		}
-		if allSubagents {
-			results := make([]string, len(msg.ToolCalls))
-			var wg sync.WaitGroup
-			for i, tc := range msg.ToolCalls {
-				wg.Add(1)
-				go func(idx int, call toolCall) {
-					defer wg.Done()
-					results[idx] = r.executeGuardedToolWithCtx(ctx, call)
-				}(i, tc)
-			}
-			wg.Wait()
-			for i, tc := range msg.ToolCalls {
-				messages = append(messages, chatMessage{
-					Role:       "tool",
-					ToolCallID: tc.ID,
-					Content:    results[i],
-				})
-			}
-		} else {
-			for _, tc := range msg.ToolCalls {
-				resultText := r.executeGuardedToolWithCtx(ctx, tc)
-				messages = append(messages, chatMessage{
-					Role:       "tool",
-					ToolCallID: tc.ID,
-					Content:    resultText,
-				})
-			}
+			resultText := r.executeGuardedTool(tc)
+			messages = append(messages, chatMessage{
+				Role:       "tool",
+				ToolCallID: tc.ID,
+				Content:    resultText,
+			})
 		}
 	}
 
@@ -466,10 +375,6 @@ func (r *Runner) compactionLimits() (int, int) {
 }
 
 func (r *Runner) executeGuardedTool(tc toolCall) string {
-	return r.executeGuardedToolWithCtx(context.Background(), tc)
-}
-
-func (r *Runner) executeGuardedToolWithCtx(parentCtx context.Context, tc toolCall) string {
 	var argMap map[string]interface{}
 	rawArgs := strings.TrimSpace(tc.Function.Arguments)
 	if rawArgs != "" && rawArgs != "{}" {
@@ -480,15 +385,10 @@ func (r *Runner) executeGuardedToolWithCtx(parentCtx context.Context, tc toolCal
 		}
 	}
 
-	if tc.Function.Name == "spawn_subagent" && !r.isSubagent {
-		return r.runSubagentWithCtx(parentCtx, argMap)
-	}
-
 	hookIn := hooks.HookInput{
-		ToolName:   tc.Function.Name,
-		AgentType:  r.agentType,
-		IsSubagent: r.isSubagent,
-		ToolCall:   &hooks.ToolCall{Name: tc.Function.Name, Args: argMap},
+		ToolName:  tc.Function.Name,
+		AgentType: r.agentType,
+		ToolCall:  &hooks.ToolCall{Name: tc.Function.Name, Args: argMap},
 	}
 	if cmd, ok := argMap["command"].(string); ok {
 		hookIn.Command = cmd
@@ -521,153 +421,10 @@ func (r *Runner) executeGuardedToolWithCtx(parentCtx context.Context, tc toolCal
 	return res
 }
 
-func (r *Runner) runSubagent(args map[string]interface{}) string {
-	return r.runSubagentWithCtx(context.Background(), args)
-}
-
-func (r *Runner) runSubagentWithCtx(parentCtx context.Context, args map[string]interface{}) string {
-	roleArg, _ := args["role"].(string)
-	task, _ := args["task"].(string)
-	if strings.TrimSpace(task) == "" {
-		return "invalid params: task is required for spawn_subagent"
-	}
-
-	// A rejected role is returned to the model as an error rather than
-	// forwarded as agentType. An unvalidated role reaches HookInput.AgentType,
-	// where CheckIsSubagent treats any non-"main" value as a subagent -- the
-	// right verdict for the wrong reason, and a typo would silently become a
-	// new role.
-	role, roleErr := ValidateSubagentRole(roleArg)
-	if roleErr != nil {
-		return roleErr.Error()
-	}
-
-	// Recursion guard. A sub-runner inherits spawn_subagent, so without this a
-	// worker can spawn workers indefinitely and the only bound is the model.
-	if r.depth >= MaxSubagentDepth {
-		return fmt.Sprintf("spawn refused: subagent depth %d reached the limit of %d", r.depth, MaxSubagentDepth)
-	}
-
-	start := time.Now()
-	run := subagentRun{Role: role}
-	subID := r.emitSubagentStart(role, task)
-
-	// The worker's output goes to a buffer, not r.cfg.Out. Inheriting the
-	// terminal writer meant every tool call the worker made printed into the
-	// main session, burying the answer the user was waiting for. The buffer is
-	// dropped after the run: its only consumer would be a log command that does
-	// not exist yet, and keeping it would imply otherwise.
-	var workerLog bytes.Buffer
-	subCfg := r.cfg
-	subCfg.Out = r.newSubagentTee(&workerLog, subID, role)
-	subCfg.MaxSteps = SubagentMaxSteps
-
-	subRunner := &Runner{
-		engine:     r.engine,
-		hooks:      r.hooks,
-		mcp:        r.mcp,
-		cfg:        subCfg,
-		client:     r.client,
-		agentType:  role,
-		isSubagent: true,
-		depth:      r.depth + 1,
-	}
-
-	// Derive from parentCtx so Esc/Ctrl+C in the TUI immediately cancels the active subagent.
-	if parentCtx == nil {
-		parentCtx = context.Background()
-	}
-	ctx, cancel := context.WithTimeout(parentCtx, SubagentTimeout)
-	defer cancel()
-
-	var ans string
-	var err error
-	defer func() {
-		r.emitSubagentDone(subID, role, start, subRunner.steps, &run, ans)
-	}()
-	ui.RunWithSpinner(r.cfg.Out, fmt.Sprintf("🤖 %s working", role), func() {
-		ans, err = subRunner.Run(ctx, task)
-		run.Elapsed = time.Since(start)
-		run.Steps = subRunner.steps
-	})
-
-	if err != nil {
-		// A timeout is worth naming: "context deadline exceeded" alone reads as
-		// a crash rather than as a limit that was configured on purpose.
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			err = fmt.Errorf("timed out after %s", SubagentTimeout)
-		}
-		run.Err = err
-		r.printRunSummary(run)
-		return fmt.Sprintf("subagent %s error: %v", role, err)
-	}
-
-	_ = r.engine.AddContext(role, "plan", ans)
-
-	// Parse the status before recording anything. A report without a parseable
-	// STATUS is not a completed task: cc-sdd's rule is to re-dispatch once and
-	// then stop, never to fill the gap by inference.
-	status, statusErr := statusFromReport(ans)
-	if statusErr != nil {
-		// One silent re-dispatch asking for the block and nothing else.
-		retryTask := task + "\n\nReturn ONLY the structured status block at the end of your report. " +
-			"STATUS must be exactly one of: READY_FOR_REVIEW, BLOCKED, NEEDS_CONTEXT."
-		ans, err = subRunner.Run(ctx, retryTask)
-		run.Steps = subRunner.steps
-		run.Elapsed = time.Since(start)
-		if err == nil {
-			status, statusErr = statusFromReport(ans)
-		}
-	}
-
-	if statusErr != nil {
-		run.Status = core.StatusNeedsContext
-		run.Elapsed = time.Since(start)
-		r.printRunSummary(run)
-		return fmt.Sprintf(
-			"[Subagent %s — NO PARSEABLE STATUS]\n%s\n\n"+
-				"The worker did not return a STATUS field (READY_FOR_REVIEW | BLOCKED | NEEDS_CONTEXT), "+
-				"so its report cannot be treated as finished. Ask the user how to proceed rather than "+
-				"assuming the work is done.", role, ans)
-	}
-	run.Status = status
-
-	// Record the worker's output as a proposal awaiting user approval. The
-	// PreToolUse gate refuses any mutation until approve_proposal is called, so
-	// the "propose first, mutate later" rule is enforced rather than hoped for.
-	//
-	// Read-only analysis must NOT lock the workspace: a pure audit produces
-	// nothing to approve, so locking for it would block the user for no reason.
-	// Only lock when the output actually contains an actionable diff/patch/proposal block.
-	if !producesMutation(role, ans) || !producesMutation("tether_qa", ans) {
-		run.Analysis = true
-		r.printRunSummary(run)
-		return fmt.Sprintf("[Subagent %s Report]:\n%s", role, ans)
-	}
-
-	proposalID, recErr := r.engine.RecordProposal(role, ans)
-	if recErr != nil {
-		run.Err = recErr
-		r.printRunSummary(run)
-	} else {
-		run.Proposal = proposalID
-		r.printRunSummary(run)
-		r.printApprovalRequired(proposalID, role, ans)
-	}
-
-	return fmt.Sprintf(
-		"[Subagent %s Report — PROPOSAL #%d, AWAITING USER APPROVAL]:\n%s\n\n"+
-			"⛔ You MUST present this proposal to the user in the main chat and wait for their explicit "+
-			"approval. Mutations are blocked by Tether Guard until you call approve_proposal (user said yes) "+
-			"or reject_proposal (user said no). Do not write files before that.",
-		role, proposalID, ans)
-}
-
 func (r *Runner) printToolAction(name string, args map[string]interface{}) {
 	// File writes are labelled explicitly. A diff printed here reflects a
 	// change that is about to be applied automatically; it is a log, not a
-	// request for consent. Anything awaiting the user's decision is rendered by
-	// printApprovalRequired instead, so the two can never be confused.
+	// request for consent.
 	switch name {
 	case "edit_file":
 		path, _ := args["path"].(string)
@@ -852,11 +609,7 @@ func (r *Runner) RunInteractive(ctx context.Context, in io.Reader) error {
 	}
 
 	for {
-		promptLabel := ""
-		if pending, perr := r.engine.GetPendingProposal(); perr == nil && pending != nil {
-			promptLabel = fmt.Sprintf(" 🔒 proposal #%d pending (tether proposal approve %d)", pending.ID, pending.ID)
-		}
-		fmt.Fprintf(r.cfg.Out, "[%s:%s%s]> ", r.cfg.Model, r.engine.GetMode(), promptLabel)
+		fmt.Fprintf(r.cfg.Out, "[%s:%s]> ", r.cfg.Model, r.engine.GetMode())
 		if !scanner.Scan() {
 			fmt.Fprintln(r.cfg.Out)
 			return nil
@@ -904,10 +657,6 @@ func (r *Runner) RunInteractive(ctx context.Context, in io.Reader) error {
 		}
 		fmt.Fprintf(r.cfg.Out, "%s\n\n", DoneRule(res.outcome, res.elapsed))
 	}
-}
-
-func compactMessages(messages []chatMessage) []chatMessage {
-	return compactMessagesWithLimits(messages, 2, 800)
 }
 
 // compactMessagesWithLimits implements surgical turn-aware context management:
@@ -968,81 +717,4 @@ func compactMessagesWithLimits(messages []chatMessage, keepAssistantTurns, maxSt
 		}
 	}
 	return out
-}
-
-// firstLines returns up to n meaningful (non-blank) lines from text, each
-// trimmed to a terminal-friendly width.
-func firstLines(text string, n int) []string {
-	var out []string
-	for _, line := range strings.Split(text, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		if len(line) > 70 {
-			line = line[:70] + "…"
-		}
-		out = append(out, line)
-		if len(out) == n {
-			break
-		}
-	}
-	if len(out) == 0 {
-		out = []string{"(empty report)"}
-	}
-	return out
-}
-
-// max returns the larger of a and b.
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-// analysisOnlyRoles are subagent roles whose normal output is a report, not a
-// change request. They only create a proposal when the output actually carries
-// something actionable (a diff block or an explicit proposal block).
-var analysisOnlyRoles = map[string]bool{
-	"tether_qa":      true,
-	"tether_product": true,
-}
-
-// producesMutation reports whether a subagent result should become an approval
-// proposal. Requiring an actionable block for analysis roles keeps audits
-// lock-free while still gating real change requests.
-func producesMutation(role, output string) bool {
-	markers := []string{"```diff", "```patch", "```proposal", "--- a/", "+++ b/"}
-	hasActionable := false
-	for _, marker := range markers {
-		if strings.Contains(output, marker) {
-			hasActionable = true
-			break
-		}
-	}
-	if analysisOnlyRoles[role] {
-		return hasActionable
-	}
-	return true
-}
-
-// printApprovalRequired renders a subagent proposal as an unmistakable request
-// for the user's decision. It must never look like the WRITE log that
-// printToolAction emits for an automatic change.
-func (r *Runner) printApprovalRequired(proposalID int64, role, summary string) {
-	preview := firstLines(summary, 4)
-
-	body := fmt.Sprintf("Role: %s\n\n", role)
-	body += strings.Join(preview, "\n")
-	if len(preview) == 4 {
-		body += "\n…"
-	}
-
-	fmt.Fprintf(r.cfg.Out, "\n%s\n", ui.Banner(
-		fmt.Sprintf("APPROVAL REQUIRED · PROPOSAL #%d", proposalID), body, ui.Warn))
-	fmt.Fprintf(r.cfg.Out, "%s\n", ui.Warn("   Nothing is written until you decide."))
-	fmt.Fprintf(r.cfg.Out, "   %s  %s\n", ui.Success("✅ tether proposal approve"), fmt.Sprint(proposalID))
-	fmt.Fprintf(r.cfg.Out, "   %s  %s\n", ui.Error("🚫 tether proposal reject"), fmt.Sprint(proposalID))
-	fmt.Fprintf(r.cfg.Out, "   %s  %s\n\n", ui.Dim("👁  tether proposal show"), fmt.Sprint(proposalID))
 }

@@ -28,28 +28,9 @@ type ApprovalGrant struct {
 	ExpiresAt string `json:"expires_at"`
 }
 
-// ensureApprovalGrants creates the grants table. It is called during migration
-// so older databases pick the table up without a manual step.
-func (e *Engine) ensureApprovalGrants() error {
-	_, err := e.DB.Exec(`
-		CREATE TABLE IF NOT EXISTS approval_grants (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			session_id TEXT NOT NULL,
-			path_scope TEXT NOT NULL,
-			kind TEXT NOT NULL DEFAULT 'path',
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-			expires_at DATETIME
-		)
-	`)
-	return err
-}
-
 // AddApprovalGrant records permission for pathScope. An empty scope with kind
 // "all" authorizes every path for the session.
 func (e *Engine) AddApprovalGrant(pathScope, kind string) error {
-	if err := e.ensureApprovalGrants(); err != nil {
-		return err
-	}
 	if kind == "" {
 		kind = "path"
 	}
@@ -61,7 +42,7 @@ func (e *Engine) AddApprovalGrant(pathScope, kind string) error {
 	// datetime('now', ?) evaluates the modifier in SQLite. Binding "+60 minutes"
 	// as a plain value would store the literal string, and the grant would look
 	// expired immediately.
-	_, err := e.DB.Exec(`
+	_, err := e.writeDB.Exec(`
 		INSERT INTO approval_grants (session_id, path_scope, kind, expires_at)
 		VALUES (?, ?, ?, datetime('now', ?))
 	`, e.SessionID, scope, kind, fmt.Sprintf("+%d minutes", ttl))
@@ -74,9 +55,6 @@ func (e *Engine) AddApprovalGrant(pathScope, kind string) error {
 // "docs" must not authorize "docs-secret/key.pem". The comparison therefore
 // appends a separator before testing the prefix.
 func (e *Engine) HasApprovalGrant(path string) (bool, error) {
-	if err := e.ensureApprovalGrants(); err != nil {
-		return false, err
-	}
 	e.expireApprovalGrants()
 
 	cleanPath := filepath.ToSlash(filepath.Clean(path))
@@ -84,7 +62,7 @@ func (e *Engine) HasApprovalGrant(path string) (bool, error) {
 	// them out in SQL so a grant whose scope happens to look like a path (for
 	// example a command starting with a directory name) cannot leak into file
 	// permissions.
-	rows, err := e.DB.Query(`
+	rows, err := e.readDB.Query(`
 		SELECT path_scope, kind FROM approval_grants
 		WHERE session_id = ?
 		  AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
@@ -125,9 +103,6 @@ const (
 // covers every later command that begins with cmd followed by a space or the
 // end of the string, so approving "go test" also allows "go test ./...".
 func (e *Engine) AddCommandGrant(cmd string, prefix bool) error {
-	if err := e.ensureApprovalGrants(); err != nil {
-		return err
-	}
 	scope := strings.TrimSpace(cmd)
 	if scope == "" {
 		return fmt.Errorf("command is required for a command grant")
@@ -136,7 +111,7 @@ func (e *Engine) AddCommandGrant(cmd string, prefix bool) error {
 	if prefix {
 		kind = GrantKindCommandPrefix
 	}
-	_, err := e.DB.Exec(`
+	_, err := e.writeDB.Exec(`
 		INSERT INTO approval_grants (session_id, path_scope, kind, expires_at)
 		VALUES (?, ?, ?, datetime('now', ?))
 	`, e.SessionID, scope, kind, fmt.Sprintf("+%d minutes", DefaultGrantTTLMinutes))
@@ -146,7 +121,7 @@ func (e *Engine) AddCommandGrant(cmd string, prefix bool) error {
 // deleteGrant consumes a one-shot command grant so a single "approve once"
 // cannot be replayed for every later invocation.
 func (e *Engine) deleteGrant(scope, kind string) {
-	e.DB.Exec(`
+	_, _ = e.writeDB.Exec(`
 		DELETE FROM approval_grants
 		WHERE session_id = ? AND path_scope = ? AND kind = ?
 	`, e.SessionID, scope, kind)
@@ -158,16 +133,13 @@ func (e *Engine) deleteGrant(scope, kind string) {
 // once" really means once. A prefix grant matches a leading token run and
 // survives until it expires, which is what "stop asking about go test" needs.
 func (e *Engine) HasCommandGrant(cmd string) (bool, error) {
-	if err := e.ensureApprovalGrants(); err != nil {
-		return false, err
-	}
 	e.expireApprovalGrants()
 
 	want := strings.TrimSpace(cmd)
 	if want == "" {
 		return false, nil
 	}
-	rows, err := e.DB.Query(`
+	rows, err := e.readDB.Query(`
 		SELECT path_scope, kind FROM approval_grants
 		WHERE session_id = ?
 		  AND kind IN (?, ?)
@@ -198,6 +170,10 @@ func (e *Engine) HasCommandGrant(cmd string) (bool, error) {
 			}
 		}
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return false, err
+	}
 	rows.Close()
 
 	if exactHit {
@@ -227,11 +203,8 @@ func commandHasPrefix(cmd, prefix string) bool {
 // ListApprovalGrants returns live grants for the current session, so the CLI can
 // show what the user has already authorized.
 func (e *Engine) ListApprovalGrants() ([]ApprovalGrant, error) {
-	if err := e.ensureApprovalGrants(); err != nil {
-		return nil, err
-	}
 	e.expireApprovalGrants()
-	rows, err := e.DB.Query(`
+	rows, err := e.readDB.Query(`
 		SELECT id, session_id, path_scope, kind, created_at, COALESCE(expires_at, '')
 		FROM approval_grants
 		WHERE session_id = ?
@@ -256,10 +229,7 @@ func (e *Engine) ListApprovalGrants() ([]ApprovalGrant, error) {
 // RevokeApprovalGrants drops every grant for the current session and reports how
 // many were removed, giving the user a way back to the safe default.
 func (e *Engine) RevokeApprovalGrants() (int64, error) {
-	if err := e.ensureApprovalGrants(); err != nil {
-		return 0, err
-	}
-	res, err := e.DB.Exec(`DELETE FROM approval_grants WHERE session_id = ?`, e.SessionID)
+	res, err := e.writeDB.Exec(`DELETE FROM approval_grants WHERE session_id = ?`, e.SessionID)
 	if err != nil {
 		return 0, err
 	}
@@ -269,7 +239,7 @@ func (e *Engine) RevokeApprovalGrants() (int64, error) {
 // expireApprovalGrants deletes grants past their lifetime. It runs before every
 // check so a stale grant can never authorize a write.
 func (e *Engine) expireApprovalGrants() {
-	_, _ = e.DB.Exec(`
+	_, _ = e.writeDB.Exec(`
 		DELETE FROM approval_grants
 		WHERE expires_at IS NOT NULL AND expires_at <= CURRENT_TIMESTAMP
 	`)
@@ -289,8 +259,7 @@ func scopeCoversPath(scope, p string) bool {
 	// Both sides must be cleaned. Cleaning only the scope let a caller walk
 	// out of a grant with a relative segment: scope "internal/hooks" matched
 	// "internal/hooks/../core/x.go" by prefix, even though that path resolves
-	// to internal/core, a package the grant never covered. The boundary check
-	// in handoff.go shares this function, so a leak here widened both.
+	// to internal/core, a package the grant never covered.
 	p = filepath.ToSlash(filepath.Clean(p))
 	if scope == p {
 		return true

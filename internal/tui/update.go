@@ -31,7 +31,6 @@ func (m Model) Update(msg any) Model {
 		if now.IsZero() {
 			now = time.Now()
 		}
-		m = m.tickSubagents(now)
 		for i := range m.Workers {
 			if m.Workers[i].State == WorkerActive {
 				m.Workers[i].Spinner = brailleFrames[m.SpinnerStep]
@@ -53,9 +52,6 @@ func (m Model) Update(msg any) Model {
 		m.ingestStreamLog(ev.WorkerID, ev.Line)
 		m.StreamScroll = 0
 		return m
-
-	case SubagentEventMsg:
-		return m.handleSubagentEvent(ev)
 
 	case AgentDeltaMsg:
 		// Ignore late deltas that arrive after Esc/Ctrl+C or completion.
@@ -146,16 +142,6 @@ func (m Model) Update(msg any) Model {
 				Kind:  StreamSystemNotice,
 				Title: fmt.Sprintf("✖ Error · %.1fs", ev.Elapsed.Seconds()),
 				Body:  strings.Split(ev.Err.Error(), "\n"),
-			})
-		} else if ev.WorkerID == "subagent" {
-			ans := strings.TrimSpace(ev.Answer)
-			if ans == "" {
-				ans = "(sub-agent finished)"
-			}
-			m.Stream = append(m.Stream, StreamEntry{
-				Kind:  StreamSubAgent,
-				Title: fmt.Sprintf("Subagent report · %.1fs", ev.Elapsed.Seconds()),
-				Body:  strings.Split(ans, "\n"),
 			})
 		} else {
 			ans := strings.TrimSpace(ev.Answer)
@@ -941,52 +927,6 @@ func (m Model) submitInput() Model {
 		return m
 	}
 
-	// Handle /spawn [role] <task> (Background Sub-Agent Worker Delegation)
-	if raw == "/spawn" || strings.HasPrefix(raw, "/spawn ") {
-		rest := strings.TrimSpace(strings.TrimPrefix(raw, "/spawn"))
-		if rest == "" {
-			m.Stream = append(m.Stream, StreamEntry{
-				Kind:  StreamSystemNotice,
-				Title: "Usage /spawn",
-				Body: []string{
-					"Usage  : /spawn [tether_architect|tether_qa|tether_frontend|tether_product] <task>",
-					"Example: /spawn tether_architect analyze package internal/tui",
-				},
-			})
-			return m
-		}
-		role := "tether_architect"
-		task := rest
-		fields := strings.Fields(rest)
-		if len(fields) >= 2 {
-			candidate := strings.ToLower(fields[0])
-			switch candidate {
-			case "tether_architect", "architect", "tether_qa", "qa", "tether_frontend", "frontend", "tether_product", "product":
-				if !strings.HasPrefix(candidate, "tether_") {
-					role = "tether_" + candidate
-				} else {
-					role = candidate
-				}
-				task = strings.TrimSpace(rest[len(fields[0]):])
-			}
-		}
-		if len(m.Workers) > 1 {
-			m.Workers[1].Name = "Sub-Agent (" + role + ")"
-			m.Workers[1].State = WorkerActive
-			m.Workers[1].Spinner = brailleFrames[0]
-			m.Workers[1].Task = truncateTask(task, 42)
-			m.Workers[1].Detail = "0.0s"
-			m.Workers[1].StartedAt = time.Now()
-		}
-		m.PendingSpawn = [2]string{role, task}
-		m.Stream = append(m.Stream, StreamEntry{
-			Kind:  StreamSubAgent,
-			Title: fmt.Sprintf("Spawned %s · running", role),
-			Body:  []string{"Task: " + task},
-		})
-		return m
-	}
-
 	// Handle /select (toggle mouse capture) and /copy [all|code]
 	if raw == "/select" {
 		return m.toggleMouseCapture()
@@ -1020,7 +960,7 @@ func (m Model) submitInput() Model {
 			{
 				Kind:  StreamSystemNotice,
 				Title: "Context cleared",
-				Body:  []string{"Viewport cleared; substrate memory remains persisted in session.db."},
+				Body:  []string{"Viewport cleared; substrate memory remains persisted in .tether/session.db."},
 			},
 		}
 		return m
@@ -1053,7 +993,7 @@ func (m Model) submitInput() Model {
 	}
 
 	// Handle /status
-	if raw == "/status" || raw == "/workers" {
+	if raw == "/status" {
 		summary := fmt.Sprintf("Workspace: %s | Mode: %s | Provider: %s (%s) | Memory: %dMB",
 			m.Workspace, m.Mode, m.ProviderName, m.ModelName, m.MemoryMB)
 		if m.Bridge != nil && m.Bridge.StatusSummary != nil {
@@ -1102,7 +1042,7 @@ func (m Model) submitInput() Model {
 		return m
 	}
 
-	// Standard user prompt submission into Zone B + mark Main Orchestrator worker active
+	// Standard user prompt submission into Zone B + mark Main Agent worker active
 	m.Stream = append(m.Stream, StreamEntry{
 		Kind:  StreamUserPrompt,
 		Title: ">",
@@ -1247,15 +1187,8 @@ func latestReasoningPreview(buf string) string {
 
 // ingestStreamLog parses raw harness tool/reasoning lines into clean 1-line `agy` entries
 // (`● Read (...)`, `● Ran (...)`, `● Searched (...)`, `● Edited (...)`, `▸ Thought`).
-func (m *Model) ingestStreamLog(workerID, raw string) {
+func (m *Model) ingestStreamLog(_ string, raw string) {
 	cleaned := StripANSI(raw)
-	if strings.Contains(cleaned, "[Sub-Agent ") && len(m.Workers) > 1 {
-		m.Workers[1].State = WorkerActive
-		m.Workers[1].Spinner = brailleFrames[m.SpinnerStep%len(brailleFrames)]
-		m.Workers[1].Task = truncateTask(cleaned, 44)
-		m.Workers[1].Detail = "0.0s"
-		m.Workers[1].StartedAt = time.Now()
-	}
 
 	rawLines := strings.Split(cleaned, "\n")
 	first := strings.TrimSpace(rawLines[0])
@@ -1345,18 +1278,6 @@ func (m *Model) ingestStreamLog(workerID, raw string) {
 	}
 
 	// 5. Fallback for any other worker log line
-	if workerID != "" && workerID != "Main Agent" {
-		// When live SubagentEvent observer is active, skip duplicate raw subagent logs
-		if len(m.Subagents) > 0 {
-			return
-		}
-		m.Stream = append(m.Stream, StreamEntry{
-			Kind:  StreamSubAgent,
-			Title: fmt.Sprintf("Subagent %s", workerID),
-			Body:  rawLines,
-		})
-		return
-	}
 	m.Stream = append(m.Stream, StreamEntry{
 		Kind:    StreamTool,
 		Title:   "Ran",
@@ -1387,11 +1308,6 @@ func (m *Model) cancelActiveWorkers() {
 		m.Stream[m.liveStream-1].Title = "interrupted"
 	}
 	m.liveStream = 0
-	for i := range m.Subagents {
-		if m.Subagents[i].State == WorkerActive {
-			m.Subagents[i].State, m.Subagents[i].Spinner, m.Subagents[i].Detail = WorkerCancelled, "⊘", "Cancelled"
-		}
-	}
 	cancelled := 0
 	if m.cancelAllFn != nil {
 		cancelled = m.cancelAllFn()

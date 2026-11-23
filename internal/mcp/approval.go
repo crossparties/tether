@@ -24,13 +24,8 @@ import (
 // tools. That is why changes could land without a single proposal.
 //
 // The rule now enforced here is simple: a change happens only when the user has
-// approved it, either for this one call or for the whole path. The only
-// exemption is the substrate database, which is governed by its own MCP tools
-// and must stay writable or the agent could not record what it is doing.
-
-// substrateDBName is exempt from approval. Writing it is how the agent saves
-// memory, and that path is already gated by dedicated tools.
-const substrateDBName = "session.db"
+// approved it, either for this one call or for the whole path. Direct writes to
+// .tether/ databases are not exempt from approval.
 
 // mutation describes a tool call that changes the workspace.
 type mutation struct {
@@ -134,11 +129,6 @@ func (s *Server) requireApproval(tool string, args json.RawMessage) string {
 		return ""
 	}
 	if m == nil {
-		return ""
-	}
-
-	// The substrate database is the single exemption.
-	if s.isSubstrateOnly(m) {
 		return ""
 	}
 
@@ -455,20 +445,6 @@ func looksLikeArg(tok string) bool {
 		return true
 	}
 	return strings.ContainsAny(tok, "=*/.")
-}
-
-// isSubstrateOnly reports whether every path in m is the substrate database.
-func (s *Server) isSubstrateOnly(m *mutation) bool {
-	if len(m.paths) == 0 {
-		return false
-	}
-	dbPath := filepath.Join(s.engine.Workspace, substrateDBName)
-	for _, p := range m.paths {
-		if filepath.Clean(p) != filepath.Clean(dbPath) {
-			return false
-		}
-	}
-	return true
 }
 
 // grantScope converts a tool path into the prefix a standing grant would cover.

@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -157,10 +159,10 @@ func TestArrowKeyResolutionAndDraftBufferPreservation(t *testing.T) {
 func TestTwoTieredApprovalModalNavigationAndCancel(t *testing.T) {
 	m := NewModel(".")
 	cancelledCalls := 0
-	m.SetCancelAllFunc(func() int {
+	m.cancelAllFn = func() int {
 		cancelledCalls++
 		return 2
-	})
+	}
 
 	m.OpenApprovalModal(ApprovalRequest{
 		ProposalID:     42,
@@ -220,7 +222,7 @@ func TestMemoryBudgetUnder40MB(t *testing.T) {
 	}
 }
 
-func TestEndToEndEditSpawnDiscussReadScrollAndEsc(t *testing.T) {
+func TestEndToEndEditDiscussReadScrollAndEsc(t *testing.T) {
 	ui.SetEnabled(true)
 	defer ui.ClearOverride()
 
@@ -228,48 +230,48 @@ func TestEndToEndEditSpawnDiscussReadScrollAndEsc(t *testing.T) {
 	m := NewModel(tmpDir)
 	m = m.Update(WindowSizeMsg{Width: 100, Height: 30})
 
-	// 1. Spawn Sub-Agent via `/spawn tether_architect analisa struktur kode`
-	for _, r := range "/spawn tether_architect analisa struktur kode" {
+	// 1. Submit a Main Agent prompt
+	for _, r := range "analisa struktur kode" {
 		m = m.Update(KeyMsg{Type: KeyRune, Rune: r})
 	}
 	m = m.Update(KeyMsg{Type: KeyEnter})
-	if m.PendingSpawn[0] != "tether_architect" || m.PendingSpawn[1] != "analisa struktur kode" {
-		t.Fatalf("expected PendingSpawn for tether_architect, got %+v", m.PendingSpawn)
+	if m.PendingPrompt != "analisa struktur kode" {
+		t.Fatalf("expected PendingPrompt, got %q", m.PendingPrompt)
 	}
-	if m.Workers[1].State != WorkerActive {
-		t.Fatalf("expected Sub-Agent worker to be WorkerActive, got %v", m.Workers[1].State)
+	if m.Workers[0].State != WorkerActive {
+		t.Fatalf("expected Main Agent worker to be WorkerActive, got %v", m.Workers[0].State)
 	}
 
-	// Verify rotating Braille spinner advances on TickMsg and renders in Zone A & Zone B
+	// Verify rotating Braille spinner advances on TickMsg and renders in Zone B
 	m = m.Update(TickMsg{Now: time.Now().Add(400 * time.Millisecond)})
 	viewWithSpinner := m.View()
-	if !strings.Contains(viewWithSpinner, "Sub-Agent (tether_architect)") || !strings.Contains(viewWithSpinner, "⠙") {
-		t.Fatalf("expected rotating spinner '⠙' and Sub-Agent in view:\n%s", viewWithSpinner)
+	if !strings.Contains(viewWithSpinner, "⠙") {
+		t.Fatalf("expected rotating spinner '⠙' in view:\n%s", viewWithSpinner)
 	}
 
-	// 2. Non-blocking discussion via `/btw` while Sub-Agent is still running in background
-	for _, r := range "/btw apakah sub-agent memblokir input?" {
+	// 2. Non-blocking discussion via `/btw` while Main Agent is still running in background
+	for _, r := range "/btw apakah side chat memblokir input?" {
 		m = m.Update(KeyMsg{Type: KeyRune, Rune: r})
 	}
 	m = m.Update(KeyMsg{Type: KeyEnter})
 	m = m.Update(SideChatDoneMsg{
-		Question: "apakah sub-agent memblokir input?",
-		Answer:   "Tidak, /btw berjalan terisolasi tanpa mengganggu Sub-Agent yang sedang aktif.",
+		Question: "apakah side chat memblokir input?",
+		Answer:   "Tidak, /btw berjalan terisolasi tanpa mengganggu task utama.",
 		Elapsed:  250 * time.Millisecond,
 	})
-	if m.Workers[1].State != WorkerActive {
-		t.Fatalf("expected Sub-Agent to remain WorkerActive during /btw discussion")
+	if m.Workers[0].State != WorkerActive {
+		t.Fatalf("expected Main Agent to remain WorkerActive during /btw discussion")
 	}
 
-	// Deliver Sub-Agent completion report
+	// Deliver Main Agent completion report
 	m = m.Update(AgentTurnDoneMsg{
-		WorkerID: "subagent",
-		Prompt:   "/spawn tether_architect analisa struktur kode",
-		Answer:   "Analisa selesai: arsitektur 3-Zona valid.\nSTATUS: READY_FOR_REVIEW",
+		WorkerID: "main",
+		Prompt:   "analisa struktur kode",
+		Answer:   "Analisa selesai: arsitektur 3-Zona valid.",
 		Elapsed:  1200 * time.Millisecond,
 	})
-	if m.Workers[1].State != WorkerDone {
-		t.Fatalf("expected Sub-Agent to transition to WorkerDone, got %v", m.Workers[1].State)
+	if m.Workers[0].State != WorkerDone {
+		t.Fatalf("expected Main Agent to transition to WorkerDone, got %v", m.Workers[0].State)
 	}
 
 	// 3. Edit File -> High-Risk Approval Gate Modal -> View Full Diff -> Esc -> Approve
@@ -277,7 +279,7 @@ func TestEndToEndEditSpawnDiscussReadScrollAndEsc(t *testing.T) {
 	m = m.Update(ApprovalGateMsg{
 		Request: ApprovalRequest{
 			ProposalID:     7,
-			AgentName:      "Main Agent / Sub-Agent Worker",
+			AgentName:      "Main Agent",
 			ActionType:     "edit_file",
 			Target:         "internal/tui/view.go",
 			MainEvaluation: "Perubahan UI aman untuk diterapkan.",
@@ -332,10 +334,10 @@ func TestEndToEndEditSpawnDiscussReadScrollAndEsc(t *testing.T) {
 
 	// 5. Test `Esc` (KeyEsc) cancellation of active workers
 	cancelled := 0
-	m.SetCancelAllFunc(func() int {
+	m.cancelAllFn = func() int {
 		cancelled++
 		return 1
-	})
+	}
 	m.Workers[0].State = WorkerActive
 	m = m.Update(KeyMsg{Type: KeyEsc})
 	if cancelled != 1 || m.Workers[0].State != WorkerCancelled {
@@ -451,56 +453,6 @@ func TestStreamingDeltasBuildLiveBlockAndFinalize(t *testing.T) {
 	m = m.Update(AgentDeltaMsg{Kind: "content", Text: "ghost"})
 	if len(m.Stream) != before+2 {
 		t.Fatalf("late delta must be ignored")
-	}
-}
-
-func TestParallelSubagentsShowOwnProcessRows(t *testing.T) {
-	ui.SetEnabled(false)
-	defer ui.ClearOverride()
-	m := NewModel(".")
-	m = m.Update(WindowSizeMsg{Width: 120, Height: 40})
-
-	m = m.Update(SubagentEventMsg{ID: 1, Role: "tether_qa", Task: "audit tests", Kind: "start"})
-	m = m.Update(SubagentEventMsg{ID: 2, Role: "tether_architect", Task: "review layers", Kind: "start"})
-	m = m.Update(SubagentEventMsg{ID: 1, Role: "tether_qa", Kind: "tool", Line: "🔧 [kb_search] \"coverage\""})
-	m = m.Update(TickMsg{Now: time.Now().Add(1500 * time.Millisecond)})
-
-	view := m.View()
-	for _, want := range []string{"tether_qa", "tether_architect", "[kb_search]", "running"} {
-		if !strings.Contains(view, want) {
-			t.Fatalf("expected %q in view while two sub-agents run:\n%s", want, view)
-		}
-	}
-	if !m.hasRunningSubagent() || m.Workers[1].State != WorkerActive {
-		t.Fatalf("pool must be active while workers run")
-	}
-
-	m = m.Update(SubagentEventMsg{ID: 1, Role: "tether_qa", Kind: "done", Status: "READY_FOR_REVIEW", Steps: 3,
-		Elapsed: 2 * time.Second, Analysis: true, Summary: []string{"coverage is 86%"}})
-	if !m.hasRunningSubagent() {
-		t.Fatalf("architect is still running")
-	}
-	m = m.Update(SubagentEventMsg{ID: 2, Role: "tether_architect", Kind: "done", Status: "BLOCKED", Steps: 1,
-		Elapsed: time.Second, Summary: []string{"missing context"}})
-	if m.hasRunningSubagent() || m.Workers[1].State == WorkerActive {
-		t.Fatalf("pool must go idle after the last worker finishes")
-	}
-
-	view = m.View()
-	for _, want := range []string{"READY_FOR_REVIEW", "BLOCKED", "coverage is 86%", "3 steps"} {
-		if !strings.Contains(view, want) {
-			t.Fatalf("expected final verdict %q in view:\n%s", want, view)
-		}
-	}
-	// One transcript block per worker (plus the welcome block), never a shared one.
-	blocks := 0
-	for _, e := range m.Stream {
-		if e.Kind == StreamSubAgent {
-			blocks++
-		}
-	}
-	if blocks != 2 {
-		t.Fatalf("expected 2 sub-agent blocks, got %d", blocks)
 	}
 }
 
@@ -669,5 +621,51 @@ func TestCompactToolLogsInStream(t *testing.T) {
 	}
 	if !strings.Contains(plain, "● Ran (go test ./...)") {
 		t.Fatalf("expected compact '● Ran (...)' row:\n%s", plain)
+	}
+}
+
+func TestIndexWorkspaceFilesExcludesSubstrateDBs(t *testing.T) {
+	ws := t.TempDir()
+	for _, rel := range []string{
+		"cmd/tether/main.go",
+		".tether/session.db",
+		".tether/cache.db",
+		".tether/PLAN.md",
+		"session.db",
+		"session.db-wal",
+		"cache.db",
+		"cache.db-wal",
+	} {
+		full := filepath.Join(ws, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", rel, err)
+		}
+		if err := os.WriteFile(full, []byte("x"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", rel, err)
+		}
+	}
+
+	m := NewModel(ws)
+	m.IndexWorkspaceFiles(50)
+
+	got := make(map[string]bool, len(m.FileIndex))
+	for _, c := range m.FileIndex {
+		got[c.RelPath] = true
+	}
+	if !got["cmd/tether/main.go"] {
+		t.Fatalf("expected cmd/tether/main.go to be indexed, got %v", m.FileIndex)
+	}
+	for _, excluded := range []string{
+		".tether/session.db",
+		".tether/cache.db",
+		".tether/PLAN.md",
+		"session.db",
+		"session.db-wal",
+		"cache.db",
+		"cache.db-wal",
+	} {
+		if got[excluded] {
+			t.Errorf("expected %q to be excluded from @ file index, got %v", excluded, m.FileIndex)
+		}
 	}
 }

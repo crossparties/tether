@@ -66,36 +66,6 @@ type AgentDeltaMsg struct {
 	Text string
 }
 
-// SubagentEventMsg is one live lifecycle update (start | tool | done) of a spawned
-// sub-agent. IDs are unique per worker so parallel sub-agents never share a row.
-type SubagentEventMsg struct {
-	ID       int
-	Role     string
-	Task     string
-	Kind     string
-	Line     string
-	Steps    int
-	Elapsed  time.Duration
-	Status   string
-	Summary  []string
-	Err      string
-	Proposal int64
-	Analysis bool
-}
-
-// SubagentView is the live process record of one sub-agent shown in Zone A and Zone B.
-type SubagentView struct {
-	ID        int
-	Role      string
-	Task      string
-	State     WorkerState
-	Spinner   string
-	StartedAt time.Time
-	Detail    string // elapsed while running, verdict when finished
-	LastTool  string
-	Tools     int
-}
-
 // AgentTurnDoneMsg delivers the completed LLM response (or error) from an async worker.
 type AgentTurnDoneMsg struct {
 	WorkerID string
@@ -147,10 +117,7 @@ type AgentBridge struct {
 	// tokens appear live. onDelta is called from the worker goroutine.
 	RunPromptStream func(ctx context.Context, prompt string, logOut io.Writer, onDelta func(kind, text string)) (string, error)
 	RunSideChat     func(ctx context.Context, question string) (string, error)
-	SpawnSubagent   func(ctx context.Context, role, task string, logOut io.Writer) (string, error)
 	BindApproval    func(askFn func(req ApprovalRequest) int)
-	// BindSubagents hands the TUI a thread-safe emitter for live sub-agent events.
-	BindSubagents func(emit func(SubagentEventMsg))
 }
 
 // WorkerState represents the execution state of a sub-agent worker in Zone A.
@@ -180,7 +147,6 @@ type StreamEntryKind int
 const (
 	StreamMainAgent StreamEntryKind = iota
 	StreamUserPrompt
-	StreamSubAgent
 	StreamSideChat // /btw ephemeral side-channel block in #FAB387 (Peach)
 	StreamSystemNotice
 	StreamThought // compact "▸ Thought for Xs" + 1-line faded preview
@@ -235,7 +201,6 @@ type InspectorState struct {
 func DefaultSlashCommands() []SlashCommandSpec {
 	return []SlashCommandSpec{
 		{Command: "/btw", Description: "Isolated side-chat (zero context pollution)", NeedsArg: true},
-		{Command: "/spawn", Description: "Spawn a background Sub-Agent worker", NeedsArg: true},
 		{Command: "/model", Description: "Select or switch the active LLM model", NeedsArg: true},
 		{Command: "/provider", Description: "Select or switch LLM provider (deepseek/openai/gemini/etc.)", NeedsArg: true},
 		{Command: "/read", Description: "Inspect file contents in scrollable viewport", NeedsArg: true},
@@ -265,7 +230,7 @@ type Model struct {
 	MemoryMB      uint64
 	AltScreenUsed bool
 
-	// Zone A: Active Sub-Agent Worker Monitor
+	// Zone A: Active Agent Status Monitor
 	Workers     []WorkerStatus
 	SpinnerStep int
 	cancelAllFn func() int
@@ -306,8 +271,7 @@ type Model struct {
 	PendingPrompt string
 	PendingBtw    string
 	PendingExec   string
-	PendingSpawn  [2]string // [role, task]
-	PendingCopy   string    // text queued for the system clipboard (OSC 52 + native helpers)
+	PendingCopy   string // text queued for the system clipboard (OSC 52 + native helpers)
 
 	// MouseCapture is true while the TUI owns the mouse wheel (scrolling). When false the
 	// terminal's native text selection works, so the user can drag-select and copy.
@@ -316,11 +280,6 @@ type Model struct {
 	// liveStream is 1 + the index in Stream of the Main Agent block currently receiving
 	// streamed tokens (0 = none). The +1 keeps the zero value meaning "no live block".
 	liveStream int
-
-	// Subagents holds one live record per spawned worker (newest last); subStream maps a
-	// worker ID to the index of its transcript block in Stream.
-	Subagents []SubagentView
-	subStream map[int]int
 
 	// Live faded reasoning & activity status (agy-style live preview while working)
 	ReasoningBuf     string
@@ -349,16 +308,8 @@ func NewModel(workspace string) Model {
 		Workers: []WorkerStatus{
 			{
 				ID:      "main",
-				Name:    "Main Orchestrator",
+				Name:    "Main Agent",
 				Task:    "Ready",
-				Detail:  "Idle",
-				State:   WorkerDone,
-				Spinner: "●",
-			},
-			{
-				ID:      "subagent",
-				Name:    "Sub-Agent Pool",
-				Task:    "Standby",
 				Detail:  "Idle",
 				State:   WorkerDone,
 				Spinner: "●",
@@ -378,27 +329,6 @@ func NewModel(workspace string) Model {
 	return m
 }
 
-// BindOrchestrator connects any orchestrator engine implementing CancelAll() or CancelAll() int.
-func (m *Model) BindOrchestrator(orch any) {
-	if orch == nil {
-		return
-	}
-	switch o := orch.(type) {
-	case interface{ CancelAll() int }:
-		m.cancelAllFn = o.CancelAll
-	case interface{ CancelAll() }:
-		m.cancelAllFn = func() int {
-			o.CancelAll()
-			return 1
-		}
-	}
-}
-
-// SetCancelAllFunc registers a custom worker cancellation callback (e.g., orchestrator.Engine.CancelAll).
-func (m *Model) SetCancelAllFunc(fn func() int) {
-	m.cancelAllFn = fn
-}
-
 // RefreshMemoryUsage samples runtime.MemStats so Zone A displays live memory footprint.
 func (m *Model) RefreshMemoryUsage() {
 	var ms runtime.MemStats
@@ -416,7 +346,7 @@ func (m *Model) SetFiles(files []FileCandidate) {
 	copy(m.FileIndex, files)
 }
 
-// IndexWorkspaceFiles scans workspace (ignoring .git, node_modules, vendor) to populate @ file candidates.
+// IndexWorkspaceFiles scans workspace (ignoring .git, .tether, node_modules, vendor) to populate @ file candidates.
 func (m *Model) IndexWorkspaceFiles(maxFiles int) {
 	if maxFiles <= 0 {
 		maxFiles = 200
@@ -433,7 +363,7 @@ func (m *Model) IndexWorkspaceFiles(maxFiles int) {
 			}
 			return nil
 		}
-		if strings.HasPrefix(name, "session.db") {
+		if strings.HasPrefix(name, "session.db") || strings.HasPrefix(name, "cache.db") {
 			return nil
 		}
 		rel, rerr := filepath.Rel(m.Workspace, path)

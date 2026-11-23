@@ -10,7 +10,9 @@ import (
 	"github.com/crossparties/tether/internal/ui"
 )
 
-// Install wires tether into the specified agent's configuration
+// Install wires tether into the specified agent's configuration.
+// [Deferred / Legacy Bridge]: External IDE MCP/hook installation is deferred during v0.3.0
+// native runtime phases (Phases 1-6).
 func Install(agent string) error {
 	switch agent {
 	case "agy", "antigravity":
@@ -111,7 +113,7 @@ func installAgy() error {
 			},
 			"PreToolUse": []map[string]interface{}{
 				{
-					"matcher": "call_mcp_tool|run_command|write_to_file|replace_file_content|multi_replace_file_content|write_file|invoke_subagent|manage_task|manage_subagents|.*",
+					"matcher": "call_mcp_tool|run_command|write_to_file|replace_file_content|multi_replace_file_content|write_file|manage_task|.*",
 					"hooks": []map[string]interface{}{
 						{"command": fmt.Sprintf("%s hook PreToolUse", tetherBinary())},
 					},
@@ -199,7 +201,6 @@ func configureAgyPermissions(home string) error {
 		"mcp(tether/todo_remove)",
 		"mcp(tether/task_classify)",
 		"mcp(tether/files_modified)",
-		"mcp(tether/subagent_spawn_rules)",
 		"mcp(tether/sql_query)",
 	}
 

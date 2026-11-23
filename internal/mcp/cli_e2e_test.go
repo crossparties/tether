@@ -46,7 +46,7 @@ func startE2EServer(t *testing.T, dir string) *e2eServer {
 
 	cmd := exec.Command(bin, "mcp")
 	cmd.Dir = dir
-	// Isolate HOME so the run cannot touch the developer's real session.db.
+	// Isolate HOME so the run cannot touch the developer's real .tether/session.db.
 	cmd.Env = append(os.Environ(), "HOME="+t.TempDir())
 
 	stdin, err := cmd.StdinPipe()

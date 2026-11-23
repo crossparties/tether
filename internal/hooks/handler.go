@@ -61,7 +61,6 @@ type HookInput struct {
 	AgentType      string    `json:"agent_type,omitempty"`
 	Prompt         string    `json:"prompt,omitempty"`
 	ConversationID string    `json:"conversationId,omitempty"`
-	IsSubagent     bool      `json:"is_subagent,omitempty"`
 
 	// ToolCallSnake captures the snake_case variant some clients send.
 	ToolCallSnake *ToolCall `json:"tool_call,omitempty"`
@@ -73,19 +72,6 @@ func (h *HookInput) toolCallValue() *ToolCall {
 		return h.ToolCall
 	}
 	return h.ToolCallSnake
-}
-
-func (h *HookInput) CheckIsSubagent(mainConversationID string) bool {
-	if h.IsSubagent {
-		return true
-	}
-	if h.AgentType != "" && h.AgentType != "main" && h.AgentType != "unknown" {
-		return true
-	}
-	if mainConversationID != "" && h.ConversationID != "" && h.ConversationID != mainConversationID {
-		return true
-	}
-	return false
 }
 
 // ArgText returns a string tool argument by name, reading the nested toolCall
@@ -195,14 +181,6 @@ func truncate(s string, max int) string {
 
 // handlePreInvocation injects workspace context + task routing hint before model runs
 func (h *Handler) handlePreInvocation(input HookInput) HookOutput {
-	// A subagent must never claim the main conversation identity. Without this
-	// guard every subagent run overwrote main_conversation_id, after which the
-	// real Main Agent was itself classified as a subagent and lost its
-	// authorization path (see handlePreToolUse).
-	if input.ConversationID != "" && !input.IsSubagent {
-		_ = h.engine.SetProjectSetting("main_conversation_id", input.ConversationID)
-	}
-
 	settings, _ := h.engine.GetAllProjectSettings()
 	decisions, _ := h.engine.InjectDecisions(injectDecisionLimit)
 	patterns, _ := h.engine.InjectPatterns(injectPatternLimit)
@@ -219,16 +197,8 @@ func (h *Handler) handlePreInvocation(input HookInput) HookOutput {
 		map[bool]string{true: "allowed", false: "BLOCKED"}[h.engine.IsWriteAllowed()])
 
 	context += "\n### ⚠️ TETHER SUBSTRATE MEMORY PROTOCOL\n"
-	context += "- NEVER use python3/bash scripts to query or edit session.db.\n"
+	context += "- NEVER use python3/bash scripts to query or edit .tether/session.db or .tether/cache.db.\n"
 	context += "- ALWAYS use Tether MCP tools (`sql_query`, `session_load`, `session_save`, `todo_*`) or inspect auto-injected context above.\n"
-
-	// Subagent Governance Protocol: Specialist workers propose changes, Main Agent requests user approval
-	context += "\n### ⚠️ SUBAGENT GOVERNANCE & APPROVAL PROTOCOL (MANDATORY)\n"
-	context += "- Subagents are SPECIALIST WORKERS: analyze, research, and compose proposed changes.\n"
-	context += "- Subagents MUST NOT mutate the codebase or run destructive commands directly.\n"
-	context += "- Subagents MUST return their proposed diff/commands in a message to the Main Agent.\n"
-	context += "- The Main Agent presents the proposal to the user in the main chat for approval.\n"
-	context += "- Only after user approval in the main session are the mutations executed.\n"
 
 	if len(settings) > 0 {
 		var keys []string
@@ -336,136 +306,45 @@ func (h *Handler) handlePreInvocation(input HookInput) HookOutput {
 func (h *Handler) handlePreToolUse(input HookInput) HookOutput {
 	toolName, command, filePath := input.Normalized()
 
-	// 1. Catastrophic command protection (always active across all agents and modes)
+	// 1. Catastrophic command & protected substrate protection (always active across all modes)
 	if toolName == "run_command" || toolName == "bash" {
 		if d := classifyCommand(command); d.level == deny {
 			return HookOutput{Decision: "deny", Reason: d.describe()}
 		}
 		cmdLower := strings.ToLower(command)
 
-		// Prevent raw bash sqlite3/session.db hacks that trigger CLI permission prompts
-		if strings.Contains(cmdLower, "session.db") || (strings.Contains(cmdLower, "sqlite3") && strings.Contains(cmdLower, ".db")) {
+		// Prevent raw bash access to .tether/*.db or mutative commands touching .tether/.
+		isDirectDB := strings.Contains(cmdLower, "session.db") || strings.Contains(cmdLower, "cache.db") ||
+			(strings.Contains(cmdLower, "sqlite3") && strings.Contains(cmdLower, ".db"))
+		isMutatingTether := false
+		if strings.Contains(cmdLower, ".tether") {
+			okRO, _ := safety.IsReadOnlyCommand(command)
+			isMutatingTether = !okRO
+		}
+		if isDirectDB || isMutatingTether {
 			return HookOutput{
 				Decision: "deny",
-				Reason:   "Tether Guard: Direct bash access to session.db via sqlite3/python is blocked. Use Tether MCP tools (session_load, sql_query, todo_list) which run in-process without permission dialogs.",
+				Reason:   "Tether Guard: Direct bash access to .tether/session.db, .tether/cache.db, or mutating .tether/ state is blocked. Use Tether MCP tools (session_load, sql_query, todo_list) instead.",
 			}
 		}
 	}
 
-	mainConvID, _ := h.engine.GetProjectSetting("main_conversation_id")
-	isSubagent := input.CheckIsSubagent(mainConvID)
-
-	// 2. Proposal Gate: while a subagent proposal awaits the user's approval,
-	// the Main Agent itself must not mutate the codebase. The protocol used to
-	// live only in the system prompt, so nothing actually stopped a write. This
-	// gate makes it enforceable: approve_proposal (after the user says yes) or
-	// reject_proposal (after the user says no) is required first.
-	if !isSubagent {
-		writeTools := map[string]bool{
-			"write_to_file":              true,
-			"write_file":                 true,
-			"edit_file":                  true,
-			"replace_file_content":       true,
-			"multi_replace_file_content": true,
+	if isWriteTool(toolName) {
+		ws := ""
+		if h.engine != nil {
+			ws = h.engine.Workspace
 		}
-
-		// State-mutating tools that are not file writes but still change the
-		// substrate. Leaving them open would let a gated agent write "sideways":
-		// recording a decision or doctoring todos instead of waiting.
-		// The proposal-control tools are NOT in this list on purpose. They used
-		// to be, and that deadlocked the gate: approve_proposal and
-		// reject_proposal are the only way out of the pending state, so gating
-		// them on "a proposal is pending" made that state permanent. The first
-		// subagent proposal locked the session until the row was resolved by
-		// hand from another entry point. They are the exit, not a sideways path
-		// around it.
-		stateTools := map[string]bool{
-			"session_save":  true,
-			"setting_set":   true,
-			"decision_add":  true,
-			"pattern_add":   true,
-			"todo_add":      true,
-			"todo_complete": true,
-			"todo_remove":   true,
-		}
-
-		blocked := writeTools[toolName] || stateTools[toolName]
-
-		// sql_query can mutate just as effectively as a file write.
-		if !blocked && toolName == "sql_query" {
-			q := strings.ToLower(strings.TrimSpace(input.ArgText("query")))
-			for _, verb := range []string{"insert", "update", "delete", "drop", "alter", "create", "replace", "truncate"} {
-				if strings.HasPrefix(q, verb) || strings.Contains(q, " "+verb+" ") {
-					blocked = true
-					break
-				}
-			}
-		}
-
-		if !blocked && (toolName == "run_command" || toolName == "bash") {
-			if okRO, _ := safety.IsReadOnlyCommand(command); !okRO {
-				if okVal, _ := safety.IsValidationCommand(command); !okVal {
-					sanitized := sanitizeRedirections(strings.ToLower(command))
-					for _, sig := range []string{
-						">", ">>", "sed -i", "rm ", "mv ", "cp ", "tee ", "chmod ", "chown ",
-						"mkdir ", "touch ", "truncate ", "dd ", "git checkout", "git reset",
-						"git push", "git apply", "go generate", "make ", "npm install", "pip install",
-					} {
-						if strings.Contains(sanitized, sig) {
-							blocked = true
-							break
-						}
-					}
-				}
-			}
-		}
-
-		if blocked {
-			pending, err := h.engine.GetPendingProposal()
-			if err == nil && pending != nil {
-				preview := pending.Proposal
-				if len(preview) > 400 {
-					preview = preview[:400] + "... [truncated]"
-				}
-				return HookOutput{
-					Decision: "deny",
-					Reason: fmt.Sprintf(
-						"Tether Guard: a subagent proposal is still awaiting user approval (proposal #%d from %s). "+
-							"Present it to the user in the main chat, then call approve_proposal once they confirm "+
-							"(or reject_proposal if they decline). Mutations stay blocked until then.\n---\n%s",
-						pending.ID, pending.Role, preview),
-				}
+		if isProtectedSubstratePath(ws, filePath) {
+			return HookOutput{
+				Decision: "deny",
+				Reason:   "Tether Guard: Direct writes to .tether/ databases or snapshots are blocked. Use Tether MCP tools (session_load, sql_query, todo_list, undo) instead.",
 			}
 		}
 	}
 
-	// 3. Subagent Gating.
-	//
-	// This used to fall through to "allow" for every tool it did not recognise,
-	// which made the guard a denylist in disguise: a new MCP tool inherited
-	// permission without anyone deciding it should. checkSubagentAccess is an
-	// allowlist -- reads, read-only queries, and validation commands only -- and
-	// it denies commits even when the parent passes them in a subset. See
-	// subagent_access.go for the source this follows.
-	if isSubagent {
-		var subagentArgs map[string]interface{}
-		if tc := input.toolCallValue(); tc != nil {
-			subagentArgs = tc.Args
-		}
-		return checkSubagentAccess(toolName, command, subagentArgs)
-	}
-
-	// 3. Main Agent: Planning Mode Gating
+	// 2. Planning Mode Gating
 	if h.engine.GetMode() == "plan" {
-		writeTools := map[string]bool{
-			"write_to_file":              true,
-			"write_file":                 true,
-			"edit_file":                  true,
-			"replace_file_content":       true,
-			"multi_replace_file_content": true,
-		}
-
-		if writeTools[toolName] {
+		if isWriteTool(toolName) {
 			targetPath := filePath
 			if targetPath != "" {
 				resolvedPath, err := filepath.EvalSymlinks(targetPath)
@@ -506,8 +385,7 @@ func (h *Handler) handlePreToolUse(input HookInput) HookOutput {
 		}
 	}
 
-	// 4. Main Agent in Code Mode:
-	// MCP calls (access to session.db) and dev tools are auto-approved for frictionless development.
+	// 3. Code Mode:
 	// Snapshot file writes first so the turn can be undone without git.
 	if isWriteTool(toolName) {
 		h.captureBeforeWrite(filePath)
@@ -569,4 +447,90 @@ var writeToolNames = map[string]bool{
 // isWriteTool reports whether a tool writes to a single file path.
 func isWriteTool(name string) bool {
 	return writeToolNames[name]
+}
+
+// isProtectedSubstratePath reports whether targetPath refers (directly, via
+// traversal, or via symlinks) to Tether's root or .tether/ SQLite databases or
+// snapshot backups. Non-DB files like .tether/PLAN.md are deliberately excluded.
+func isProtectedSubstratePath(workspace, targetPath string) bool {
+	trimmed := strings.TrimSpace(targetPath)
+	if trimmed == "" {
+		return false
+	}
+
+	isSubstrateRel := func(rel string) bool {
+		s := strings.ToLower(strings.TrimPrefix(filepath.ToSlash(filepath.Clean(rel)), "./"))
+		return strings.HasPrefix(s, "session.db") ||
+			strings.HasPrefix(s, "cache.db") ||
+			strings.HasPrefix(s, ".tether/session.db") ||
+			strings.HasPrefix(s, ".tether/cache.db") ||
+			s == ".tether/snapshots" || strings.HasPrefix(s, ".tether/snapshots/")
+	}
+
+	if !filepath.IsAbs(trimmed) && isSubstrateRel(trimmed) {
+		return true
+	}
+	if workspace == "" {
+		return false
+	}
+
+	absRoot, err := filepath.Abs(workspace)
+	if err != nil {
+		return false
+	}
+	canonRoot := resolvePathWithAncestor(absRoot)
+
+	var candidate string
+	if filepath.IsAbs(trimmed) {
+		candidate = filepath.Clean(trimmed)
+	} else {
+		candidate = filepath.Join(absRoot, trimmed)
+	}
+	if rel, err := filepath.Rel(absRoot, candidate); err == nil && isSubstrateRel(rel) {
+		return true
+	}
+
+	canonTarget := resolvePathWithAncestor(candidate)
+	if rel, err := filepath.Rel(canonRoot, canonTarget); err == nil && isSubstrateRel(rel) {
+		return true
+	}
+	return false
+}
+
+func resolvePathWithAncestor(p string) string {
+	clean := filepath.Clean(p)
+	var suffix []string
+	cur := clean
+	symlinkHops := 0
+	for {
+		if info, err := os.Lstat(cur); err == nil {
+			if resolved, rerr := filepath.EvalSymlinks(cur); rerr == nil {
+				for i := len(suffix) - 1; i >= 0; i-- {
+					resolved = filepath.Join(resolved, suffix[i])
+				}
+				return filepath.Clean(resolved)
+			}
+			if info.Mode()&os.ModeSymlink != 0 && symlinkHops < 16 {
+				if linkTarget, lerr := os.Readlink(cur); lerr == nil {
+					if !filepath.IsAbs(linkTarget) {
+						linkTarget = filepath.Join(filepath.Dir(cur), linkTarget)
+					}
+					for i := len(suffix) - 1; i >= 0; i-- {
+						linkTarget = filepath.Join(linkTarget, suffix[i])
+					}
+					cur = filepath.Clean(linkTarget)
+					suffix = nil
+					symlinkHops++
+					continue
+				}
+			}
+			return clean
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return clean
+		}
+		suffix = append(suffix, filepath.Base(cur))
+		cur = parent
+	}
 }

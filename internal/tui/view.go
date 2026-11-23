@@ -9,7 +9,7 @@ import (
 )
 
 // View renders the minimalist Antigravity-style (`agy`) 3-Zone Terminal Layout
-// (Zone A: Compact Header & Live Sub-Agents, Zone B: Clean Borderless Stream,
+// (Zone A: Compact Header & Agent Status, Zone B: Clean Borderless Stream,
 // Zone C: Thin-Rule Input & Split Status Footer) within exact m.Width x m.Height.
 func (m Model) View() string {
 	width := m.Width
@@ -84,78 +84,8 @@ func (m Model) renderZoneA(width, totalHeight int) []string {
 	}
 
 	out := []string{PadOrTruncate(headerLine, width)}
-
-	// Render live per-subagent rows only when sub-agents have been spawned or are running.
-	if len(m.Subagents) > 0 {
-		ordered := m.orderedSubagents()
-		maxRows := 4
-		switch {
-		case totalHeight < 18:
-			maxRows = 1
-		case totalHeight < 26:
-			maxRows = 2
-		}
-		if len(ordered) < maxRows {
-			maxRows = len(ordered)
-		}
-		for i := 0; i < maxRows; i++ {
-			s := ordered[i]
-			task := s.Task
-			if s.State == WorkerActive && s.LastTool != "" {
-				task = s.LastTool
-			}
-			taskTrunc := truncateTask(task, max(12, width-36))
-			var row string
-			switch s.State {
-			case WorkerActive:
-				sp := nonEmpty(s.Spinner, brailleFrames[m.SpinnerStep%len(brailleFrames)])
-				row = fmt.Sprintf("    %s %s %s %s",
-					BoldFgHex(SubAgentAccent, sp),
-					BoldFgHex(TextPrimary, s.Role),
-					FgHex(MutedMeta, "· "+taskTrunc),
-					DimFgHex(SubAgentAccent, "· running "+nonEmpty(s.Detail, "0.0s")),
-				)
-			case WorkerCancelled:
-				row = fmt.Sprintf("    %s %s %s",
-					BoldFgHex(DangerAlert, "✖"),
-					FgHex(TextPrimary, s.Role),
-					FgHex(DangerAlert, "· "+nonEmpty(s.Detail, "Cancelled")),
-				)
-			default:
-				row = fmt.Sprintf("    %s %s %s",
-					FgHex(CommandSuccess, "✓"),
-					FgHex(TextPrimary, s.Role),
-					FgHex(MutedMeta, "· "+nonEmpty(s.Detail, "Done")),
-				)
-			}
-			out = append(out, PadOrTruncate(row, width))
-		}
-	} else if len(m.Workers) > 1 && m.Workers[1].State == WorkerActive {
-		w := m.Workers[1]
-		sp := nonEmpty(w.Spinner, brailleFrames[m.SpinnerStep%len(brailleFrames)])
-		row := fmt.Sprintf("    %s %s %s %s",
-			BoldFgHex(SubAgentAccent, sp),
-			BoldFgHex(TextPrimary, w.Name),
-			FgHex(MutedMeta, "· "+truncateTask(w.Task, max(12, width-38))),
-			DimFgHex(SubAgentAccent, "· running "+nonEmpty(w.Detail, "0.0s")),
-		)
-		out = append(out, PadOrTruncate(row, width))
-	}
-
 	out = append(out, PadOrTruncate(FgHex(MutedMeta, strings.Repeat("─", width)), width))
 	return out
-}
-
-func (m Model) orderedSubagents() []SubagentView {
-	var running, finished []SubagentView
-	for i := len(m.Subagents) - 1; i >= 0; i-- {
-		if m.Subagents[i].State == WorkerActive {
-			running = append(running, m.Subagents[i])
-		} else {
-			finished = append(finished, m.Subagents[i])
-		}
-	}
-	return append(running, finished...)
 }
 
 // renderZoneB renders the clean, boxless Antigravity-style conversation stream,
@@ -230,29 +160,6 @@ func (m Model) renderZoneB(width, rows int) []string {
 					rendered = append(rendered, PadOrTruncate("    "+FgHex(DangerAlert, plain), width))
 				default:
 					rendered = append(rendered, PadOrTruncate("    "+DimFgHex(MutedMeta, plain), width))
-				}
-			}
-
-		case StreamSubAgent:
-			bullet := FgHex(CommandSuccess, "● ")
-			switch {
-			case strings.Contains(entry.Title, "running"):
-				bullet = BoldFgHex(SubAgentAccent, brailleFrames[m.SpinnerStep%len(brailleFrames)]+" ")
-			case strings.Contains(entry.Title, "BLOCKED") || strings.Contains(entry.Title, "ERROR") || strings.HasPrefix(entry.Title, "✖"):
-				bullet = BoldFgHex(DangerAlert, "● ")
-			}
-			rendered = append(rendered, PadOrTruncate("  "+bullet+BoldFgHex(SubAgentAccent, entry.Title), width))
-			if entry.Collapsed && entry.Summary != "" {
-				rendered = append(rendered, PadOrTruncate("    "+DimFgHex(MutedMeta, "▸ "+entry.Summary), width))
-			} else {
-				for _, b := range entry.Body {
-					for _, wl := range wrapLine(b, max(12, width-6)) {
-						if strings.HasPrefix(strings.TrimSpace(wl), "▸") {
-							rendered = append(rendered, PadOrTruncate("    "+DimFgHex(MutedMeta, wl), width))
-						} else {
-							rendered = append(rendered, PadOrTruncate("    "+FgHex(TextPrimary, wl), width))
-						}
-					}
 				}
 			}
 
@@ -364,15 +271,6 @@ func (m Model) renderZoneB(width, rows int) []string {
 			tip := "  " + DimFgHex(MutedMeta, "└ Tip: Use /btw for side questions or Ctrl+Y to drag-select text.")
 			rendered = append(rendered, PadOrTruncate(tip, width))
 		}
-	} else if len(m.Workers) > 1 && m.Workers[1].State == WorkerActive && len(m.Subagents) == 0 {
-		w := m.Workers[1]
-		sp := nonEmpty(w.Spinner, brailleFrames[m.SpinnerStep%len(brailleFrames)])
-		appendBlank()
-		liveRow := fmt.Sprintf("  %s %s",
-			BoldFgHex(SubAgentAccent, sp),
-			DimFgHex(TextPrimary, TruncateVisible(w.Name+" · "+w.Task+" ("+nonEmpty(w.Detail, "0.0s")+")", max(10, width-6))),
-		)
-		rendered = append(rendered, PadOrTruncate(liveRow, width))
 	}
 
 	fitted := fitLines(rendered, width, rows, m.StreamScroll)
@@ -421,7 +319,7 @@ func (m Model) renderZoneC(width, maxAllowedRows int) []string {
 	out = append(out, rule)
 
 	// Split Footer: contextual shortcut hint on the left, model · mode on the right
-	busy := m.hasRunningSubagent()
+	busy := false
 	for _, w := range m.Workers {
 		if w.State == WorkerActive {
 			busy = true

@@ -172,7 +172,7 @@ func renderFrame(out io.Writer, m Model, clearScreen bool) {
 // RunTUI launches the interactive 3-Zone Alt-Screen TUI loop on the given input/output streams.
 // It guarantees terminal restoration (ExitAltScreenSeq, ShowCursorSeq, and termios restore)
 // on normal exit, context cancellation, SIGINT/SIGTERM, or panic.
-func RunTUI(ctx context.Context, in *os.File, out io.Writer, workspace, mode, branch string, orch any, bridge ...*AgentBridge) (err error) {
+func RunTUI(ctx context.Context, in *os.File, out io.Writer, workspace, mode, branch string, bridge ...*AgentBridge) (err error) {
 	if in == nil {
 		in = os.Stdin
 	}
@@ -208,7 +208,6 @@ func RunTUI(ctx context.Context, in *os.File, out io.Writer, workspace, mode, br
 		}
 	}
 	m.AltScreenUsed = true
-	m.BindOrchestrator(orch)
 	m.IndexWorkspaceFiles(200)
 
 	if outFile, ok := out.(*os.File); ok && (ui.IsTerminal(outFile) || ui.IsTerminal(in)) {
@@ -241,12 +240,9 @@ func RunTUI(ctx context.Context, in *os.File, out io.Writer, workspace, mode, br
 		for _, c := range cancels {
 			c()
 		}
-		if orchCancel, ok := orch.(interface{ CancelAll() int }); ok {
-			return len(cancels) + orchCancel.CancelAll()
-		}
 		return len(cancels)
 	}
-	m.SetCancelAllFunc(cancelActive)
+	m.cancelAllFn = cancelActive
 
 	cleanedUp := false
 	cleanup := func() {
@@ -276,14 +272,6 @@ func RunTUI(ctx context.Context, in *os.File, out io.Writer, workspace, mode, br
 	if m.Bridge != nil && m.Bridge.BindApproval != nil {
 		m.Bridge.BindApproval(func(req ApprovalRequest) int {
 			return int(SendApprovalGate(msgCh, req))
-		})
-	}
-	if m.Bridge != nil && m.Bridge.BindSubagents != nil {
-		m.Bridge.BindSubagents(func(ev SubagentEventMsg) {
-			select {
-			case msgCh <- ev:
-			case <-ctx.Done():
-			}
 		})
 	}
 	go func() {
@@ -361,7 +349,7 @@ func RunTUI(ctx context.Context, in *os.File, out io.Writer, workspace, mode, br
 			if resyncSize() {
 				continue
 			}
-			hasActive := m.hasRunningSubagent()
+			hasActive := false
 			for _, w := range m.Workers {
 				if w.State == WorkerActive {
 					hasActive = true
@@ -454,30 +442,6 @@ func RunTUI(ctx context.Context, in *os.File, out io.Writer, workspace, mode, br
 						Elapsed:  time.Since(start),
 					}
 				}(cmdStr)
-			}
-
-			// Dispatch asynchronous /spawn Sub-Agent worker if PendingSpawn was queued
-			if m.PendingSpawn[1] != "" && m.Bridge != nil && m.Bridge.SpawnSubagent != nil {
-				role, task := m.PendingSpawn[0], m.PendingSpawn[1]
-				m.PendingSpawn = [2]string{}
-				subCtx, subCancel := context.WithCancel(ctx)
-				activeMu.Lock()
-				activeCancels = append(activeCancels, subCancel)
-				activeMu.Unlock()
-
-				go func(r, t string) {
-					defer subCancel()
-					start := time.Now()
-					lw := &tuiLogWriter{workerID: r, msgCh: msgCh}
-					res, subErr := m.Bridge.SpawnSubagent(subCtx, r, t, lw)
-					msgCh <- AgentTurnDoneMsg{
-						WorkerID: "subagent",
-						Prompt:   "/spawn " + r + " " + t,
-						Answer:   res,
-						Err:      subErr,
-						Elapsed:  time.Since(start),
-					}
-				}(role, task)
 			}
 
 			renderFrame(out, m, false)

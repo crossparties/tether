@@ -14,7 +14,6 @@ import (
 	"github.com/crossparties/tether/internal/harness"
 	"github.com/crossparties/tether/internal/hooks"
 	"github.com/crossparties/tether/internal/mcp"
-	"github.com/crossparties/tether/internal/orchestrator"
 	"github.com/crossparties/tether/internal/safety"
 	"github.com/crossparties/tether/internal/snapshot"
 	"github.com/crossparties/tether/internal/tui"
@@ -47,8 +46,6 @@ func main() {
 		cmdDoctor()
 	case "install":
 		cmdInstall()
-	case "proposal", "proposals":
-		cmdProposal(os.Args[2:])
 	case "tui":
 		cmdRun(append([]string{"--tui"}, os.Args[2:]...))
 	case "run", "agent", "chat":
@@ -79,7 +76,7 @@ func cmdInit() {
 	defer engine.Close()
 
 	fmt.Printf("%s in %s\n", ui.Success("✓ Initialized tether"), ui.Path(workspace))
-	fmt.Printf("  %s session.db created\n", ui.Dim("→"))
+	fmt.Printf("  %s .tether/session.db and .tether/cache.db created\n", ui.Dim("→"))
 	fmt.Printf("  %s .gitignore updated\n", ui.Dim("→"))
 
 	// Detect and store project settings
@@ -144,17 +141,11 @@ func cmdHook() {
 
 	// Hard OS Exit Code 2 enforcement for tool denial
 	if strings.Contains(result, `"decision":"deny"`) {
-		if strings.Contains(result, "Subagents cannot mutate") || strings.Contains(result, "Subagent shell mutation") {
+		if strings.Contains(result, ".tether") || strings.Contains(result, "session.db") || strings.Contains(result, "cache.db") {
 			fmt.Fprintf(os.Stderr, "\n┌────────────────────────────── TETHER GUARD ──────────────────────────────┐\n")
-			fmt.Fprintf(os.Stderr, "│ 🛑 SUBAGENT ACTION BLOCKED: Direct Codebase Mutation Restricted          │\n")
+			fmt.Fprintf(os.Stderr, "│ 🛑 PROTECTED SUBSTRATE BLOCKED: Direct .tether/ mutation is forbidden    │\n")
 			fmt.Fprintf(os.Stderr, "├──────────────────────────────────────────────────────────────────────────┤\n")
-			fmt.Fprintf(os.Stderr, "│ Subagents must propose diffs/commands to Main Agent for user approval.   │\n")
-			fmt.Fprintf(os.Stderr, "└──────────────────────────────────────────────────────────────────────────┘\n\n")
-		} else if strings.Contains(result, "session.db") {
-			fmt.Fprintf(os.Stderr, "\n┌────────────────────────────── TETHER GUARD ──────────────────────────────┐\n")
-			fmt.Fprintf(os.Stderr, "│ 🛑 BASH ACCESS BLOCKED: Use Tether MCP for session.db                    │\n")
-			fmt.Fprintf(os.Stderr, "├──────────────────────────────────────────────────────────────────────────┤\n")
-			fmt.Fprintf(os.Stderr, "│ Direct sqlite3/python shell calls trigger manual permission prompts.     │\n")
+			fmt.Fprintf(os.Stderr, "│ Direct shell/file writes to .tether/ DBs or snapshots are blocked.       │\n")
 			fmt.Fprintf(os.Stderr, "│ Use Tether MCP tools (session_load, sql_query, todo_list) instead.      │\n")
 			fmt.Fprintf(os.Stderr, "└──────────────────────────────────────────────────────────────────────────┘\n\n")
 		} else {
@@ -177,238 +168,6 @@ func cmdHook() {
 }
 
 // cmdMode inspects or toggles the execution mode (code | plan | review)
-// cmdProposal is the user's own key to the approval gate. It writes straight to
-// session.db and never goes through the model, so a decision cannot be forged or
-// skipped by the agent that is supposed to be asking for permission.
-func cmdProposal(args []string) {
-	workspace, err := core.DetectWorkspace(".")
-	if err != nil {
-		fatalf("%v", err)
-		os.Exit(1)
-	}
-
-	engine, err := core.NewEngine(workspace)
-	if err != nil {
-		fatalf("initializing: %v", err)
-		os.Exit(1)
-	}
-	defer engine.Close()
-
-	if len(args) == 0 {
-		args = []string{"list"}
-	}
-
-	switch args[0] {
-	case "list", "ls":
-		proposals, err := engine.ListProposals("pending")
-		if err != nil {
-			fatalf("%v", err)
-			os.Exit(1)
-		}
-		if len(proposals) == 0 {
-			fmt.Println(ui.Success("No proposals awaiting approval.") + " 🔓 Codebase writes are not blocked.")
-			return
-		}
-		fmt.Printf("%s %s awaiting your approval:\n\n",
-			ui.Error("🔒"), ui.Bold(fmt.Sprintf("%d proposal(s)", len(proposals))))
-		for _, p := range proposals {
-			fmt.Printf("  %s  %s %s\n",
-				ui.Accent(fmt.Sprintf("#%d", p.ID)),
-				ui.Bold(ui.Pad(p.Role, 18)),
-				ui.Dim(p.CreatedAt))
-			for _, line := range previewLines(p.Proposal, 3) {
-				fmt.Printf("       %s\n", ui.Dim(line))
-			}
-			fmt.Println()
-		}
-		fmt.Println(ui.Dim("Decide with:  ") + ui.Bold("tether proposal approve <id>") +
-			ui.Dim("   |   ") + ui.Bold("tether proposal reject <id>"))
-
-	case "show":
-		if len(args) < 2 {
-			fatalf("usage: tether proposal show <id>")
-		}
-		id, err := strconv.ParseInt(args[1], 10, 64)
-		if err != nil {
-			fatalf("invalid proposal id %q", args[1])
-		}
-		p, err := engine.GetProposalByID(id)
-		if err != nil {
-			fatalf("%v", err)
-			os.Exit(1)
-		}
-		if p == nil {
-			fatalf("no proposal #%d", id)
-		}
-		fmt.Printf("%s %s\n", ui.Dim("Proposal"), ui.Bold(ui.Accent(fmt.Sprintf("#%d", p.ID))))
-		fmt.Printf("%s %s\n", ui.Dim(ui.Pad("Role:", 8)), ui.Bold(p.Role))
-		fmt.Printf("%s %s\n", ui.Dim(ui.Pad("Status:", 8)), ui.Warn(p.Status))
-		fmt.Printf("%s %s\n", ui.Dim(ui.Pad("Created:", 8)), ui.Dim(p.CreatedAt))
-		if p.Role == "spec" {
-			fmt.Println(ui.Warn("Note:   this is a plan to review, not a code patch."))
-		}
-		fmt.Println(ui.Dim(strings.Repeat("─", 60)))
-		fmt.Println(p.Proposal)
-		if p.Comment != "" {
-			fmt.Println(ui.Dim(strings.Repeat("─", 60)))
-			fmt.Printf("%s %s\n", ui.Dim("Your steering:"), ui.Bold(p.Comment))
-		}
-
-	case "approve", "reject", "abandon":
-		verdict := args[0]
-		if len(args) < 2 {
-			fatalf("usage: tether proposal %s <id|--all> [-m \"steering\"] [--topic]", verdict)
-			os.Exit(1)
-		}
-
-		// A rejection may carry steering (revisit with direction) or mean the
-		// user changed topic (drop the work, do not resubmit).
-		comment, topic, rest := parseVerdictFlags(args[2:])
-		if len(rest) > 0 {
-			fatalf("unexpected argument %q", rest[0])
-			os.Exit(1)
-		}
-		if verdict != "reject" && (comment != "" || topic) {
-			fatalf("-m/--topic only apply to reject")
-			os.Exit(1)
-		}
-
-		var affected int64
-		switch {
-		case args[1] == "--all":
-			if verdict == "approve" {
-				affected, err = engine.ApproveProposal()
-			} else {
-				affected, err = engine.RejectProposal()
-			}
-		default:
-			id, perr := strconv.ParseInt(args[1], 10, 64)
-			if perr != nil {
-				fatalf("invalid proposal id %q", args[1])
-				os.Exit(1)
-			}
-			switch {
-			case verdict == "approve":
-				affected, err = engine.ApproveProposalByID(id)
-			case verdict == "abandon" || topic:
-				affected, err = engine.AbandonProposal(id)
-			default:
-				affected, err = engine.RejectProposalWithComment(id, comment)
-			}
-		}
-		if err != nil {
-			fatalf("%v", err)
-			os.Exit(1)
-		}
-		if affected == 0 {
-			fmt.Println(ui.Dim("Nothing to decide — no pending proposal matched."))
-			return
-		}
-		icon, done := ui.Success("✅"), "approved"
-		switch {
-		case verdict == "reject" || topic:
-			icon, done = ui.Error("🚫"), "rejected"
-		}
-		fmt.Printf("%s %s proposal(s) %s by you via CLI.\n", icon, ui.Bold(fmt.Sprintf("%d", affected)), ui.Bold(done))
-		if verdict == "approve" {
-			fmt.Println(ui.Success("🔓 Codebase writes are no longer blocked."))
-			return
-		}
-		fmt.Println(ui.Warn("🔒 Writes stay blocked until a new proposal is approved."))
-		if topic {
-			fmt.Println(ui.Warn("Topic dropped — the agent must not resubmit this work."))
-		} else if comment != "" {
-			fmt.Printf("%s %s\n", ui.Dim("Steering recorded:"), ui.Bold(comment))
-			fmt.Println(ui.Dim("The agent must revise with this direction, not guess at a fix."))
-		} else {
-			fmt.Println(ui.Dim("No steering given — the agent must wait for your comment."))
-		}
-
-	case "feedback":
-		feedback, ferr := engine.GetRejectionFeedback(10)
-		if ferr != nil {
-			fatalf("%v", ferr)
-			os.Exit(1)
-		}
-		if len(feedback) == 0 {
-			fmt.Println(ui.Dim("No rejections to answer. Nothing is waiting on you."))
-			return
-		}
-		for _, p := range feedback {
-			fmt.Printf("%s  %s %s %s\n",
-				ui.Accent(fmt.Sprintf("#%d", p.ID)),
-				ui.Bold(ui.Pad(p.Role, 12)),
-				ui.Warn(ui.Pad(p.Status, 10)),
-				ui.Dim(p.CreatedAt))
-			for _, line := range previewLines(p.Proposal, 2) {
-				fmt.Printf("      %s\n", ui.Dim(line))
-			}
-			if p.Comment == "" {
-				fmt.Printf("%s %s\n", ui.Dim("      ↳ waiting for your direction:"),
-					ui.Bold("tether proposal show "+strconv.FormatInt(p.ID, 10)))
-			} else {
-				fmt.Printf("%s %s\n", ui.Dim("      ↳ you said:"), ui.Bold(p.Comment))
-			}
-			fmt.Println()
-		}
-
-	default:
-		fatalf("unknown subcommand %q", args[0])
-		fatalf("usage: tether proposal [list|show <id>|approve <id|--all>|reject <id|--all>]")
-		os.Exit(1)
-	}
-}
-
-// parseVerdictFlags splits trailing reject options from positional arguments.
-// It accepts -m/--message/--comment with a value, and --topic as a bare flag.
-func parseVerdictFlags(args []string) (comment string, topic bool, rest []string) {
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		switch {
-		case arg == "--topic":
-			topic = true
-		case arg == "-m" || arg == "--message" || arg == "--comment":
-			if i+1 >= len(args) {
-				fatalf("%s needs a value", arg)
-				os.Exit(1)
-			}
-			comment = args[i+1]
-			i++
-		case strings.HasPrefix(arg, "--message="):
-			comment = strings.TrimPrefix(arg, "--message=")
-		case strings.HasPrefix(arg, "--comment="):
-			comment = strings.TrimPrefix(arg, "--comment=")
-		case strings.HasPrefix(arg, "-m="):
-			comment = strings.TrimPrefix(arg, "-m=")
-		default:
-			rest = append(rest, arg)
-		}
-	}
-	return comment, topic, rest
-}
-
-// previewLines returns at most max non-empty lines from text, trimmed.
-func previewLines(text string, max int) []string {
-	var out []string
-	for _, line := range strings.Split(text, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		if len(line) > 72 {
-			line = line[:72] + "…"
-		}
-		out = append(out, line)
-		if len(out) == max {
-			break
-		}
-	}
-	if len(out) == 0 {
-		out = []string{"(empty)"}
-	}
-	return out
-}
-
 func cmdMode() {
 	workspace, err := core.DetectWorkspace(".")
 	if err != nil {
@@ -608,22 +367,6 @@ func cmdStatus() {
 	fmt.Println(ui.Dim("└─────────────────────────────────────────────────────────────────────────┘"))
 	fmt.Println()
 
-	// A pending subagent proposal silently blocks every write. Never let the
-	// user discover that only when a mutation is refused mid-task.
-	if pending, perr := engine.ListProposals("pending"); perr == nil && len(pending) > 0 {
-		fmt.Printf("%s %d subagent proposal(s) awaiting your approval", ui.Error("🔒 LOCKED:"), len(pending))
-		if oldest := pending[0]; oldest.Role != "" {
-			fmt.Printf("%s\n", ui.Dim(fmt.Sprintf(" (oldest #%d from %s, %s)", oldest.ID, oldest.Role, oldest.CreatedAt)))
-		}
-		fmt.Println()
-		fmt.Println(ui.Error("   Codebase writes are BLOCKED until you decide."))
-		fmt.Printf("%s %s\n", ui.Dim("   Review:"), ui.Bold(fmt.Sprintf("tether proposal show %d", pending[0].ID)))
-		fmt.Printf("%s %s %s %s %s\n", ui.Dim("   Decide:"),
-			ui.Bold(fmt.Sprintf("tether proposal approve %d", pending[0].ID)), ui.Dim("|"),
-			ui.Bold(fmt.Sprintf("tether proposal reject %d", pending[0].ID)), ui.Dim(""))
-		fmt.Println()
-	}
-
 	if mode == "plan" {
 		fmt.Println(ui.Accent("💡 Quick Action:") + "  " + ui.Dim("Run 'tether mode code' to unlock codebase mutation."))
 	} else {
@@ -652,18 +395,18 @@ func cmdDoctor() {
 
 	// 1. Storage & SQLite
 	fmt.Println(ui.Title("[1/4] Core Substrate & Storage"))
-	dbPath := filepath.Join(workspace, "session.db")
+	dbPath := filepath.Join(workspace, ".tether", "session.db")
 	if _, err := os.Stat(dbPath); err == nil {
-		fmt.Println(doctorLine(ui.Success("✔"), "Database File:", "session.db accessible"))
+		fmt.Println(doctorLine(ui.Success("✔"), "Database File:", ".tether/session.db accessible"))
 		passed++
 	} else {
-		fmt.Println(doctorLine(ui.Warn("▲"), "Database File:", "session.db not found (run 'tether init')"))
+		fmt.Println(doctorLine(ui.Warn("▲"), "Database File:", ".tether/session.db not found (run 'tether init')"))
 		warnings++
 	}
 
-	walPath := filepath.Join(workspace, "session.db-wal")
+	walPath := filepath.Join(workspace, ".tether", "session.db-wal")
 	if _, err := os.Stat(walPath); err == nil {
-		fmt.Println(doctorLine(ui.Success("✔"), "WAL Mode:", "ACTIVE (session.db-wal present)"))
+		fmt.Println(doctorLine(ui.Success("✔"), "WAL Mode:", "ACTIVE (.tether/session.db-wal present)"))
 		passed++
 	} else {
 		fmt.Println(doctorLine(ui.Success("✔"), "WAL Mode:", "Configured in PRAGMA"))
@@ -672,11 +415,11 @@ func cmdDoctor() {
 
 	gitignorePath := filepath.Join(workspace, ".gitignore")
 	if content, err := os.ReadFile(gitignorePath); err == nil {
-		if strings.Contains(string(content), "session.db") {
-			fmt.Println(doctorLine(ui.Success("✔"), "Git Hygiene:", "session.db ignored in .gitignore"))
+		if strings.Contains(string(content), ".tether/session.db") || strings.Contains(string(content), ".tether/") {
+			fmt.Println(doctorLine(ui.Success("✔"), "Git Hygiene:", ".tether/session.db ignored in .gitignore"))
 			passed++
 		} else {
-			fmt.Println(doctorLine(ui.Error("✖"), "Git Hygiene:", "session.db NOT in .gitignore!"))
+			fmt.Println(doctorLine(ui.Error("✖"), "Git Hygiene:", ".tether/session.db NOT in .gitignore!"))
 			failed++
 		}
 	} else {
@@ -849,10 +592,8 @@ func cmdRun(args []string) {
 	prompt := strings.TrimSpace(strings.Join(promptParts, " "))
 	if prompt == "" {
 		if useTUI || (ui.IsTerminal(os.Stdin) && ui.IsTerminalFile(os.Stdout) && os.Getenv("TETHER_LEGACY_REPL") != "1") {
-			orch := orchestrator.NewEngine()
-			defer orch.Close()
 			bridge := buildTUIBridge(runner, engine)
-			if err := tui.RunTUI(context.Background(), os.Stdin, os.Stdout, workspace, strings.ToUpper(engine.GetMode()), engine.Branch, orch, bridge); err != nil {
+			if err := tui.RunTUI(context.Background(), os.Stdin, os.Stdout, workspace, strings.ToUpper(engine.GetMode()), engine.Branch, bridge); err != nil {
 				fatalf("%v", err)
 			}
 			return
@@ -909,7 +650,6 @@ func buildTUIBridge(runner *harness.Runner, engine *core.Engine) *tui.AgentBridg
 		RunPrompt:       runner.RunWithOutput,
 		RunPromptStream: runner.RunWithOutputStream,
 		RunSideChat:     runner.RunSideChat,
-		SpawnSubagent:   runner.SpawnSubagentWithOutput,
 		ListModels: func() []tui.PickerOption {
 			choices := runner.ListModels()
 			out := make([]tui.PickerOption, len(choices))
@@ -925,15 +665,6 @@ func buildTUIBridge(runner *harness.Runner, engine *core.Engine) *tui.AgentBridg
 				out[i] = tui.PickerOption{Label: c.Label, Detail: c.Detail}
 			}
 			return out
-		},
-		BindSubagents: func(emit func(tui.SubagentEventMsg)) {
-			runner.SetSubagentObserver(func(ev harness.SubagentEvent) {
-				emit(tui.SubagentEventMsg{
-					ID: ev.ID, Role: ev.Role, Task: ev.Task, Kind: ev.Kind, Line: ev.Line,
-					Steps: ev.Steps, Elapsed: ev.Elapsed, Status: ev.Status, Summary: ev.Summary,
-					Err: ev.Err, Proposal: ev.Proposal, Analysis: ev.Analysis,
-				})
-			})
 		},
 		BindApproval: func(askFn func(req tui.ApprovalRequest) int) {
 			runner.SetAskPolicy(func(d mcp.Decision) (mcp.Verdict, bool) {
@@ -984,7 +715,7 @@ func buildTUIBridge(runner *harness.Runner, engine *core.Engine) *tui.AgentBridg
 					diffLines = strings.Split(strings.TrimRight(diffRaw, "\n"), "\n")
 				}
 				choice := views.ApprovalOptionIndex(askFn(tui.ApprovalRequest{
-					AgentName:      "Main Agent / Sub-Agent Worker",
+					AgentName:      "Main Agent",
 					ActionType:     d.Tool,
 					Target:         target,
 					ScopeHint:      scopeHint,

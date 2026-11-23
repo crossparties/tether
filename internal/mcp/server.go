@@ -296,31 +296,6 @@ func (s *Server) handleToolsList(req *Request) *Response {
 			InputSchema: InputSchema{Type: "object"},
 		},
 		{
-			Name:        "approve_proposal",
-			Description: "Mark a subagent proposal as approved by the user. Call ONLY after the user explicitly says yes in the main chat. Lifts the Tether Guard write block.",
-			InputSchema: InputSchema{
-				Type: "object",
-				Properties: map[string]Property{
-					"proposal_id": {Type: "integer", Description: "Proposal to approve. Omit to approve the oldest pending one."},
-				},
-			},
-		},
-		{
-			Name:        "reject_proposal",
-			Description: "Mark a subagent proposal as rejected by the user. Call when the user declines. Lifts the Tether Guard write block without applying the proposal.",
-			InputSchema: InputSchema{
-				Type: "object",
-				Properties: map[string]Property{
-					"proposal_id": {Type: "integer", Description: "Proposal to reject. Omit to reject the oldest pending one."},
-				},
-			},
-		},
-		{
-			Name:        "proposal_status",
-			Description: "Show any subagent proposal still awaiting user approval",
-			InputSchema: InputSchema{Type: "object"},
-		},
-		{
 			Name:        "session_load",
 			Description: "Load the active session context (recent history, decisions, patterns)",
 			InputSchema: InputSchema{
@@ -491,13 +466,8 @@ func (s *Server) handleToolsList(req *Request) *Response {
 			InputSchema: InputSchema{Type: "object"},
 		},
 		{
-			Name:        "subagent_spawn_rules",
-			Description: "Get mandatory rules for spawning subagents with write access. Call this before invoking any subagent that will create or modify files.",
-			InputSchema: InputSchema{Type: "object"},
-		},
-		{
 			Name:        "sql_query",
-			Description: "Directly execute SQL query against session.db (full access to sessions, session_context, project_settings, decisions, learned_patterns, todos, kb_documents). Returns results as JSON.",
+			Description: "Directly execute SQL query against .tether/session.db (full access to sessions, session_context, project_settings, decisions, learned_patterns, todos, approval_grants). Returns results as JSON.",
 			InputSchema: InputSchema{
 				Type: "object",
 				Properties: map[string]Property{
@@ -628,12 +598,6 @@ func (s *Server) CallTool(name string, args json.RawMessage) (string, bool) {
 	switch name {
 	case "workspace_info":
 		return s.toolWorkspaceInfo(), false
-	case "approve_proposal":
-		return s.toolResolveProposal("approve", args), false
-	case "reject_proposal":
-		return s.toolResolveProposal("reject", args), false
-	case "proposal_status":
-		return s.toolProposalStatus(), false
 	case "approve_change":
 		return s.toolApproveChange("approve", args), false
 	case "reject_change":
@@ -676,8 +640,6 @@ func (s *Server) CallTool(name string, args json.RawMessage) (string, bool) {
 		return s.toolTaskClassify(args), false
 	case "files_modified":
 		return s.toolFilesModified(), false
-	case "subagent_spawn_rules":
-		return s.toolSubagentSpawnRules(), false
 	case "sql_query":
 		return s.toolSQLQuery(args)
 	case "read_file":
@@ -822,124 +784,6 @@ func (s *Server) toolRevokeGrants() string {
 		return fmt.Sprintf("error revoking grants: %v", err)
 	}
 	return fmt.Sprintf("Revoked %d approval grant(s). Every change will ask again.", n)
-}
-
-// toolResolveProposal approves or rejects the pending subagent proposal. It is
-// the only path that lifts the PreToolUse mutation gate.
-func (s *Server) toolResolveProposal(action string, args json.RawMessage) string {
-	var params struct {
-		ProposalID int64  `json:"proposal_id"`
-		Comment    string `json:"comment"`
-		Topic      bool   `json:"topic"`
-	}
-	if len(args) > 0 {
-		_ = json.Unmarshal(args, &params)
-	}
-	if action != "approve" && action != "reject" {
-		return fmt.Sprintf("unknown action %q (approve|reject)", action)
-	}
-
-	var (
-		pending *core.ProposalRecord
-		err     error
-	)
-	if params.ProposalID > 0 {
-		candidate, gerr := s.engine.GetProposalByID(params.ProposalID)
-		if gerr != nil {
-			return fmt.Sprintf("error reading proposal #%d: %v", params.ProposalID, gerr)
-		}
-		if candidate == nil {
-			return fmt.Sprintf("no proposal #%d", params.ProposalID)
-		}
-		if candidate.Status != "pending" {
-			return fmt.Sprintf("proposal #%d is already %s", candidate.ID, candidate.Status)
-		}
-		pending = candidate
-	} else {
-		pending, err = s.engine.GetPendingProposal()
-		if err != nil {
-			return fmt.Sprintf("error reading pending proposal: %v", err)
-		}
-		if pending == nil {
-			return "no pending proposal (the Tether Guard write block is not active)"
-		}
-	}
-
-	var affected int64
-	switch {
-	case action == "approve":
-		affected, err = s.engine.ApproveProposalByID(pending.ID)
-	case params.Topic:
-		affected, err = s.engine.AbandonProposal(pending.ID)
-	default:
-		affected, err = s.engine.RejectProposalWithComment(pending.ID, params.Comment)
-	}
-	if err != nil {
-		return fmt.Sprintf("error resolving proposal: %v", err)
-	}
-
-	verdict := "approved"
-	if action != "approve" {
-		verdict = "rejected"
-	}
-	if params.Topic && action != "approve" {
-		verdict = "abandoned"
-	}
-	payload := map[string]interface{}{
-		"proposal_id":   pending.ID,
-		"role":          pending.Role,
-		"status":        verdict,
-		"affected":      affected,
-		"write_blocked": false,
-	}
-	// A rejection is not a green light to self-correct: hand the agent the
-	// user's steering and tell it to wait when none was given.
-	switch verdict {
-	case "rejected":
-		payload["write_blocked"] = true
-		payload["must_revise"] = true
-		payload["comment"] = params.Comment
-		if params.Comment == "" {
-			payload["instruction"] = "No steering given. Wait for the user's comment; do not guess at a fix."
-		} else {
-			payload["instruction"] = "Revise the proposal using the user's comment. Do not implement the rejected plan."
-		}
-	case "abandoned":
-		payload["write_blocked"] = true
-		payload["must_revise"] = false
-		payload["instruction"] = "The user changed topic. Drop this work and do not resubmit it."
-	}
-	out, _ := json.MarshalIndent(payload, "", "  ")
-	return string(out)
-}
-
-// toolProposalStatus reports whether a subagent proposal is blocking writes.
-func (s *Server) toolProposalStatus() string {
-	pending, err := s.engine.GetPendingProposal()
-	if err != nil {
-		return fmt.Sprintf("error reading pending proposal: %v", err)
-	}
-	if pending == nil {
-		out, _ := json.MarshalIndent(map[string]interface{}{
-			"pending":       false,
-			"write_blocked": false,
-		}, "", "  ")
-		return string(out)
-	}
-
-	preview := pending.Proposal
-	if len(preview) > 500 {
-		preview = preview[:500] + "... [truncated]"
-	}
-	out, _ := json.MarshalIndent(map[string]interface{}{
-		"pending":       true,
-		"write_blocked": true,
-		"proposal_id":   pending.ID,
-		"role":          pending.Role,
-		"created_at":    pending.CreatedAt,
-		"proposal":      preview,
-	}, "", "  ")
-	return string(out)
 }
 
 func (s *Server) toolSessionLoad(args json.RawMessage) string {
@@ -1242,31 +1086,6 @@ func (s *Server) toolFilesModified() string {
 		"count":          len(files),
 	}, "", "  ")
 	return string(out)
-}
-
-// toolSubagentSpawnRules returns mandatory rules for subagents and orchestrator approval protocol
-func (s *Server) toolSubagentSpawnRules() string {
-	return `## Subagent Governance & Approval Protocol
-
-### Architecture: Orchestrator-Worker Model
-1. Subagents are SPECIALIST WORKERS (analysis, research, code review, diff drafting).
-2. Subagents CANNOT mutate the codebase or execute mutative shell commands directly.
-3. Subagents MUST send their proposed changes/diffs/commands via message back to the Main Agent.
-4. The Main Agent (Orchestrator) presents the proposal to the user in the main chat session for approval.
-5. Only after explicit user approval does the Main Agent execute the approved changes.
-
-### Rules for Subagent Prompts:
-1. NO DIRECT MUTATION PERMISSION: Do NOT attempt write_to_file, replace_file_content, or shell mutators. Tether Guard will strictly deny direct mutations.
-2. READ & ANALYZE: Use read_file, view_file, grep, search_files, kb_search freely.
-3. PROPOSE ONLY: Compose all proposed code modifications as markdown diff blocks or shell command scripts.
-4. RETURN VIA MESSAGE: Return the proposal clearly formatted in the final message to the Main Agent.
-5. DO NOT LOOP ON DENIAL: If any mutation is denied, immediately return your findings and proposed diff/command via message to the Main Agent.
-
-### Named subagent types available:
-- tether_architect: Architecture design and diff composition
-- tether_qa: Test planning and verification script design
-- tether_frontend: Frontend component design and styling diffs
-- tether_product: Product specification and planning`
 }
 
 func (s *Server) toolSQLQuery(args json.RawMessage) (string, bool) {

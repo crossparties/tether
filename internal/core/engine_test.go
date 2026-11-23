@@ -1,9 +1,11 @@
 package core
 
 import (
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -29,8 +31,24 @@ func TestNewEngine(t *testing.T) {
 	if e.SessionID == "" {
 		t.Error("SessionID should be non-empty after NewEngine")
 	}
-	if _, err := os.Stat(filepath.Join(dir, "session.db")); os.IsNotExist(err) {
-		t.Error("session.db not created in workspace")
+	if _, err := os.Stat(filepath.Join(dir, ".tether", "session.db")); os.IsNotExist(err) {
+		t.Error(".tether/session.db not created in workspace")
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".tether", "cache.db")); os.IsNotExist(err) {
+		t.Error(".tether/cache.db not created in workspace")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "session.db")); !os.IsNotExist(err) {
+		t.Error("legacy root session.db must not be created on fresh init")
+	}
+
+	gi, err := os.ReadFile(filepath.Join(dir, ".gitignore"))
+	if err != nil {
+		t.Fatalf("read .gitignore: %v", err)
+	}
+	for _, want := range []string{".tether/session.db*", ".tether/cache.db*", ".tether/snapshots/", ".tether/PLAN.md"} {
+		if !strings.Contains(string(gi), want) {
+			t.Errorf(".gitignore missing %q:\n%s", want, string(gi))
+		}
 	}
 }
 
@@ -73,7 +91,9 @@ func TestSession(t *testing.T) {
 		t.Fatalf("CompleteSession: %v", err)
 	}
 	var status string
-	e.DB.QueryRow(`SELECT status FROM sessions WHERE id = ?`, e.SessionID).Scan(&status)
+	if err := e.ReadDB().QueryRow(`SELECT status FROM sessions WHERE id = ?`, e.SessionID).Scan(&status); err != nil {
+		t.Fatalf("read status: %v", err)
+	}
 	if status != "completed" {
 		t.Errorf("status = %q, want completed", status)
 	}
@@ -163,7 +183,7 @@ func TestTodos(t *testing.T) {
 func TestModeGating(t *testing.T) {
 	e := newTestEngine(t)
 
-	e.SetMode("plan")
+	_ = e.SetMode("plan")
 	if e.IsWriteAllowed() {
 		t.Error("IsWriteAllowed() true in plan mode")
 	}
@@ -171,7 +191,7 @@ func TestModeGating(t *testing.T) {
 		t.Errorf("GetMode() = %q, want plan", e.GetMode())
 	}
 
-	e.SetMode("code")
+	_ = e.SetMode("code")
 	if !e.IsWriteAllowed() {
 		t.Error("IsWriteAllowed() false in code mode")
 	}
@@ -182,23 +202,23 @@ func TestEngine_ExecuteSQL_And_Optimizations(t *testing.T) {
 
 	// 1. Verify PRAGMA user_version fast-path
 	var userVer int
-	if err := e.DB.QueryRow("PRAGMA user_version;").Scan(&userVer); err != nil {
+	if err := e.ReadDB().QueryRow("PRAGMA user_version;").Scan(&userVer); err != nil {
 		t.Fatalf("QueryRow user_version: %v", err)
 	}
 	if userVer != SchemaVersion {
 		t.Errorf("expected user_version = %d, got %d", SchemaVersion, userVer)
 	}
 
-	// 2. Verify WAL mode and busy timeout
+	// 2. Verify WAL mode
 	var journalMode string
-	if err := e.DB.QueryRow("PRAGMA journal_mode;").Scan(&journalMode); err != nil {
+	if err := e.WriteDB().QueryRow("PRAGMA journal_mode;").Scan(&journalMode); err != nil {
 		t.Fatalf("QueryRow journal_mode: %v", err)
 	}
 	if journalMode != "wal" {
 		t.Errorf("expected journal_mode wal, got %s", journalMode)
 	}
 
-	// 3. Test ExecuteSQL SELECT
+	// 3. Test ExecuteSQL SELECT (routes via readDB)
 	res, err := e.ExecuteSQL("SELECT key, value FROM project_settings")
 	if err != nil {
 		t.Fatalf("ExecuteSQL select: %v", err)
@@ -209,7 +229,7 @@ func TestEngine_ExecuteSQL_And_Optimizations(t *testing.T) {
 	}
 	_ = rows
 
-	// 4. Test ExecuteSQL INSERT
+	// 4. Test ExecuteSQL INSERT (routes via writeDB)
 	insertRes, err := e.ExecuteSQL("INSERT INTO project_settings (key, value) VALUES ('test_opt', '123')")
 	if err != nil {
 		t.Fatalf("ExecuteSQL insert: %v", err)
@@ -229,121 +249,9 @@ func TestEngine_ExecuteSQL_And_Optimizations(t *testing.T) {
 	}
 }
 
-func TestRecordAndApproveProposal(t *testing.T) {
-	e := newTestEngine(t)
-
-	// No proposal initially.
-	p, err := e.GetPendingProposal()
-	if err != nil {
-		t.Fatalf("GetPendingProposal: %v", err)
-	}
-	if p != nil {
-		t.Fatalf("expected no pending proposal, got %+v", p)
-	}
-
-	blocked, _, err := e.ProposalGateBlocked()
-	if err != nil {
-		t.Fatalf("ProposalGateBlocked: %v", err)
-	}
-	if blocked {
-		t.Fatal("gate should be open with no pending proposal")
-	}
-
-	id, err := e.RecordProposal("tether_qa", "add adapter tests")
-	if err != nil {
-		t.Fatalf("RecordProposal: %v", err)
-	}
-	if id == 0 {
-		t.Fatal("RecordProposal returned id 0")
-	}
-
-	p, err = e.GetPendingProposal()
-	if err != nil {
-		t.Fatalf("GetPendingProposal: %v", err)
-	}
-	if p == nil {
-		t.Fatal("expected a pending proposal")
-	}
-	if p.Role != "tether_qa" || p.Proposal != "add adapter tests" || p.Status != "pending" {
-		t.Fatalf("unexpected proposal: %+v", p)
-	}
-
-	blocked, rec, err := e.ProposalGateBlocked()
-	if err != nil {
-		t.Fatalf("ProposalGateBlocked: %v", err)
-	}
-	if !blocked || rec == nil || rec.ID != id {
-		t.Fatalf("gate should be closed by proposal #%d", id)
-	}
-
-	affected, err := e.ApproveProposal()
-	if err != nil {
-		t.Fatalf("ApproveProposal: %v", err)
-	}
-	if affected != 1 {
-		t.Fatalf("ApproveProposal affected %d rows, want 1", affected)
-	}
-
-	blocked, _, err = e.ProposalGateBlocked()
-	if err != nil {
-		t.Fatalf("ProposalGateBlocked after approve: %v", err)
-	}
-	if blocked {
-		t.Fatal("gate should reopen after approval")
-	}
-}
-
-func TestRecordAndRejectProposal(t *testing.T) {
-	e := newTestEngine(t)
-
-	if _, err := e.RecordProposal("tether_architect", "rewrite engine"); err != nil {
-		t.Fatalf("RecordProposal: %v", err)
-	}
-
-	affected, err := e.RejectProposal()
-	if err != nil {
-		t.Fatalf("RejectProposal: %v", err)
-	}
-	if affected != 1 {
-		t.Fatalf("RejectProposal affected %d rows, want 1", affected)
-	}
-
-	p, err := e.GetPendingProposal()
-	if err != nil {
-		t.Fatalf("GetPendingProposal: %v", err)
-	}
-	if p != nil {
-		t.Fatalf("expected no pending proposal after reject, got %+v", p)
-	}
-}
-
-func TestProposalGate_OldestFirst(t *testing.T) {
-	e := newTestEngine(t)
-
-	if _, err := e.RecordProposal("tether_qa", "first"); err != nil {
-		t.Fatalf("RecordProposal: %v", err)
-	}
-	if _, err := e.RecordProposal("tether_frontend", "second"); err != nil {
-		t.Fatalf("RecordProposal: %v", err)
-	}
-
-	p, err := e.GetPendingProposal()
-	if err != nil {
-		t.Fatalf("GetPendingProposal: %v", err)
-	}
-	if p == nil || p.Proposal != "first" {
-		t.Fatalf("expected oldest proposal first, got %+v", p)
-	}
-}
-
 // Every required table must exist after a fresh initialisation.
 func TestMigrateCreatesAllRequiredTables(t *testing.T) {
-	dir := t.TempDir()
-	e, err := NewEngine(dir)
-	if err != nil {
-		t.Fatalf("NewEngine: %v", err)
-	}
-	defer e.Close()
+	e := newTestEngine(t)
 
 	missing, err := e.missingTables()
 	if err != nil {
@@ -352,26 +260,38 @@ func TestMigrateCreatesAllRequiredTables(t *testing.T) {
 	if len(missing) != 0 {
 		t.Fatalf("after init, missing tables: %v", missing)
 	}
+
+	wantIndexes := []string{
+		"idx_conversation_events_thread_seq",
+		"idx_session_context_session_id",
+		"idx_todos_session_status",
+		"idx_decisions_git_branch",
+		"idx_approval_grants_session_expires",
+	}
+	for _, idx := range wantIndexes {
+		var name string
+		err := e.ReadDB().QueryRow(`SELECT name FROM sqlite_master WHERE type='index' AND name = ?`, idx).Scan(&name)
+		if err != nil || name != idx {
+			t.Errorf("missing expected index %q in session.db (err=%v)", idx, err)
+		}
+	}
 }
 
 // A database stamped with the current SchemaVersion but lacking a table must be
-// repaired on the next open. This is the regression that let pending_proposals
-// stay absent while PRAGMA user_version claimed the schema was current.
+// repaired on the next open.
 func TestMigrateRepairsSchemaDrift(t *testing.T) {
 	dir := t.TempDir()
 
-	// Build a healthy database first.
 	e, err := NewEngine(dir)
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
 
-	// Simulate the bug: drop a table while user_version still says "current".
-	if _, err := e.DB.Exec("DROP TABLE pending_proposals"); err != nil {
+	if _, err := e.WriteDB().Exec("DROP TABLE approval_grants"); err != nil {
 		t.Fatalf("drop table: %v", err)
 	}
 	var version int
-	if err := e.DB.QueryRow("PRAGMA user_version;").Scan(&version); err != nil {
+	if err := e.ReadDB().QueryRow("PRAGMA user_version;").Scan(&version); err != nil {
 		t.Fatalf("read user_version: %v", err)
 	}
 	if version < SchemaVersion {
@@ -381,7 +301,6 @@ func TestMigrateRepairsSchemaDrift(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	// Reopening must notice the missing table and recreate it.
 	reopened, err := NewEngine(dir)
 	if err != nil {
 		t.Fatalf("reopen NewEngine: %v", err)
@@ -396,204 +315,400 @@ func TestMigrateRepairsSchemaDrift(t *testing.T) {
 		t.Fatalf("schema drift was not repaired, still missing: %v", missing)
 	}
 
-	// And the repaired table must actually be usable.
-	if _, err := reopened.RecordProposal("tether_qa", "post-repair proposal"); err != nil {
-		t.Fatalf("RecordProposal after repair: %v", err)
+	if err := reopened.AddApprovalGrant("internal/core", "path"); err != nil {
+		t.Fatalf("AddApprovalGrant after repair: %v", err)
 	}
 }
 
-func TestProposalPerIDLifecycle(t *testing.T) {
-	e := newTestEngine(t)
+func TestLegacyV4AutoMigrationToDotTetherAndV5(t *testing.T) {
+	dir := t.TempDir()
+	legacyPath := filepath.Join(dir, "session.db")
 
-	id1, err := e.RecordProposal("tether_qa", "first proposal")
+	legacyDB, err := sql.Open("sqlite", sqliteDSN(legacyPath, false))
 	if err != nil {
-		t.Fatalf("RecordProposal: %v", err)
+		t.Fatalf("open legacy db: %v", err)
 	}
-	id2, err := e.RecordProposal("tether_architect", "second proposal")
+	v4Schema := `
+	CREATE TABLE sessions (
+		id TEXT PRIMARY KEY,
+		status TEXT DEFAULT 'active',
+		mode TEXT DEFAULT 'code',
+		git_branch TEXT DEFAULT 'default',
+		summary TEXT DEFAULT '',
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE TABLE session_context (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		session_id TEXT,
+		agent TEXT DEFAULT '',
+		role TEXT,
+		content TEXT,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE TABLE project_settings (
+		key TEXT PRIMARY KEY,
+		value TEXT,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE TABLE decisions (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		session_id TEXT,
+		git_branch TEXT DEFAULT 'default',
+		topic TEXT,
+		decision TEXT,
+		reason TEXT,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE TABLE learned_patterns (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		pattern_type TEXT,
+		description TEXT,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE TABLE todos (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		session_id TEXT,
+		git_branch TEXT DEFAULT 'default',
+		description TEXT,
+		details TEXT DEFAULT '',
+		status TEXT DEFAULT 'pending',
+		version INTEGER DEFAULT 1,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		completed_at DATETIME
+	);
+	CREATE TABLE kb_documents (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		file_path TEXT,
+		chunk_index INTEGER DEFAULT 0,
+		content TEXT,
+		metadata TEXT DEFAULT '',
+		indexed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE(file_path, chunk_index)
+	);
+	CREATE VIRTUAL TABLE kb_fts USING fts5(content, file_path, content='kb_documents', content_rowid='id');
+	CREATE TABLE pending_proposals (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		session_id TEXT,
+		role TEXT DEFAULT '',
+		proposal TEXT DEFAULT '',
+		status TEXT DEFAULT 'pending',
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	INSERT INTO sessions (id, status, mode, git_branch, summary) VALUES ('v4-sess', 'active', 'code', 'default', 'kept summary');
+	INSERT INTO decisions (session_id, git_branch, topic, decision, reason) VALUES ('v4-sess', 'default', 'db', 'dual-pool', 'perf');
+	INSERT INTO pending_proposals (session_id, role, proposal) VALUES ('v4-sess', 'tether_qa', 'obsolete');
+	PRAGMA user_version = 4;
+	`
+	if _, err := legacyDB.Exec(v4Schema); err != nil {
+		legacyDB.Close()
+		t.Fatalf("seed v4 schema: %v", err)
+	}
+	if err := legacyDB.Close(); err != nil {
+		t.Fatalf("close legacy db: %v", err)
+	}
+
+	e, err := NewEngine(dir)
 	if err != nil {
-		t.Fatalf("RecordProposal: %v", err)
+		t.Fatalf("NewEngine migration failed: %v", err)
+	}
+	defer e.Close()
+
+	// Root legacy files must be gone; .tether/session.db must exist.
+	for _, old := range []string{"session.db", "session.db-wal", "session.db-shm"} {
+		if _, err := os.Stat(filepath.Join(dir, old)); !os.IsNotExist(err) {
+			t.Errorf("legacy root file %q still exists after migration", old)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".tether", "session.db")); err != nil {
+		t.Fatalf("migrated .tether/session.db missing: %v", err)
 	}
 
-	all, err := e.ListProposals("pending")
-	if err != nil {
-		t.Fatalf("ListProposals: %v", err)
+	// Legacy session & decision data survived.
+	if e.SessionID != "v4-sess" {
+		t.Errorf("SessionID = %q, want v4-sess", e.SessionID)
 	}
-	if len(all) != 2 {
-		t.Fatalf("ListProposals returned %d, want 2", len(all))
-	}
-	if all[0].ID != id1 || all[1].ID != id2 {
-		t.Fatalf("ListProposals order = [%d %d], want oldest first [%d %d]", all[0].ID, all[1].ID, id1, id2)
+	decisions, err := e.GetDecisions()
+	if err != nil || len(decisions) != 1 || decisions[0].Topic != "db" {
+		t.Fatalf("legacy decisions lost during migration: %+v, err=%v", decisions, err)
 	}
 
-	// Approving one must leave the other pending.
-	affected, err := e.ApproveProposalByID(id1)
-	if err != nil {
-		t.Fatalf("ApproveProposalByID: %v", err)
+	// user_version bumped to 5, legacy tables removed from session.db.
+	var ver int
+	if err := e.ReadDB().QueryRow("PRAGMA user_version;").Scan(&ver); err != nil || ver != SchemaVersion {
+		t.Fatalf("user_version = %d (err=%v), want %d", ver, err, SchemaVersion)
 	}
-	if affected != 1 {
-		t.Fatalf("ApproveProposalByID affected %d, want 1", affected)
-	}
-
-	pending, err := e.ListProposals("pending")
-	if err != nil {
-		t.Fatalf("ListProposals: %v", err)
-	}
-	if len(pending) != 1 || pending[0].ID != id2 {
-		t.Fatalf("after approving #%d, pending = %+v, want only #%d", id1, pending, id2)
+	for _, removed := range []string{"pending_proposals", "kb_documents", "kb_fts"} {
+		var cnt int
+		if err := e.ReadDB().QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name = ?`, removed).Scan(&cnt); err != nil {
+			t.Fatalf("check removed table %s: %v", removed, err)
+		}
+		if cnt != 0 {
+			t.Errorf("legacy table %q still exists in session.db after v4->v5 migration", removed)
+		}
 	}
 
-	// The write gate must stay closed because #2 is still undecided.
-	if blocked, rec, err := e.ProposalGateBlocked(); err != nil || !blocked || rec.ID != id2 {
-		t.Fatalf("gate should still be blocked by #%d (blocked=%v err=%v)", id2, blocked, err)
-	}
-
-	// Approving an already-decided proposal is a no-op.
-	if affected, err := e.ApproveProposalByID(id1); err != nil || affected != 0 {
-		t.Fatalf("re-approving #%d affected %d (err=%v), want 0", id1, affected, err)
-	}
-
-	p, err := e.GetProposalByID(id1)
-	if err != nil {
-		t.Fatalf("GetProposalByID: %v", err)
-	}
-	if p == nil || p.Status != "approved" {
-		t.Fatalf("proposal #%d = %+v, want status approved", id1, p)
-	}
-
-	if _, err := e.RejectProposalByID(id2); err != nil {
-		t.Fatalf("RejectProposalByID: %v", err)
-	}
-	if blocked, _, _ := e.ProposalGateBlocked(); blocked {
-		t.Fatal("gate should reopen once every proposal is decided")
-	}
-
-	missing, err := e.GetProposalByID(99999)
-	if err != nil {
-		t.Fatalf("GetProposalByID missing: %v", err)
-	}
-	if missing != nil {
-		t.Fatalf("GetProposalByID(99999) = %+v, want nil", missing)
+	// All required v5 tables exist.
+	missing, err := e.missingTables()
+	if err != nil || len(missing) != 0 {
+		t.Fatalf("missing tables after v4->v5 migration: %v (err=%v)", missing, err)
 	}
 }
 
-// A pending proposal must not lock the workspace forever if it is abandoned.
-func TestProposalTTLExpiry(t *testing.T) {
-	e := newTestEngine(t)
+func TestLegacyV4AutoMigration_LiveWALAndBusyFailure(t *testing.T) {
+	prevTimeout := legacyCheckpointBusyTimeoutMs
+	legacyCheckpointBusyTimeoutMs = 50
+	t.Cleanup(func() { legacyCheckpointBusyTimeoutMs = prevTimeout })
 
-	id, err := e.RecordProposal("tether_qa", "abandoned proposal")
+	seedDir := t.TempDir()
+	legacyPath := filepath.Join(seedDir, "session.db")
+
+	writerDB, err := sql.Open("sqlite", sqliteDSN(legacyPath, false))
 	if err != nil {
-		t.Fatalf("RecordProposal: %v", err)
+		t.Fatalf("open writer db: %v", err)
+	}
+	if _, err := writerDB.Exec(`
+		PRAGMA wal_autocheckpoint = 0;
+		CREATE TABLE sessions (
+			id TEXT PRIMARY KEY,
+			status TEXT DEFAULT 'active',
+			mode TEXT DEFAULT 'code',
+			git_branch TEXT DEFAULT 'default',
+			summary TEXT DEFAULT '',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE TABLE decisions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_id TEXT,
+			git_branch TEXT DEFAULT 'default',
+			topic TEXT,
+			decision TEXT,
+			reason TEXT,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+		INSERT INTO sessions (id, status, mode, git_branch) VALUES ('wal-sess', 'active', 'code', 'default');
+		PRAGMA user_version = 4;
+		PRAGMA wal_checkpoint(TRUNCATE);
+	`); err != nil {
+		writerDB.Close()
+		t.Fatalf("seed v4 schema: %v", err)
 	}
 
-	blocked, rec, err := e.ProposalGateBlocked()
-	if err != nil || !blocked || rec.ID != id {
-		t.Fatalf("fresh proposal should block writes (blocked=%v err=%v)", blocked, err)
-	}
-
-	// Age the proposal past its TTL, exactly as a forgotten decision would.
-	if _, err := e.DB.Exec(`
-		UPDATE pending_proposals SET expires_at = datetime('now', '-1 minute') WHERE id = ?`, id); err != nil {
-		t.Fatalf("age proposal: %v", err)
-	}
-
-	blocked, _, err = e.ProposalGateBlocked()
+	// Open a reader snapshot BEFORE writing the uncheckpointed row so SQLite
+	// retains the new frame inside session.db-wal and blocks TRUNCATE.
+	readerDB, err := sql.Open("sqlite", sqliteDSN(legacyPath, true))
 	if err != nil {
-		t.Fatalf("ProposalGateBlocked: %v", err)
+		writerDB.Close()
+		t.Fatalf("open reader db: %v", err)
 	}
-	if blocked {
-		t.Fatal("an expired proposal must not keep the workspace locked")
+	readTx, err := readerDB.Begin()
+	if err != nil {
+		readerDB.Close()
+		writerDB.Close()
+		t.Fatalf("begin reader tx: %v", err)
+	}
+	var count int
+	if err := readTx.QueryRow(`SELECT COUNT(*) FROM sessions`).Scan(&count); err != nil {
+		_ = readTx.Rollback()
+		readerDB.Close()
+		writerDB.Close()
+		t.Fatalf("pin wal read snapshot: %v", err)
 	}
 
-	p, err := e.GetProposalByID(id)
-	if err != nil {
-		t.Fatalf("GetProposalByID: %v", err)
+	// Commit a new row while the reader pins the older snapshot -> stays in -wal.
+	if _, err := writerDB.Exec(`INSERT INTO decisions (session_id, git_branch, topic, decision, reason) VALUES ('wal-sess', 'default', 'wal-live', 'uncheckpointed-row', 'must-survive')`); err != nil {
+		_ = readTx.Rollback()
+		readerDB.Close()
+		writerDB.Close()
+		t.Fatalf("insert live wal row: %v", err)
 	}
-	if p == nil || p.Status != "expired" {
-		t.Fatalf("proposal #%d status = %v, want expired", id, p)
+
+	walInfo, err := os.Stat(legacyPath + "-wal")
+	if err != nil || walInfo.Size() == 0 {
+		_ = readTx.Rollback()
+		readerDB.Close()
+		writerDB.Close()
+		t.Fatalf("expected non-empty session.db-wal before migration (err=%v)", err)
+	}
+
+	// Snapshot the live uncheckpointed db + wal files to liveDir while readTx holds the WAL open.
+	liveDir := t.TempDir()
+	for _, suffix := range []string{"", "-wal"} {
+		data, rerr := os.ReadFile(legacyPath + suffix)
+		if rerr != nil {
+			_ = readTx.Rollback()
+			readerDB.Close()
+			writerDB.Close()
+			t.Fatalf("read %s: %v", legacyPath+suffix, rerr)
+		}
+		if werr := os.WriteFile(filepath.Join(liveDir, "session.db"+suffix), data, 0644); werr != nil {
+			_ = readTx.Rollback()
+			readerDB.Close()
+			writerDB.Close()
+			t.Fatalf("copy %s: %v", suffix, rerr)
+		}
+	}
+
+	// Negative test: while readTx blocks TRUNCATE on seedDir, migration must fail
+	// cleanly and leave root session.db + session.db-wal untouched.
+	if _, err := NewEngine(seedDir); err == nil {
+		_ = readTx.Rollback()
+		readerDB.Close()
+		writerDB.Close()
+		t.Fatal("expected NewEngine to fail when legacy WAL cannot be truncated due to active lock")
+	}
+	if _, err := os.Stat(legacyPath + "-wal"); err != nil {
+		t.Errorf("busy migration deleted session.db-wal: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(seedDir, ".tether", "session.db")); !os.IsNotExist(err) {
+		t.Errorf("busy migration created .tether/session.db unexpectedly")
+	}
+
+	_ = readTx.Rollback()
+	readerDB.Close()
+	writerDB.Close()
+
+	// Positive test: migrate liveDir containing uncheckpointed -wal frames.
+	e, err := NewEngine(liveDir)
+	if err != nil {
+		t.Fatalf("NewEngine live WAL migration failed: %v", err)
+	}
+	defer e.Close()
+
+	decisions, err := e.GetDecisions()
+	if err != nil {
+		t.Fatalf("GetDecisions: %v", err)
+	}
+	foundLiveWAL := false
+	for _, d := range decisions {
+		if d.Topic == "wal-live" && d.Decision == "uncheckpointed-row" {
+			foundLiveWAL = true
+			break
+		}
+	}
+	if !foundLiveWAL {
+		t.Fatalf("uncheckpointed WAL row lost during migration; decisions=%+v", decisions)
+	}
+	if _, err := os.Stat(filepath.Join(liveDir, "session.db-wal")); !os.IsNotExist(err) {
+		t.Errorf("expected root session.db-wal to be removed after successful migration")
 	}
 }
 
-// A proposal from another session must never block this one.
-func TestProposalSessionScoping(t *testing.T) {
+func TestReadDBRejectsWritesAndSupportsConcurrentReads(t *testing.T) {
 	e := newTestEngine(t)
 
-	// Simulate a proposal left behind by an unrelated session.
-	if _, err := e.DB.Exec(`
-		INSERT INTO pending_proposals (session_id, role, proposal, status, expires_at)
-		VALUES ('some-other-session', 'tether_qa', 'stale from elsewhere', 'pending', datetime('now', '+2 hours'))`); err != nil {
-		t.Fatalf("insert foreign proposal: %v", err)
-	}
-
-	blocked, _, err := e.ProposalGateBlocked()
-	if err != nil {
-		t.Fatalf("ProposalGateBlocked: %v", err)
-	}
-	if blocked {
-		t.Fatal("a proposal owned by another session must not lock this session")
-	}
-
-	// This session's own proposal does block.
-	if _, err := e.RecordProposal("tether_qa", "mine"); err != nil {
-		t.Fatalf("RecordProposal: %v", err)
-	}
-	if blocked, _, _ := e.ProposalGateBlocked(); !blocked {
-		t.Fatal("own proposal should block the session")
-	}
-}
-
-// The TTL is operator-tunable.
-func TestProposalTTLSetting(t *testing.T) {
-	e := newTestEngine(t)
-
-	if got := e.proposalTTLMinutes(); got != DefaultProposalTTLMinutes {
-		t.Fatalf("default TTL = %d, want %d", got, DefaultProposalTTLMinutes)
-	}
-	if err := e.SetProjectSetting("proposal_ttl_minutes", "15"); err != nil {
+	if err := e.SetProjectSetting("read_test", "ok"); err != nil {
 		t.Fatalf("SetProjectSetting: %v", err)
 	}
-	if got := e.proposalTTLMinutes(); got != 15 {
-		t.Fatalf("TTL = %d, want 15", got)
+
+	if _, err := e.ReadDB().Exec(`INSERT INTO project_settings (key, value) VALUES ('illegal', 'write')`); err == nil {
+		t.Fatal("expected ReadDB().Exec(INSERT) to fail under query_only=ON / mode=ro, got nil")
 	}
-	if err := e.SetProjectSetting("proposal_ttl_minutes", "garbage"); err != nil {
-		t.Fatalf("SetProjectSetting: %v", err)
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 16)
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			val, err := e.GetProjectSetting("read_test")
+			if err != nil {
+				errs <- err
+				return
+			}
+			if val != "ok" {
+				errs <- sql.ErrNoRows
+			}
+		}()
 	}
-	if got := e.proposalTTLMinutes(); got != DefaultProposalTTLMinutes {
-		t.Fatalf("invalid TTL should fall back to default, got %d", got)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent ReadDB query failed: %v", err)
 	}
 }
 
-// An expired proposal must not be listed as actionable. Listing raw
-// status='pending' rows hid the TTL and showed stale items as live.
-func TestListProposalsHidesExpired(t *testing.T) {
+func TestCacheDBSchemaAndKBStorage(t *testing.T) {
 	e := newTestEngine(t)
 
-	live, err := e.RecordProposal("tether_qa", "live one")
-	if err != nil {
-		t.Fatalf("RecordProposal: %v", err)
+	for _, tbl := range []string{"kb_documents", "kb_fts", "repomap_tags"} {
+		var name string
+		if err := e.CacheDB().QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name = ?`, tbl).Scan(&name); err != nil {
+			t.Errorf("expected table %q in .tether/cache.db: %v", tbl, err)
+		}
 	}
-	stale, err := e.RecordProposal("tether_qa", "stale one")
-	if err != nil {
-		t.Fatalf("RecordProposal: %v", err)
-	}
-	if _, err := e.DB.Exec(`
-		UPDATE pending_proposals SET expires_at = datetime('now', '-1 minute') WHERE id = ?`, stale); err != nil {
-		t.Fatalf("age proposal: %v", err)
+	var idxName string
+	if err := e.CacheDB().QueryRow(`SELECT name FROM sqlite_master WHERE type='index' AND name = 'idx_kb_documents_path'`).Scan(&idxName); err != nil {
+		t.Errorf("expected idx_kb_documents_path in .tether/cache.db: %v", err)
 	}
 
-	pending, err := e.ListProposals("pending")
-	if err != nil {
-		t.Fatalf("ListProposals: %v", err)
+	// Ensure session.db does not host cache tables or pending_proposals.
+	for _, absent := range []string{"kb_documents", "kb_fts", "pending_proposals"} {
+		var cnt int
+		if err := e.ReadDB().QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name = ?`, absent).Scan(&cnt); err != nil {
+			t.Fatalf("query session.db master: %v", err)
+		}
+		if cnt != 0 {
+			t.Errorf("expected %q to be absent from .tether/session.db", absent)
+		}
 	}
-	if len(pending) != 1 || pending[0].ID != live {
-		t.Fatalf("ListProposals = %+v, want only the live proposal #%d", pending, live)
+}
+
+func TestIndexDirectoryTransactional(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]string{
+		"main.go":           "package main\nfunc alphaSignal() {}\n",
+		"sub/helper.go":     "package sub\nfunc betaSignal() {}\n",
+		"README.md":         "# Documentation\n",
+		"ignored.txt":       "ignored extension\n",
+		".git/HEAD":         "ref: refs/heads/main\n",
+		".tether/secret.go": "package secret\n",
+	}
+	for rel, content := range files {
+		full := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatalf("mkdir %s: %v", full, err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0644); err != nil {
+			t.Fatalf("write %s: %v", full, err)
+		}
 	}
 
-	// The expired row is kept for the audit trail, just not as pending.
-	p, err := e.GetProposalByID(stale)
+	e, err := NewEngine(dir)
 	if err != nil {
-		t.Fatalf("GetProposalByID: %v", err)
+		t.Fatalf("NewEngine: %v", err)
 	}
-	if p == nil || p.Status != "expired" {
-		t.Fatalf("stale proposal status = %v, want expired", p.Status)
+	defer e.Close()
+
+	count, err := e.IndexDirectory(dir, []string{"go", "md"})
+	if err != nil {
+		t.Fatalf("IndexDirectory: %v", err)
+	}
+	if count != 3 {
+		t.Fatalf("IndexDirectory indexed %d files, want 3 (main.go, sub/helper.go, README.md)", count)
+	}
+
+	stats, err := e.KBStatus()
+	if err != nil {
+		t.Fatalf("KBStatus: %v", err)
+	}
+	if stats.TotalFiles != 3 || stats.TotalChunks != 3 {
+		t.Fatalf("KBStatus = %+v, want {TotalFiles:3 TotalChunks:3}", stats)
+	}
+
+	// Re-indexing must overwrite without duplicating chunks.
+	count2, err := e.IndexDirectory(dir, []string{"go", "md"})
+	if err != nil || count2 != 3 {
+		t.Fatalf("re-index = (%d, %v), want (3, nil)", count2, err)
+	}
+	stats2, err := e.KBStatus()
+	if err != nil || stats2.TotalChunks != 3 {
+		t.Fatalf("after re-index KBStatus = %+v (err=%v), want 3 chunks", stats2, err)
+	}
+
+	hits, err := e.SearchKB("betaSignal", 5)
+	if err != nil || len(hits) != 1 {
+		t.Fatalf("SearchKB(betaSignal) = %+v, err=%v", hits, err)
 	}
 }

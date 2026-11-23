@@ -60,7 +60,8 @@ func isIgnoredDir(name string) bool {
 
 // isIgnoredFile reports whether a file name must be excluded from workspace indexing.
 func isIgnoredFile(name string) bool {
-	if name == "session.db" || strings.HasPrefix(name, "session.db-") || strings.HasPrefix(name, "session.db.") {
+	if name == "session.db" || strings.HasPrefix(name, "session.db-") || strings.HasPrefix(name, "session.db.") ||
+		name == "cache.db" || strings.HasPrefix(name, "cache.db-") || strings.HasPrefix(name, "cache.db.") {
 		return true
 	}
 	return false
@@ -420,8 +421,8 @@ func SafeReadWorkspaceFile(workspaceRoot, relOrAbsPath string, maxBytes int64) (
 	}
 
 	cleanRel = filepath.ToSlash(relReal)
-	if isIgnoredFile(filepath.Base(cleanRel)) {
-		return "", "", fmt.Errorf("access denied: reading internal database %q is restricted", cleanRel)
+	if isIgnoredFile(filepath.Base(cleanRel)) || cleanRel == ".tether" || strings.HasPrefix(cleanRel, ".tether/") {
+		return "", "", fmt.Errorf("access denied: reading internal substrate path %q is restricted", cleanRel)
 	}
 
 	info, err := os.Stat(realTarget)

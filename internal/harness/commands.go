@@ -167,7 +167,7 @@ func init() {
 			Help: "clear conversation history (substrate memory kept)",
 			Handler: func(r *Runner, _ []string) bool {
 				r.history = nil
-				fmt.Fprintln(r.cfg.Out, "✓ Conversation history cleared (substrate memory in session.db retained).")
+				fmt.Fprintln(r.cfg.Out, "✓ Conversation history cleared (substrate memory in .tether/session.db retained).")
 				return false
 			},
 		},
@@ -191,7 +191,7 @@ func init() {
 			Handler: func(r *Runner, args []string) bool {
 				q := strings.TrimSpace(strings.Join(args, " "))
 				if q == "" {
-					fmt.Fprintln(r.cfg.Out, "Usage: /btw <question>  (side chat isolated from main history & session.db)")
+					fmt.Fprintln(r.cfg.Out, "Usage: /btw <question>  (side chat isolated from main history & .tether/session.db)")
 					return false
 				}
 				ans, err := r.RunSideChat(r.sideChatCtx(), q)

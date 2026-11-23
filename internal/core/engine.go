@@ -2,10 +2,11 @@ package core
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -14,9 +15,12 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// Engine is the core Tether engine managing sessions, guardrails, and project memory
+// Engine is the core Tether engine managing sessions, guardrails, and project memory.
 type Engine struct {
-	DB        *sql.DB
+	DB        *sql.DB // Write handle for .tether/session.db (kept for compatibility; equals writeDB)
+	writeDB   *sql.DB
+	readDB    *sql.DB
+	cacheDB   *sql.DB
 	Workspace string
 	SessionID string
 	Branch    string
@@ -24,7 +28,16 @@ type Engine struct {
 	mode      string // "code" | "plan" — backed by SQLite
 }
 
-// DetectGitBranch reads .git/HEAD directly with <0.1ms latency
+// WriteDB returns the serialized write connection pool for .tether/session.db.
+func (e *Engine) WriteDB() *sql.DB { return e.writeDB }
+
+// ReadDB returns the concurrent read-only (query_only=ON) pool for .tether/session.db.
+func (e *Engine) ReadDB() *sql.DB { return e.readDB }
+
+// CacheDB returns the connection handle for .tether/cache.db.
+func (e *Engine) CacheDB() *sql.DB { return e.cacheDB }
+
+// DetectGitBranch reads .git/HEAD directly with <0.1ms latency.
 func DetectGitBranch(workspace string) string {
 	headPath := filepath.Join(workspace, ".git", "HEAD")
 	data, err := os.ReadFile(headPath)
@@ -45,68 +58,175 @@ func DetectGitBranch(workspace string) string {
 // Bump this whenever the migrate() schema gains a table: migrate() exits early
 // when PRAGMA user_version >= SchemaVersion, so a new CREATE TABLE without a
 // bump is silently never executed on existing databases.
-const SchemaVersion = 4
+const SchemaVersion = 5
 
-// NewEngine creates a new engine for the given workspace with optimized SQLite connection
+func sqliteDSN(path string, readOnly bool) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = path
+	}
+	q := url.Values{}
+	q.Set("_busy_timeout", "5000")
+	q.Add("_pragma", "cache_size=-10000")
+	q.Add("_pragma", "temp_store=MEMORY")
+	q.Add("_pragma", "mmap_size=67108864")
+	if readOnly {
+		q.Set("mode", "ro")
+		q.Set("_query_only", "on")
+	} else {
+		q.Set("_journal_mode", "WAL")
+		q.Set("_synchronous", "NORMAL")
+		q.Set("_foreign_keys", "on")
+		q.Add("_pragma", "wal_autocheckpoint=1000")
+	}
+	return (&url.URL{
+		Scheme:   "file",
+		Path:     filepath.ToSlash(abs),
+		RawQuery: q.Encode(),
+	}).String()
+}
+
+// legacyCheckpointBusyTimeoutMs bounds how long legacy WAL checkpointing waits
+// for concurrent readers/writers; overridden only in unit tests.
+var legacyCheckpointBusyTimeoutMs = 5000
+
+// migrateLegacySessionDB atomically moves <root>/session.db to <root>/.tether/session.db
+// after checkpointing any pending WAL frames so no v0.2 state is lost.
+func migrateLegacySessionDB(workspace, sessionDBPath string) (migrated bool, err error) {
+	if _, statErr := os.Stat(sessionDBPath); statErr == nil {
+		return false, nil
+	} else if !os.IsNotExist(statErr) {
+		return false, statErr
+	}
+
+	legacyDBPath := filepath.Join(workspace, "session.db")
+	legacyInfo, err := os.Stat(legacyDBPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	_, walErr := os.Stat(legacyDBPath + "-wal")
+	hasWAL := walErr == nil
+
+	if legacyInfo.Size() > 0 || hasWAL {
+		u, parseErr := url.Parse(sqliteDSN(legacyDBPath, false))
+		if parseErr != nil {
+			return false, parseErr
+		}
+		q := u.Query()
+		q.Set("_busy_timeout", fmt.Sprintf("%d", legacyCheckpointBusyTimeoutMs))
+		u.RawQuery = q.Encode()
+
+		legacyDB, openErr := sql.Open("sqlite", u.String())
+		if openErr != nil {
+			return false, fmt.Errorf("open legacy session.db: %w", openErr)
+		}
+		var busy, logFrames, ckptFrames int
+		ckptErr := legacyDB.QueryRow("PRAGMA wal_checkpoint(TRUNCATE);").Scan(&busy, &logFrames, &ckptFrames)
+		closeErr := legacyDB.Close()
+		if ckptErr != nil {
+			return false, fmt.Errorf("checkpoint legacy session.db before migration: %w", ckptErr)
+		}
+		if busy != 0 {
+			return false, fmt.Errorf("checkpoint legacy session.db: database is busy (busy=%d, log=%d, checkpointed=%d); close active tether processes and retry", busy, logFrames, ckptFrames)
+		}
+		if closeErr != nil {
+			return false, fmt.Errorf("close legacy session.db: %w", closeErr)
+		}
+	}
+
+	if err := os.Rename(legacyDBPath, sessionDBPath); err != nil {
+		return false, fmt.Errorf("move legacy session.db to .tether/: %w", err)
+	}
+	_ = os.Remove(legacyDBPath + "-wal")
+	_ = os.Remove(legacyDBPath + "-shm")
+	return true, nil
+}
+
+// NewEngine creates a new engine for the given workspace with Dual-Pool WAL connections
+// for .tether/session.db and a dedicated .tether/cache.db handle.
 func NewEngine(workspace string) (*Engine, error) {
-	dbPath := filepath.Join(workspace, "session.db")
+	tetherDir := filepath.Join(workspace, ".tether")
+	if err := os.MkdirAll(tetherDir, 0755); err != nil {
+		return nil, fmt.Errorf("create .tether directory: %w", err)
+	}
+
+	sessionDBPath := filepath.Join(tetherDir, "session.db")
+	cacheDBPath := filepath.Join(tetherDir, "cache.db")
+
+	migratedLegacy, err := migrateLegacySessionDB(workspace, sessionDBPath)
+	if err != nil {
+		return nil, err
+	}
+
 	dbExisted := false
-	if fi, err := os.Stat(dbPath); err == nil && fi.Size() > 0 {
+	if fi, statErr := os.Stat(sessionDBPath); statErr == nil && fi.Size() > 0 {
 		dbExisted = true
 	}
 
-	db, err := sql.Open("sqlite", dbPath)
+	writeDB, err := sql.Open("sqlite", sqliteDSN(sessionDBPath, false))
 	if err != nil {
-		return nil, fmt.Errorf("open session.db: %w", err)
+		return nil, fmt.Errorf("open .tether/session.db write pool: %w", err)
 	}
+	// Serialize writes through a single connection to eliminate SQLITE_BUSY in-process.
+	writeDB.SetMaxOpenConns(1)
+	writeDB.SetMaxIdleConns(1)
 
-	// 1. Connection Pooling: single connection avoids SQLite lock contention
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-
-	// 2. High-Performance PRAGMAs:
-	// - WAL mode: concurrent readers + writer
-	// - synchronous=NORMAL: reduces disk fsync by ~95% in WAL mode, 100% crash-safe
-	// - busy_timeout=5000: wait up to 5s if locked by another process
-	// - cache_size=-10000: 10MB page cache in RAM
-	// - temp_store=MEMORY: temp tables/indices in RAM
-	// - mmap_size=67108864: 64MB memory-mapped I/O
-	// - wal_autocheckpoint=1000: keep WAL file compact
-	pragmas := `
-		PRAGMA journal_mode=WAL;
-		PRAGMA synchronous=NORMAL;
-		PRAGMA busy_timeout=5000;
-		PRAGMA cache_size=-10000;
-		PRAGMA temp_store=MEMORY;
-		PRAGMA mmap_size=67108864;
-		PRAGMA wal_autocheckpoint=1000;
-	`
-	if _, err := db.Exec(pragmas); err != nil {
-		_, _ = db.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
-	}
-
-	branch := DetectGitBranch(workspace)
 	e := &Engine{
-		DB:        db,
+		DB:        writeDB,
+		writeDB:   writeDB,
 		Workspace: workspace,
-		Branch:    branch,
+		Branch:    DetectGitBranch(workspace),
 		mode:      "code",
 	}
 
+	// Run schema migration on writeDB before opening the read-only pool so the
+	// database file and WAL sidecars always exist before readDB attaches.
 	if err := e.migrate(); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("migrate: %w", err)
+		writeDB.Close()
+		return nil, fmt.Errorf("migrate session.db: %w", err)
 	}
 
-	if !dbExisted {
+	readDB, err := sql.Open("sqlite", sqliteDSN(sessionDBPath, true))
+	if err != nil {
+		writeDB.Close()
+		return nil, fmt.Errorf("open .tether/session.db read pool: %w", err)
+	}
+	readDB.SetMaxOpenConns(8)
+	readDB.SetMaxIdleConns(4)
+	if err := readDB.Ping(); err != nil {
+		readDB.Close()
+		writeDB.Close()
+		return nil, fmt.Errorf("ping .tether/session.db read pool: %w", err)
+	}
+	e.readDB = readDB
+
+	cacheDB, err := sql.Open("sqlite", sqliteDSN(cacheDBPath, false))
+	if err != nil {
+		readDB.Close()
+		writeDB.Close()
+		return nil, fmt.Errorf("open .tether/cache.db: %w", err)
+	}
+	cacheDB.SetMaxOpenConns(1)
+	cacheDB.SetMaxIdleConns(1)
+	e.cacheDB = cacheDB
+
+	if err := e.migrateCache(); err != nil {
+		_ = e.Close()
+		return nil, fmt.Errorf("migrate cache.db: %w", err)
+	}
+
+	if !dbExisted || migratedLegacy {
 		if err := e.ensureGitignore(); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: could not update .gitignore: %v\n", err)
 		}
 	}
 
-	// Load or create active session
 	if err := e.loadOrCreateSession(); err != nil {
-		db.Close()
+		_ = e.Close()
 		return nil, fmt.Errorf("session: %w", err)
 	}
 
@@ -114,33 +234,57 @@ func NewEngine(workspace string) (*Engine, error) {
 }
 
 func (e *Engine) Close() error {
-	if e.DB != nil {
-		return e.DB.Close()
+	var errs []error
+	if e.readDB != nil {
+		if err := e.readDB.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		e.readDB = nil
 	}
-	return nil
+	if e.writeDB != nil {
+		_, _ = e.writeDB.Exec("PRAGMA optimize; PRAGMA wal_checkpoint(PASSIVE);")
+		if err := e.writeDB.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		e.writeDB = nil
+		e.DB = nil
+	}
+	if e.cacheDB != nil {
+		_, _ = e.cacheDB.Exec("PRAGMA optimize; PRAGMA wal_checkpoint(PASSIVE);")
+		if err := e.cacheDB.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		e.cacheDB = nil
+	}
+	return errors.Join(errs...)
 }
 
-// requiredTables lists every table migrate() is responsible for. The fast path
-// only trusts PRAGMA user_version when these all actually exist, so a database
-// whose version was bumped without its DDL running gets repaired instead of
-// silently staying broken.
+// requiredTables lists every table migrate() is responsible for in session.db.
+// The fast path only trusts PRAGMA user_version when these all actually exist,
+// so a database whose version was bumped without its DDL running gets repaired
+// instead of silently staying broken.
 var requiredTables = []string{
 	"sessions",
 	"session_context",
 	"decisions",
 	"learned_patterns",
 	"project_settings",
-	"kb_documents",
 	"todos",
-	"pending_proposals",
+	"approval_grants",
+	"conversation_threads",
+	"conversation_events",
+	"crew_sessions",
+	"mounted_files",
+	"mount_ignore_rules",
+	"api_keys_meta",
 }
 
-// missingTables returns the required tables absent from the database.
+// missingTables returns the required tables absent from session.db.
 func (e *Engine) missingTables() ([]string, error) {
 	var missing []string
 	for _, table := range requiredTables {
 		var name string
-		err := e.DB.QueryRow(
+		err := e.writeDB.QueryRow(
 			"SELECT name FROM sqlite_master WHERE type='table' AND name = ?", table).Scan(&name)
 		if err == sql.ErrNoRows {
 			missing = append(missing, table)
@@ -153,14 +297,11 @@ func (e *Engine) missingTables() ([]string, error) {
 	return missing, nil
 }
 
-// migrate creates all required tables (fast-paths if schema is already up-to-date)
+// migrate creates all required session.db tables and indexes (fast-paths if schema is up-to-date).
 func (e *Engine) migrate() error {
 	var currentVersion int
-	_ = e.DB.QueryRow("PRAGMA user_version;").Scan(&currentVersion)
+	_ = e.writeDB.QueryRow("PRAGMA user_version;").Scan(&currentVersion)
 	if currentVersion >= SchemaVersion {
-		// Fast path is only safe when the schema it claims to describe actually
-		// exists. A version bump without matching DDL (or a partially created
-		// database) must be repaired rather than trusted.
 		missing, err := e.missingTables()
 		if err == nil && len(missing) == 0 {
 			return nil
@@ -210,6 +351,127 @@ func (e *Engine) migrate() error {
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 
+	CREATE TABLE IF NOT EXISTS todos (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		session_id TEXT REFERENCES sessions(id),
+		git_branch TEXT DEFAULT 'default',
+		description TEXT,
+		details TEXT DEFAULT '',
+		status TEXT DEFAULT 'pending',
+		version INTEGER DEFAULT 1,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		completed_at DATETIME
+	);
+
+	CREATE TABLE IF NOT EXISTS approval_grants (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		session_id TEXT NOT NULL,
+		path_scope TEXT NOT NULL,
+		kind TEXT NOT NULL DEFAULT 'path',
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		expires_at DATETIME
+	);
+
+	CREATE TABLE IF NOT EXISTS conversation_threads (
+		id TEXT PRIMARY KEY,
+		workspace TEXT NOT NULL DEFAULT '',
+		git_branch TEXT NOT NULL DEFAULT 'default',
+		title TEXT NOT NULL DEFAULT '',
+		mode TEXT NOT NULL DEFAULT 'code',
+		pinned_key_id TEXT NOT NULL DEFAULT '',
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS conversation_events (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		thread_id TEXT NOT NULL REFERENCES conversation_threads(id),
+		crew_id TEXT NOT NULL DEFAULT '',
+		seq INTEGER NOT NULL,
+		role TEXT NOT NULL,
+		usage_id TEXT NOT NULL DEFAULT 'main',
+		payload_json TEXT NOT NULL DEFAULT '{}',
+		token_est INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS crew_sessions (
+		id TEXT PRIMARY KEY,
+		parent_thread_id TEXT NOT NULL DEFAULT '',
+		name TEXT NOT NULL DEFAULT '',
+		skill_name TEXT NOT NULL DEFAULT '',
+		purpose_category TEXT NOT NULL DEFAULT '',
+		status TEXT NOT NULL DEFAULT 'active',
+		lease_files_json TEXT NOT NULL DEFAULT '[]',
+		lease_expires_at DATETIME,
+		summary TEXT NOT NULL DEFAULT '',
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		closed_at DATETIME
+	);
+
+	CREATE TABLE IF NOT EXISTS mounted_files (
+		rel_path TEXT PRIMARY KEY,
+		access_mode TEXT NOT NULL DEFAULT 'guarded',
+		source TEXT NOT NULL DEFAULT 'rule',
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS mount_ignore_rules (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		pattern TEXT NOT NULL,
+		is_regex INTEGER NOT NULL DEFAULT 0,
+		is_builtin INTEGER NOT NULL DEFAULT 0,
+		enabled INTEGER NOT NULL DEFAULT 1,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS api_keys_meta (
+		key_id TEXT PRIMARY KEY,
+		provider TEXT NOT NULL DEFAULT '',
+		label TEXT NOT NULL DEFAULT '',
+		avg_ttft_ms INTEGER NOT NULL DEFAULT 0,
+		tool_error_rate REAL NOT NULL DEFAULT 0.0,
+		cache_hit_ratio REAL NOT NULL DEFAULT 0.0,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_conversation_events_thread_seq ON conversation_events(thread_id, seq);
+	CREATE INDEX IF NOT EXISTS idx_session_context_session_id ON session_context(session_id);
+	CREATE INDEX IF NOT EXISTS idx_todos_session_status ON todos(session_id, status);
+	CREATE INDEX IF NOT EXISTS idx_decisions_git_branch ON decisions(git_branch);
+	CREATE INDEX IF NOT EXISTS idx_approval_grants_session_expires ON approval_grants(session_id, expires_at);
+	`
+	if _, err := e.writeDB.Exec(schema); err != nil {
+		return err
+	}
+
+	// Non-breaking migrations for existing v1-v4 databases
+	_, _ = e.writeDB.Exec("ALTER TABLE sessions ADD COLUMN mode TEXT DEFAULT 'code';")
+	_, _ = e.writeDB.Exec("ALTER TABLE sessions ADD COLUMN git_branch TEXT DEFAULT 'default';")
+	_, _ = e.writeDB.Exec("ALTER TABLE decisions ADD COLUMN git_branch TEXT DEFAULT 'default';")
+	_, _ = e.writeDB.Exec("ALTER TABLE todos ADD COLUMN git_branch TEXT DEFAULT 'default';")
+	_, _ = e.writeDB.Exec("ALTER TABLE todos ADD COLUMN version INTEGER DEFAULT 1;")
+
+	// Drop legacy v4 tables/triggers removed in v5 (FTS cache moved to .tether/cache.db)
+	cleanup := `
+	DROP TABLE IF EXISTS pending_proposals;
+	DROP TRIGGER IF EXISTS kb_ai;
+	DROP TRIGGER IF EXISTS kb_ad;
+	DROP TRIGGER IF EXISTS kb_au;
+	DROP TABLE IF EXISTS kb_fts;
+	DROP TABLE IF EXISTS kb_documents;
+	`
+	if _, err := e.writeDB.Exec(cleanup); err != nil {
+		return err
+	}
+
+	_, _ = e.writeDB.Exec(fmt.Sprintf("PRAGMA user_version = %d;", SchemaVersion))
+	return nil
+}
+
+// migrateCache initializes .tether/cache.db tables, indexes, and FTS5 triggers.
+func (e *Engine) migrateCache() error {
+	schema := `
 	CREATE TABLE IF NOT EXISTS kb_documents (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		file_path TEXT,
@@ -219,6 +481,8 @@ func (e *Engine) migrate() error {
 		indexed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		UNIQUE(file_path, chunk_index)
 	);
+
+	CREATE INDEX IF NOT EXISTS idx_kb_documents_path ON kb_documents(file_path);
 
 	CREATE VIRTUAL TABLE IF NOT EXISTS kb_fts USING fts5(
 		content,
@@ -241,54 +505,18 @@ func (e *Engine) migrate() error {
 		INSERT INTO kb_fts(rowid, content, file_path) VALUES (new.id, new.content, new.file_path);
 	END;
 
-	CREATE TABLE IF NOT EXISTS todos (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		session_id TEXT REFERENCES sessions(id),
-		git_branch TEXT DEFAULT 'default',
-		description TEXT,
-		details TEXT DEFAULT '',
-		status TEXT DEFAULT 'pending',
-		version INTEGER DEFAULT 1,
-		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-		completed_at DATETIME
-	);
-
-	CREATE TABLE IF NOT EXISTS pending_proposals (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		session_id TEXT,
-		role TEXT DEFAULT '',
-		proposal TEXT DEFAULT '',
-		status TEXT DEFAULT 'pending',
-		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-		approved_at DATETIME,
-		comment TEXT DEFAULT ''
+	CREATE TABLE IF NOT EXISTS repomap_tags (
+		file_path TEXT PRIMARY KEY,
+		mtime_ns INTEGER NOT NULL DEFAULT 0,
+		lang TEXT NOT NULL DEFAULT '',
+		tags_json TEXT NOT NULL DEFAULT '[]'
 	);
 	`
-	if _, err := e.DB.Exec(schema); err != nil {
-		return err
-	}
-
-	// Non-breaking migrations for existing databases
-	_, _ = e.DB.Exec("ALTER TABLE sessions ADD COLUMN mode TEXT DEFAULT 'code';")
-	_, _ = e.DB.Exec("ALTER TABLE sessions ADD COLUMN git_branch TEXT DEFAULT 'default';")
-	_, _ = e.DB.Exec("ALTER TABLE decisions ADD COLUMN git_branch TEXT DEFAULT 'default';")
-	_, _ = e.DB.Exec("ALTER TABLE todos ADD COLUMN git_branch TEXT DEFAULT 'default';")
-	_, _ = e.DB.Exec("ALTER TABLE todos ADD COLUMN version INTEGER DEFAULT 1;")
-	_, _ = e.DB.Exec("ALTER TABLE pending_proposals ADD COLUMN expires_at DATETIME;")
-	_, _ = e.DB.Exec("ALTER TABLE pending_proposals ADD COLUMN comment TEXT DEFAULT '';")
-
-	// Approval grants back the "approve every change on this path" option.
-	if err := e.ensureApprovalGrants(); err != nil {
-		return err
-	}
-
-	// Record schema version to fast-path all subsequent runs
-	_, _ = e.DB.Exec(fmt.Sprintf("PRAGMA user_version = %d;", SchemaVersion))
-
-	return nil
+	_, err := e.cacheDB.Exec(schema)
+	return err
 }
 
-// ensureGitignore adds session.db to .gitignore
+// ensureGitignore adds .tether runtime artifacts to .gitignore.
 func (e *Engine) ensureGitignore() error {
 	gitignorePath := filepath.Join(e.Workspace, ".gitignore")
 
@@ -297,11 +525,31 @@ func (e *Engine) ensureGitignore() error {
 		return err
 	}
 
-	lines := strings.Split(string(content), "\n")
-	for _, line := range lines {
-		if strings.TrimSpace(line) == "session.db" {
-			return nil // already present
+	existing := make(map[string]bool)
+	for _, line := range strings.Split(string(content), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == ".tether/" || trimmed == ".tether" {
+			return nil
 		}
+		if trimmed != "" {
+			existing[trimmed] = true
+		}
+	}
+
+	required := []string{
+		".tether/session.db*",
+		".tether/cache.db*",
+		".tether/snapshots/",
+		".tether/PLAN.md",
+	}
+	var missing []string
+	for _, entry := range required {
+		if !existing[entry] {
+			missing = append(missing, entry)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
 	}
 
 	f, err := os.OpenFile(gitignorePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -311,25 +559,25 @@ func (e *Engine) ensureGitignore() error {
 	defer f.Close()
 
 	if len(content) > 0 && !strings.HasSuffix(string(content), "\n") {
-		f.WriteString("\n")
+		if _, err := f.WriteString("\n"); err != nil {
+			return err
+		}
 	}
-	_, err = f.WriteString("session.db\n")
+	_, err = f.WriteString(strings.Join(missing, "\n") + "\n")
 	return err
 }
 
-// loadOrCreateSession loads the last active session for this branch or creates a new one
+// loadOrCreateSession loads the last active session for this branch or creates a new one.
 func (e *Engine) loadOrCreateSession() error {
-	// Try to load active session for current branch
 	var id, mode string
-	err := e.DB.QueryRow(`
+	err := e.writeDB.QueryRow(`
 		SELECT id, COALESCE(mode, 'code') FROM sessions
 		WHERE status = 'active' AND git_branch = ?
 		ORDER BY updated_at DESC LIMIT 1
 	`, e.Branch).Scan(&id, &mode)
 
 	if err == sql.ErrNoRows {
-		// Fallback: check if there's any active session without branch or default
-		err = e.DB.QueryRow(`
+		err = e.writeDB.QueryRow(`
 			SELECT id, COALESCE(mode, 'code') FROM sessions
 			WHERE status = 'active'
 			ORDER BY updated_at DESC LIMIT 1
@@ -337,8 +585,7 @@ func (e *Engine) loadOrCreateSession() error {
 	}
 
 	if err == sql.ErrNoRows {
-		// Create new session: archive old sessions (>7 days without activity)
-		_, _ = e.DB.Exec(`
+		_, _ = e.writeDB.Exec(`
 			UPDATE sessions SET status = 'archived'
 			WHERE status = 'active'
 			AND updated_at < datetime('now', '-7 days')
@@ -346,7 +593,7 @@ func (e *Engine) loadOrCreateSession() error {
 
 		id = uuid.New().String()
 		mode = "code"
-		_, err = e.DB.Exec(`INSERT INTO sessions (id, status, mode, git_branch) VALUES (?, 'active', 'code', ?)`, id, e.Branch)
+		_, err = e.writeDB.Exec(`INSERT INTO sessions (id, status, mode, git_branch) VALUES (?, 'active', 'code', ?)`, id, e.Branch)
 		if err != nil {
 			return err
 		}
@@ -354,8 +601,7 @@ func (e *Engine) loadOrCreateSession() error {
 		e.mode = mode
 		e.adoptPreviousTODOs(id)
 
-		// Touch updated_at and update branch
-		_, _ = e.DB.Exec(`UPDATE sessions SET updated_at = CURRENT_TIMESTAMP, git_branch = ? WHERE id = ?`, e.Branch, id)
+		_, _ = e.writeDB.Exec(`UPDATE sessions SET updated_at = CURRENT_TIMESTAMP, git_branch = ? WHERE id = ?`, e.Branch, id)
 		return nil
 	} else if err != nil {
 		return err
@@ -364,23 +610,13 @@ func (e *Engine) loadOrCreateSession() error {
 	e.SessionID = id
 	e.mode = mode
 
-	// Touch updated_at and update branch
-	_, _ = e.DB.Exec(`UPDATE sessions SET updated_at = CURRENT_TIMESTAMP, git_branch = ? WHERE id = ?`, e.Branch, id)
-
+	_, _ = e.writeDB.Exec(`UPDATE sessions SET updated_at = CURRENT_TIMESTAMP, git_branch = ? WHERE id = ?`, e.Branch, id)
 	return nil
 }
 
 // adoptPreviousTODOs carries open work forward into a freshly created session.
-//
-// todo_list filters on session_id, so without this a new session starts empty
-// and unfinished tasks from the previous session become invisible. Users read
-// that as "nothing left to do", which is why the backlog silently rots.
-//
-// Only pending todos whose session belongs to the same git branch are adopted,
-// and the original row is marked superseded via the details field so history
-// stays intact instead of being rewritten.
 func (e *Engine) adoptPreviousTODOs(newSessionID string) {
-	rows, err := e.DB.Query(`
+	rows, err := e.readDB.Query(`
 		SELECT id, description, details FROM todos
 		WHERE status = 'pending'
 		  AND session_id <> ?
@@ -415,45 +651,44 @@ func (e *Engine) adoptPreviousTODOs(newSessionID string) {
 			details += "\n\n"
 		}
 		details += fmt.Sprintf("(carried over from todo #%d)", t.id)
-		if _, err := e.DB.Exec(`
+		if _, err := e.writeDB.Exec(`
 			INSERT INTO todos (session_id, git_branch, description, details, status)
 			VALUES (?, ?, ?, ?, 'pending')
 		`, newSessionID, e.Branch, t.description, details); err != nil {
 			continue
 		}
-		// Retire the original so the same task is not adopted twice.
-		_, _ = e.DB.Exec(`UPDATE todos SET status = 'carried' WHERE id = ?`, t.id)
+		_, _ = e.writeDB.Exec(`UPDATE todos SET status = 'carried' WHERE id = ?`, t.id)
 	}
 }
 
 // --- Session Operations ---
 
 func (e *Engine) CompleteSession() error {
-	_, err := e.DB.Exec(`UPDATE sessions SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE id = ?`, e.SessionID)
+	_, err := e.writeDB.Exec(`UPDATE sessions SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE id = ?`, e.SessionID)
 	return err
 }
 
 func (e *Engine) GetSessionSummary() (string, error) {
 	var summary string
-	err := e.DB.QueryRow(`SELECT COALESCE(summary, '') FROM sessions WHERE id = ?`, e.SessionID).Scan(&summary)
+	err := e.readDB.QueryRow(`SELECT COALESCE(summary, '') FROM sessions WHERE id = ?`, e.SessionID).Scan(&summary)
 	return summary, err
 }
 
 func (e *Engine) SetSessionSummary(summary string) error {
-	_, err := e.DB.Exec(`UPDATE sessions SET summary = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, summary, e.SessionID)
+	_, err := e.writeDB.Exec(`UPDATE sessions SET summary = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, summary, e.SessionID)
 	return err
 }
 
 // --- Context Operations ---
 
 func (e *Engine) AddContext(agent, role, content string) error {
-	_, err := e.DB.Exec(`INSERT INTO session_context (session_id, agent, role, content) VALUES (?, ?, ?, ?)`,
+	_, err := e.writeDB.Exec(`INSERT INTO session_context (session_id, agent, role, content) VALUES (?, ?, ?, ?)`,
 		e.SessionID, agent, role, content)
 	return err
 }
 
 func (e *Engine) GetRecentContext(limit int) ([]ContextEntry, error) {
-	rows, err := e.DB.Query(`
+	rows, err := e.readDB.Query(`
 		SELECT agent, role, content, created_at FROM session_context
 		WHERE session_id = ?
 		ORDER BY created_at DESC LIMIT ?
@@ -471,277 +706,16 @@ func (e *Engine) GetRecentContext(limit int) ([]ContextEntry, error) {
 		}
 		entries = append(entries, entry)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return entries, nil
-}
-
-// --- Subagent Proposal Approval ---
-
-// ProposalRecord describes a proposal a subagent returned to the Main Agent.
-type ProposalRecord struct {
-	ID         int64  `json:"id"`
-	SessionID  string `json:"session_id"`
-	Role       string `json:"role"`
-	Proposal   string `json:"proposal"`
-	Status     string `json:"status"`
-	CreatedAt  string `json:"created_at"`
-	ApprovedAt string `json:"approved_at,omitempty"`
-	// Comment carries the user's steering when a proposal is rejected. It is
-	// deliberately empty for approvals: a comment only exists to redirect work.
-	Comment string `json:"comment,omitempty"`
-}
-
-// Proposal statuses. A proposal is only ever gated while 'pending'; the two
-// rejection flavours stay readable so the agent can wait for direction instead
-// of guessing at a fix.
-const (
-	ProposalPending   = "pending"
-	ProposalApproved  = "approved"
-	ProposalRejected  = "rejected"  // user pushed back: revise using Comment
-	ProposalAbandoned = "abandoned" // user changed topic: do not resubmit
-)
-
-// RecordProposal persists a subagent proposal so the Main Agent cannot mutate
-// the codebase until the user approves it.
-func (e *Engine) RecordProposal(role, proposal string) (int64, error) {
-	// expires_at is the safety valve: an abandoned proposal must not lock the
-	// workspace forever. The operator can raise or lower it via the
-	// proposal_ttl_minutes setting.
-	ttl := e.proposalTTLMinutes()
-	res, err := e.DB.Exec(`
-		INSERT INTO pending_proposals (session_id, role, proposal, status, expires_at)
-		VALUES (?, ?, ?, 'pending', datetime('now', ?))`,
-		e.SessionID, role, proposal, fmt.Sprintf("+%d minutes", ttl))
-	if err != nil {
-		return 0, err
-	}
-	return res.LastInsertId()
-}
-
-// DefaultProposalTTLMinutes is how long an undecided proposal blocks writes.
-const DefaultProposalTTLMinutes = 120
-
-// proposalTTLMinutes resolves the proposal lifetime, defaulting when unset.
-func (e *Engine) proposalTTLMinutes() int {
-	if v, err := e.GetProjectSetting("proposal_ttl_minutes"); err == nil && v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return n
-		}
-	}
-	return DefaultProposalTTLMinutes
-}
-
-// ExpireStaleProposals retires proposals past their TTL and reports how many it
-// retired. It is called before every gate read so the block always reflects a
-// live decision.
-func (e *Engine) ExpireStaleProposals() (int64, error) {
-	res, err := e.DB.Exec(`
-		UPDATE pending_proposals SET status = 'expired'
-		WHERE status = 'pending' AND expires_at IS NOT NULL AND expires_at <= datetime('now')`)
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
-}
-
-// GetPendingProposal returns the oldest live proposal for this session, or nil
-// when none. Expired proposals are retired first, and rows written before
-// session scoping (or belonging to another session) never block this one.
-func (e *Engine) GetPendingProposal() (*ProposalRecord, error) {
-	_, _ = e.ExpireStaleProposals()
-	row := e.DB.QueryRow(`
-		SELECT id, session_id, role, proposal, status, created_at
-		FROM pending_proposals
-		WHERE status = 'pending'
-		  AND (session_id = '' OR session_id IS NULL OR session_id = ?)
-		ORDER BY id ASC LIMIT 1`, e.SessionID)
-	var p ProposalRecord
-	if err := row.Scan(&p.ID, &p.SessionID, &p.Role, &p.Proposal, &p.Status, &p.CreatedAt); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, err
-	}
-	return &p, nil
-}
-
-// ListProposals returns proposals in the given status ("" = all), newest last.
-func (e *Engine) ListProposals(status string) ([]ProposalRecord, error) {
-	// Keep the listing honest: retire anything past its TTL before reporting,
-	// otherwise an expired proposal keeps looking actionable.
-	if status == "pending" || status == "" {
-		_, _ = e.ExpireStaleProposals()
-	}
-	query := `SELECT id, session_id, role, proposal, status, created_at FROM pending_proposals`
-	var args []interface{}
-	if status != "" {
-		query += ` WHERE status = ?`
-		args = append(args, status)
-	}
-	query += ` ORDER BY id ASC`
-
-	rows, err := e.DB.Query(query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var out []ProposalRecord
-	for rows.Next() {
-		var p ProposalRecord
-		if err := rows.Scan(&p.ID, &p.SessionID, &p.Role, &p.Proposal, &p.Status, &p.CreatedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, p)
-	}
-	return out, rows.Err()
-}
-
-// GetProposalByID returns a single proposal, or nil when it does not exist.
-func (e *Engine) GetProposalByID(id int64) (*ProposalRecord, error) {
-	row := e.DB.QueryRow(`
-		SELECT id, session_id, role, proposal, status, created_at,
-		       COALESCE(approved_at, ''), COALESCE(comment, '')
-		FROM pending_proposals WHERE id = ?`, id)
-	var p ProposalRecord
-	if err := row.Scan(&p.ID, &p.SessionID, &p.Role, &p.Proposal, &p.Status, &p.CreatedAt,
-		&p.ApprovedAt, &p.Comment); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, err
-	}
-	return &p, nil
-}
-
-// ApproveProposalByID approves exactly one proposal, leaving others untouched.
-// The decision is recorded in the session context so the audit trail survives
-// the proposal row itself.
-func (e *Engine) ApproveProposalByID(id int64) (int64, error) {
-	return e.resolveProposalByID(id, ProposalApproved, "cli", "")
-}
-
-// resolveProposalByID applies a verdict to one proposal and journals it.
-// comment is the user's steering on a rejection; it is ignored on approval.
-func (e *Engine) resolveProposalByID(id int64, status, source, comment string) (int64, error) {
-	p, err := e.GetProposalByID(id)
-	if err != nil {
-		return 0, err
-	}
-	if p == nil || p.Status != "pending" {
-		return 0, nil
-	}
-
-	res, err := e.DB.Exec(`
-		UPDATE pending_proposals
-		SET status = ?, approved_at = CURRENT_TIMESTAMP, comment = ?
-		WHERE id = ? AND status = 'pending'`, status, comment, id)
-	if err != nil {
-		return 0, err
-	}
-	affected, err := res.RowsAffected()
-	if err != nil || affected == 0 {
-		return affected, err
-	}
-
-	summary := p.Proposal
-	if len(summary) > 200 {
-		summary = summary[:200] + "…"
-	}
-	entry := fmt.Sprintf("Proposal #%d from %s %s by %s: %s", p.ID, p.Role, status, source, summary)
-	if comment != "" {
-		entry += " | user said: " + comment
-	}
-	_ = e.AddContext("tether", "decision", entry)
-	return affected, nil
-}
-
-// RejectProposalByID rejects exactly one proposal, leaving others untouched.
-func (e *Engine) RejectProposalByID(id int64) (int64, error) {
-	return e.resolveProposalByID(id, ProposalRejected, "cli", "")
-}
-
-// RejectProposalWithComment rejects a proposal and records the user's steering.
-// The proposal stays visible to the agent as rejected but no longer opens the
-// write gate: the agent must wait for direction, not silently "fix" it.
-func (e *Engine) RejectProposalWithComment(id int64, comment string) (int64, error) {
-	return e.resolveProposalByID(id, ProposalRejected, "cli", strings.TrimSpace(comment))
-}
-
-// AbandonProposal closes a proposal because the user changed topic. Unlike a
-// rejection it is not offered back for revision; the work is dropped, not fixed.
-func (e *Engine) AbandonProposal(id int64) (int64, error) {
-	return e.resolveProposalByID(id, ProposalAbandoned, "cli", "")
-}
-
-// GetRejectionFeedback returns rejected proposals that still carry an
-// unresolved verdict, newest first. The agent reads this after a rejection
-// instead of auto-correcting: an empty Comment means "wait for the user".
-func (e *Engine) GetRejectionFeedback(limit int) ([]ProposalRecord, error) {
-	if limit <= 0 {
-		limit = 5
-	}
-	rows, err := e.DB.Query(`
-		SELECT id, session_id, role, proposal, status, created_at,
-		       COALESCE(approved_at, ''), COALESCE(comment, '')
-		FROM pending_proposals
-		WHERE status IN ('rejected', 'abandoned')
-		ORDER BY id DESC LIMIT ?`, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var out []ProposalRecord
-	for rows.Next() {
-		var p ProposalRecord
-		if err := rows.Scan(&p.ID, &p.SessionID, &p.Role, &p.Proposal,
-			&p.Status, &p.CreatedAt, &p.ApprovedAt, &p.Comment); err != nil {
-			return nil, err
-		}
-		out = append(out, p)
-	}
-	return out, rows.Err()
-}
-
-// ApproveProposal marks every pending proposal as approved by the user.
-func (e *Engine) ApproveProposal() (int64, error) {
-	res, err := e.DB.Exec(`
-		UPDATE pending_proposals
-		SET status = 'approved', approved_at = CURRENT_TIMESTAMP
-		WHERE status = 'pending'`)
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
-}
-
-// RejectProposal marks every pending proposal as rejected.
-func (e *Engine) RejectProposal() (int64, error) {
-	res, err := e.DB.Exec(`
-		UPDATE pending_proposals
-		SET status = 'rejected'
-		WHERE status = 'pending'`)
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
-}
-
-// ProposalGateBlocked reports whether a write must be refused because a
-// subagent proposal is still awaiting user approval. Mutation is gated in Code
-// mode and in Plan mode alike; only an explicit approval lifts it.
-func (e *Engine) ProposalGateBlocked() (bool, *ProposalRecord, error) {
-	p, err := e.GetPendingProposal()
-	if err != nil {
-		return false, nil, err
-	}
-	return p != nil, p, nil
 }
 
 // --- Project Settings ---
 
 func (e *Engine) SetProjectSetting(key, value string) error {
-	_, err := e.DB.Exec(`
+	_, err := e.writeDB.Exec(`
 		INSERT INTO project_settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
 	`, key, value)
@@ -750,7 +724,7 @@ func (e *Engine) SetProjectSetting(key, value string) error {
 
 func (e *Engine) GetProjectSetting(key string) (string, error) {
 	var value string
-	err := e.DB.QueryRow(`SELECT value FROM project_settings WHERE key = ?`, key).Scan(&value)
+	err := e.readDB.QueryRow(`SELECT value FROM project_settings WHERE key = ?`, key).Scan(&value)
 	if err == sql.ErrNoRows {
 		return "", nil
 	}
@@ -758,7 +732,7 @@ func (e *Engine) GetProjectSetting(key string) (string, error) {
 }
 
 func (e *Engine) GetAllProjectSettings() (map[string]string, error) {
-	rows, err := e.DB.Query(`SELECT key, value FROM project_settings`)
+	rows, err := e.readDB.Query(`SELECT key, value FROM project_settings`)
 	if err != nil {
 		return nil, err
 	}
@@ -772,19 +746,22 @@ func (e *Engine) GetAllProjectSettings() (map[string]string, error) {
 		}
 		settings[k] = v
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return settings, nil
 }
 
 // --- Decisions ---
 
 func (e *Engine) AddDecision(topic, decision, reason string) error {
-	_, err := e.DB.Exec(`INSERT INTO decisions (session_id, topic, decision, reason) VALUES (?, ?, ?, ?)`,
-		e.SessionID, topic, decision, reason)
+	_, err := e.writeDB.Exec(`INSERT INTO decisions (session_id, git_branch, topic, decision, reason) VALUES (?, ?, ?, ?, ?)`,
+		e.SessionID, e.Branch, topic, decision, reason)
 	return err
 }
 
 func (e *Engine) GetDecisions() ([]Decision, error) {
-	rows, err := e.DB.Query(`SELECT topic, decision, reason, created_at FROM decisions ORDER BY created_at DESC`)
+	rows, err := e.readDB.Query(`SELECT topic, decision, reason, created_at FROM decisions ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -798,19 +775,16 @@ func (e *Engine) GetDecisions() ([]Decision, error) {
 		}
 		decisions = append(decisions, d)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return decisions, nil
 }
 
 // InjectDecisions returns at most limit of the most recent decisions, newest
 // first, for prompt injection.
-//
-// Injection is a cache, not an archive: every decision injected here is re-sent
-// to the model on every turn of every session, so an unbounded query turns the
-// prompt into a monotonically growing transcript. The full history stays
-// reachable through GetDecisions and sql_query. rowid breaks created_at ties,
-// which happen whenever two decisions land in the same second.
 func (e *Engine) InjectDecisions(limit int) ([]Decision, error) {
-	rows, err := e.DB.Query(`
+	rows, err := e.readDB.Query(`
 		SELECT topic, decision, reason, created_at FROM decisions
 		ORDER BY created_at DESC, rowid DESC LIMIT ?
 	`, limit)
@@ -827,19 +801,22 @@ func (e *Engine) InjectDecisions(limit int) ([]Decision, error) {
 		}
 		decisions = append(decisions, d)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return decisions, nil
 }
 
 // --- Learned Patterns ---
 
 func (e *Engine) AddPattern(patternType, description string) error {
-	_, err := e.DB.Exec(`INSERT INTO learned_patterns (pattern_type, description) VALUES (?, ?)`,
+	_, err := e.writeDB.Exec(`INSERT INTO learned_patterns (pattern_type, description) VALUES (?, ?)`,
 		patternType, description)
 	return err
 }
 
 func (e *Engine) GetPatterns() ([]Pattern, error) {
-	rows, err := e.DB.Query(`SELECT pattern_type, description, created_at FROM learned_patterns ORDER BY created_at DESC`)
+	rows, err := e.readDB.Query(`SELECT pattern_type, description, created_at FROM learned_patterns ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -853,13 +830,16 @@ func (e *Engine) GetPatterns() ([]Pattern, error) {
 		}
 		patterns = append(patterns, p)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return patterns, nil
 }
 
 // InjectPatterns mirrors InjectDecisions: the prompt only carries the newest
 // few patterns, while the archive stays available in full through GetPatterns.
 func (e *Engine) InjectPatterns(limit int) ([]Pattern, error) {
-	rows, err := e.DB.Query(`
+	rows, err := e.readDB.Query(`
 		SELECT pattern_type, description, created_at FROM learned_patterns
 		ORDER BY created_at DESC, rowid DESC LIMIT ?
 	`, limit)
@@ -876,6 +856,9 @@ func (e *Engine) InjectPatterns(limit int) ([]Pattern, error) {
 		}
 		patterns = append(patterns, p)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return patterns, nil
 }
 
@@ -886,7 +869,7 @@ func (e *Engine) SetMode(mode string) error {
 	defer e.mu.Unlock()
 	e.mode = mode
 	if e.SessionID != "" {
-		_, err := e.DB.Exec(`UPDATE sessions SET mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, mode, e.SessionID)
+		_, err := e.writeDB.Exec(`UPDATE sessions SET mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, mode, e.SessionID)
 		return err
 	}
 	return nil
@@ -897,7 +880,7 @@ func (e *Engine) GetMode() string {
 	defer e.mu.RUnlock()
 	if e.SessionID != "" {
 		var mode string
-		err := e.DB.QueryRow(`SELECT COALESCE(mode, 'code') FROM sessions WHERE id = ?`, e.SessionID).Scan(&mode)
+		err := e.readDB.QueryRow(`SELECT COALESCE(mode, 'code') FROM sessions WHERE id = ?`, e.SessionID).Scan(&mode)
 		if err == nil && mode != "" {
 			return mode
 		}
@@ -951,75 +934,87 @@ type Pattern struct {
 	CreatedAt   time.Time
 }
 
-// --- Knowledge Base ---
+// --- Knowledge Base (.tether/cache.db) ---
 
-// IndexFile indexes a file into the knowledge base, splitting into chunks
-func (e *Engine) IndexFile(filePath string) error {
-	content, err := os.ReadFile(filePath)
-	if err != nil {
+func indexFileChunks(delStmt, insStmt *sql.Stmt, filePath, content string) error {
+	if _, err := delStmt.Exec(filePath); err != nil {
 		return err
 	}
 
-	// Remove old entries for this file
-	e.DB.Exec(`DELETE FROM kb_documents WHERE file_path = ?`, filePath)
-
-	// Split into chunks (~500 lines each for large files, or whole file if small)
-	lines := strings.Split(string(content), "\n")
-	chunkSize := 100 // lines per chunk
+	lines := strings.Split(content, "\n")
+	const chunkSize = 100
 	if len(lines) <= chunkSize {
-		// Small file - index as single chunk
-		_, err = e.DB.Exec(`INSERT INTO kb_documents (file_path, chunk_index, content) VALUES (?, 0, ?)`,
-			filePath, string(content))
+		_, err := insStmt.Exec(filePath, 0, content)
 		return err
 	}
 
-	// Large file - split into chunks
 	for i := 0; i < len(lines); i += chunkSize {
 		end := i + chunkSize
 		if end > len(lines) {
 			end = len(lines)
 		}
 		chunk := strings.Join(lines[i:end], "\n")
-		chunkIdx := i / chunkSize
-		_, err = e.DB.Exec(`INSERT INTO kb_documents (file_path, chunk_index, content) VALUES (?, ?, ?)`,
-			filePath, chunkIdx, chunk)
-		if err != nil {
+		if _, err := insStmt.Exec(filePath, i/chunkSize, chunk); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// IndexDirectory indexes all files in a directory recursively
+// IndexFile indexes a file into .tether/cache.db inside a single transaction with prepared statements.
+func (e *Engine) IndexFile(filePath string) error {
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return err
+	}
+
+	tx, err := e.cacheDB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	delStmt, err := tx.Prepare(`DELETE FROM kb_documents WHERE file_path = ?`)
+	if err != nil {
+		return err
+	}
+	defer delStmt.Close()
+
+	insStmt, err := tx.Prepare(`INSERT INTO kb_documents (file_path, chunk_index, content) VALUES (?, ?, ?)`)
+	if err != nil {
+		return err
+	}
+	defer insStmt.Close()
+
+	if err := indexFileChunks(delStmt, insStmt, filePath, string(content)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// IndexDirectory indexes matching files in a directory inside a single cache.db transaction.
 func (e *Engine) IndexDirectory(dirPath string, extensions []string) (int, error) {
-	count := 0
-	// Clean the root so ".", "./", and trailing slashes normalize consistently.
-	// Without this, walking "." yields a root whose Base() is "." and the
-	// hidden-dir skip below would SkipDir on the root itself, indexing nothing.
 	root := filepath.Clean(dirPath)
-	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+	var files []string
+	walkErr := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return nil // skip errors
+			return nil
 		}
 		if info.IsDir() {
-			// Never skip the root we were asked to index.
 			if path == root {
 				return nil
 			}
-			// Skip hidden dirs and common non-source dirs
 			base := filepath.Base(path)
 			if strings.HasPrefix(base, ".") || base == "node_modules" || base == "vendor" || base == "__pycache__" {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-
-		// Check extension filter
 		if len(extensions) > 0 {
 			ext := strings.TrimPrefix(filepath.Ext(path), ".")
 			matched := false
-			for _, e := range extensions {
-				if ext == e {
+			for _, want := range extensions {
+				if ext == want {
 					matched = true
 					break
 				}
@@ -1028,28 +1023,58 @@ func (e *Engine) IndexDirectory(dirPath string, extensions []string) (int, error
 				return nil
 			}
 		}
-
-		// Skip binary/large files
-		if info.Size() > 1024*1024 { // skip >1MB
+		if info.Size() > 1024*1024 {
 			return nil
 		}
-
-		if err := e.IndexFile(path); err != nil {
-			return nil // skip individual file errors
-		}
-		count++
+		files = append(files, path)
 		return nil
 	})
-	return count, err
+	if walkErr != nil {
+		return 0, walkErr
+	}
+
+	tx, err := e.cacheDB.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	delStmt, err := tx.Prepare(`DELETE FROM kb_documents WHERE file_path = ?`)
+	if err != nil {
+		return 0, err
+	}
+	defer delStmt.Close()
+
+	insStmt, err := tx.Prepare(`INSERT INTO kb_documents (file_path, chunk_index, content) VALUES (?, ?, ?)`)
+	if err != nil {
+		return 0, err
+	}
+	defer insStmt.Close()
+
+	count := 0
+	for _, path := range files {
+		content, readErr := os.ReadFile(path)
+		if readErr != nil {
+			continue
+		}
+		if err := indexFileChunks(delStmt, insStmt, path, string(content)); err != nil {
+			return 0, err
+		}
+		count++
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
-// SearchKB performs full-text search across indexed documents
+// SearchKB performs full-text search across indexed documents in .tether/cache.db.
 func (e *Engine) SearchKB(query string, limit int) ([]KBResult, error) {
 	if limit == 0 {
 		limit = 10
 	}
 
-	rows, err := e.DB.Query(`
+	rows, err := e.cacheDB.Query(`
 		SELECT d.file_path, d.chunk_index, snippet(kb_fts, 0, '>>>', '<<<', '...', 64) as snippet,
 			   rank
 		FROM kb_fts f
@@ -1071,14 +1096,21 @@ func (e *Engine) SearchKB(query string, limit int) ([]KBResult, error) {
 		}
 		results = append(results, r)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return results, nil
 }
 
-// KBStatus returns stats about indexed documents
+// KBStatus returns stats about indexed documents in .tether/cache.db.
 func (e *Engine) KBStatus() (KBStats, error) {
 	var stats KBStats
-	e.DB.QueryRow(`SELECT COUNT(*) FROM kb_documents`).Scan(&stats.TotalChunks)
-	e.DB.QueryRow(`SELECT COUNT(DISTINCT file_path) FROM kb_documents`).Scan(&stats.TotalFiles)
+	if err := e.cacheDB.QueryRow(`SELECT COUNT(*) FROM kb_documents`).Scan(&stats.TotalChunks); err != nil {
+		return stats, err
+	}
+	if err := e.cacheDB.QueryRow(`SELECT COUNT(DISTINCT file_path) FROM kb_documents`).Scan(&stats.TotalFiles); err != nil {
+		return stats, err
+	}
 	return stats, nil
 }
 
@@ -1097,8 +1129,8 @@ type KBStats struct {
 // --- Todo Tracking ---
 
 func (e *Engine) AddTodo(description, details string) (int64, error) {
-	result, err := e.DB.Exec(`INSERT INTO todos (session_id, description, details) VALUES (?, ?, ?)`,
-		e.SessionID, description, details)
+	result, err := e.writeDB.Exec(`INSERT INTO todos (session_id, git_branch, description, details) VALUES (?, ?, ?, ?)`,
+		e.SessionID, e.Branch, description, details)
 	if err != nil {
 		return 0, err
 	}
@@ -1112,7 +1144,7 @@ func (e *Engine) ListTodos(includeCompleted bool) ([]Todo, error) {
 	}
 	query += ` ORDER BY created_at ASC`
 
-	rows, err := e.DB.Query(query, e.SessionID)
+	rows, err := e.readDB.Query(query, e.SessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -1130,17 +1162,20 @@ func (e *Engine) ListTodos(includeCompleted bool) ([]Todo, error) {
 		}
 		todos = append(todos, t)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return todos, nil
 }
 
 func (e *Engine) CompleteTodo(id int) error {
-	_, err := e.DB.Exec(`UPDATE todos SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = ? AND session_id = ?`,
+	_, err := e.writeDB.Exec(`UPDATE todos SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = ? AND session_id = ?`,
 		id, e.SessionID)
 	return err
 }
 
 func (e *Engine) RemoveTodo(id int) error {
-	_, err := e.DB.Exec(`DELETE FROM todos WHERE id = ? AND session_id = ?`, id, e.SessionID)
+	_, err := e.writeDB.Exec(`DELETE FROM todos WHERE id = ? AND session_id = ?`, id, e.SessionID)
 	return err
 }
 
@@ -1153,9 +1188,9 @@ type Todo struct {
 	CompletedAt string
 }
 
-// ExecuteSQL executes a SQL query directly against session.db and returns JSON-friendly results.
-// SELECT, PRAGMA, EXPLAIN return []map[string]interface{}.
-// DML/DDL (INSERT, UPDATE, DELETE, etc.) return map[string]interface{} with rows_affected and last_insert_id.
+// ExecuteSQL executes a SQL query directly against .tether/session.db and returns JSON-friendly results.
+// SELECT, PRAGMA, EXPLAIN route to readDB and return []map[string]interface{}.
+// DML/DDL route to writeDB and return map[string]interface{} with rows_affected and last_insert_id.
 func (e *Engine) ExecuteSQL(query string) (interface{}, error) {
 	trimmed := strings.TrimSpace(query)
 	upper := strings.ToUpper(trimmed)
@@ -1170,7 +1205,7 @@ func (e *Engine) ExecuteSQL(query string) (interface{}, error) {
 	}
 
 	if strings.HasPrefix(upper, "SELECT") || strings.HasPrefix(upper, "PRAGMA") || strings.HasPrefix(upper, "EXPLAIN") {
-		rows, err := e.DB.Query(query)
+		rows, err := e.readDB.Query(query)
 		if err != nil {
 			return nil, err
 		}
@@ -1202,13 +1237,16 @@ func (e *Engine) ExecuteSQL(query string) (interface{}, error) {
 			}
 			results = append(results, rowMap)
 		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
 		if results == nil {
 			results = []map[string]interface{}{}
 		}
 		return results, nil
 	}
 
-	res, err := e.DB.Exec(query)
+	res, err := e.writeDB.Exec(query)
 	if err != nil {
 		return nil, err
 	}

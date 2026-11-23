@@ -102,7 +102,7 @@ func (r *Runner) SwitchMode(mode string) error {
 	return r.engine.SetMode(mode)
 }
 
-// ClearHistory clears the in-memory conversation buffer while retaining session.db memory.
+// ClearHistory clears the in-memory conversation buffer while retaining .tether/session.db memory.
 func (r *Runner) ClearHistory() {
 	r.history = nil
 }
@@ -219,7 +219,7 @@ func (r *Runner) expandAtMentions(prompt string) string {
 // RunSideChat executes an isolated `/btw <question>` turn (PRD §3.5).
 // It guarantees zero context pollution:
 //  1. It never reads or mutates r.history.
-//  2. It never records entries in session.db via r.engine.AddContext.
+//  2. It never records entries in .tether/session.db via r.engine.AddContext.
 //  3. It strips all mutative tools (only stateless Q&A is performed).
 func (r *Runner) RunSideChat(ctx context.Context, question string) (string, error) {
 	question = strings.TrimSpace(question)
@@ -290,28 +290,6 @@ func (r *Runner) ExecuteGatedCommand(ctx context.Context, cmdStr string) (string
 		},
 	})
 	if strings.HasPrefix(res, "DENIED BY TETHER GUARD:") {
-		return "", fmt.Errorf("%s", res)
-	}
-	return res, nil
-}
-
-// SpawnSubagentWithOutput spawns a specialist background subagent (tether_architect,
-// tether_qa, tether_frontend, tether_product) with context cancellation support.
-func (r *Runner) SpawnSubagentWithOutput(ctx context.Context, role, task string, out io.Writer) (string, error) {
-	role = strings.TrimSpace(role)
-	if role == "" {
-		role = "tether_architect"
-	}
-	// Work on a shallow copy so concurrent /spawn calls never share (or race on) cfg.Out.
-	view := *r
-	if out != nil {
-		view.cfg.Out = out
-	}
-	res := view.runSubagentWithCtx(ctx, map[string]interface{}{
-		"role": role,
-		"task": task,
-	})
-	if strings.HasPrefix(res, "subagent ") && strings.Contains(res, " error:") {
 		return "", fmt.Errorf("%s", res)
 	}
 	return res, nil

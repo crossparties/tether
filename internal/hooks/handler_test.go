@@ -213,11 +213,10 @@ func TestPreToolUse_AntigravityPayloadAndAutoApprove(t *testing.T) {
 	e := newTestEngine(t)
 	h := NewHandler(e)
 
-	// 1. In code mode, call_mcp_tool, invoke_subagent, and run_command must be allowed
+	// 1. In code mode, call_mcp_tool and run_command must be allowed
 	payloads := []string{
 		`{"toolCall":{"name":"call_mcp_tool","args":{"ServerName":"tether","ToolName":"session_load"}}}`,
 		`{"toolCall":{"name":"call_mcp_tool","args":{"ServerName":"tether","ToolName":"sql_query","Arguments":{"query":"SELECT 1"}}}}`,
-		`{"toolCall":{"name":"invoke_subagent","args":{"Subagents":[{"TypeName":"tether_architect","Role":"Architect","Prompt":"Build feature"}]}}}`,
 		`{"toolCall":{"name":"run_command","args":{"CommandLine":"go test ./... 2>&1"}}}`,
 		`{"toolCall":{"name":"replace_file_content","args":{"TargetFile":"main.go","ReplacementContent":"package main"}}}`,
 	}
@@ -271,263 +270,17 @@ func TestPreToolUse_AntigravityPayloadAndAutoApprove(t *testing.T) {
 	}
 }
 
-func TestPreToolUse_SubagentGovernanceProtocol(t *testing.T) {
-	e := newTestEngine(t)
-	h := NewHandler(e)
-
-	// 1. Establish main conversation ID via PreInvocation
-	mainPreInv := `{"conversationId":"conv-main-001","prompt":"let's build"}`
-	_, err := h.Handle("PreInvocation", strings.NewReader(mainPreInv))
-	if err != nil {
-		t.Fatalf("PreInvocation: %v", err)
-	}
-
-	// 2. Main agent in code mode is authorized for edits
-	mainEdit := `{"conversationId":"conv-main-001","toolCall":{"name":"replace_file_content","args":{"TargetFile":"main.go"}}}`
-	outStr, err := h.Handle("PreToolUse", strings.NewReader(mainEdit))
-	if err != nil {
-		t.Fatalf("Handle: %v", err)
-	}
-	var out HookOutput
-	_ = json.Unmarshal([]byte(outStr), &out)
-	if out.Decision != "allow" {
-		t.Errorf("expected main agent edit to be allowed, got: %s", out.Decision)
-	}
-
-	// 3. Subagent attempting file writes must be DENIED (orchestrator approval required)
-	subagentWrites := []string{
-		`{"conversationId":"conv-subagent-999","toolCall":{"name":"write_to_file","args":{"TargetFile":"secret.go"}}}`,
-		`{"conversationId":"conv-subagent-999","toolCall":{"name":"replace_file_content","args":{"TargetFile":"cmd/main.go"}}}`,
-		`{"agent_type":"tether_architect","toolCall":{"name":"write_file","args":{"TargetFile":"util.go"}}}`,
-		`{"is_subagent":true,"toolCall":{"name":"multi_replace_file_content","args":{"TargetFile":"handler.go"}}}`,
-	}
-
-	for _, sw := range subagentWrites {
-		outStr, err := h.Handle("PreToolUse", strings.NewReader(sw))
-		if err != nil {
-			t.Fatalf("Handle: %v", err)
-		}
-		_ = json.Unmarshal([]byte(outStr), &out)
-		if out.Decision != "deny" {
-			t.Errorf("expected subagent write to be denied, got: %s (payload: %s)", out.Decision, sw)
-		}
-		if !strings.Contains(out.Reason, "Subagents cannot mutate codebase directly") {
-			t.Errorf("expected reason to mention subagents cannot mutate directly, got: %s", out.Reason)
-		}
-	}
-
-	// 4. Subagent attempting mutative shell commands must be DENIED
-	subagentShellMutations := []string{
-		`{"conversationId":"conv-subagent-999","toolCall":{"name":"run_command","args":{"CommandLine":"rm -rf internal/core"}}}`,
-		`{"conversationId":"conv-subagent-999","toolCall":{"name":"run_command","args":{"CommandLine":"mkdir -p internal/newpkg"}}}`,
-		`{"agent_type":"tether_qa","toolCall":{"name":"run_command","args":{"CommandLine":"cat > main.go << 'EOF'\npackage main\nEOF"}}}`,
-	}
-
-	for _, sm := range subagentShellMutations {
-		outStr, err := h.Handle("PreToolUse", strings.NewReader(sm))
-		if err != nil {
-			t.Fatalf("Handle: %v", err)
-		}
-		_ = json.Unmarshal([]byte(outStr), &out)
-		if out.Decision != "deny" {
-			t.Errorf("expected subagent shell mutation to be denied, got: %s (payload: %s)", out.Decision, sm)
-		}
-	}
-
-	// 5. Subagent reading files and querying MCP must be ALLOWED
-	subagentSafeActions := []string{
-		`{"conversationId":"conv-subagent-999","toolCall":{"name":"view_file","args":{"AbsolutePath":"/repo/main.go"}}}`,
-		`{"conversationId":"conv-subagent-999","toolCall":{"name":"read_file","args":{"FilePath":"/repo/main.go"}}}`,
-		`{"conversationId":"conv-subagent-999","toolCall":{"name":"call_mcp_tool","args":{"ServerName":"tether","ToolName":"sql_query","Arguments":{"query":"SELECT * FROM sessions"}}}}`,
-		`{"conversationId":"conv-subagent-999","toolCall":{"name":"call_mcp_tool","args":{"ServerName":"tether","ToolName":"session_load"}}}`,
-		`{"conversationId":"conv-subagent-999","toolCall":{"name":"send_message","args":{"Recipient":"main","Message":"Proposed changes"}}}`,
-	}
-
-	for _, sa := range subagentSafeActions {
-		outStr, err := h.Handle("PreToolUse", strings.NewReader(sa))
-		if err != nil {
-			t.Fatalf("Handle: %v", err)
-		}
-		_ = json.Unmarshal([]byte(outStr), &out)
-		if out.Decision != "allow" {
-			t.Errorf("expected subagent safe action to be allowed, got: %s (payload: %s)", out.Decision, sa)
-		}
-	}
-}
-
-// A subagent must never be able to claim the main conversation identity.
-func TestPreInvocation_SubagentCannotHijackMainConversation(t *testing.T) {
-	e := newTestEngine(t)
-	h := NewHandler(e)
-
-	// The real Main Agent registers itself first.
-	if _, err := h.Handle("PreInvocation", strings.NewReader(`{"conversationId":"main-123"}`)); err != nil {
-		t.Fatalf("Handle: %v", err)
-	}
-	if got, _ := e.GetProjectSetting("main_conversation_id"); got != "main-123" {
-		t.Fatalf("main_conversation_id = %q, want main-123", got)
-	}
-
-	// A subagent run must be ignored.
-	if _, err := h.Handle("PreInvocation", strings.NewReader(`{"conversationId":"sub-999","is_subagent":true}`)); err != nil {
-		t.Fatalf("Handle: %v", err)
-	}
-	if got, _ := e.GetProjectSetting("main_conversation_id"); got != "main-123" {
-		t.Fatalf("subagent hijacked main_conversation_id: got %q, want main-123", got)
-	}
-}
-
-// The Main Agent must be blocked from writing while a subagent proposal awaits
-// user approval, and unblocked only after approve_proposal runs.
-func TestPreToolUse_ProposalApprovalGate(t *testing.T) {
-	e := newTestEngine(t)
-	h := NewHandler(e)
-
-	_ = e.SetMode("code")
-	if _, err := h.Handle("PreInvocation", strings.NewReader(`{"conversationId":"main-1"}`)); err != nil {
-		t.Fatalf("Handle: %v", err)
-	}
-
-	writeCall := `{"tool_name":"write_file","tool_call":{"name":"write_file","args":{"path":"internal/x.go","content":"package x"}}}`
-
-	// Without a pending proposal the write is allowed.
-	outStr, err := h.Handle("PreToolUse", strings.NewReader(writeCall))
-	if err != nil {
-		t.Fatalf("Handle PreToolUse: %v", err)
-	}
-	if !strings.Contains(outStr, `"allow"`) {
-		t.Fatalf("expected allow with no pending proposal, got %s", outStr)
-	}
-
-	// Once a subagent proposal is recorded, the write is denied.
-	id, err := e.RecordProposal("tether_qa", "propose adapter tests")
-	if err != nil {
-		t.Fatalf("RecordProposal: %v", err)
-	}
-	outStr, err = h.Handle("PreToolUse", strings.NewReader(writeCall))
-	if err != nil {
-		t.Fatalf("Handle PreToolUse: %v", err)
-	}
-	if !strings.Contains(outStr, `"deny"`) {
-		t.Fatalf("expected deny while proposal #%d pending, got %s", id, outStr)
-	}
-	if !strings.Contains(outStr, "awaiting user approval") {
-		t.Fatalf("deny reason should mention approval, got %s", outStr)
-	}
-
-	// Mutative shell commands are gated too.
-	cmdCall := `{"tool_name":"run_command","command":"rm -rf build","tool_call":{"name":"run_command","args":{"command":"rm -rf build"}}}`
-	outStr, err = h.Handle("PreToolUse", strings.NewReader(cmdCall))
-	if err != nil {
-		t.Fatalf("Handle PreToolUse: %v", err)
-	}
-	if !strings.Contains(outStr, `"deny"`) {
-		t.Fatalf("expected deny for mutative command while proposal pending, got %s", outStr)
-	}
-
-	// Read tools are never gated.
-	readCall := `{"tool_name":"read_file","tool_call":{"name":"read_file","args":{"path":"internal/x.go"}}}`
-	outStr, err = h.Handle("PreToolUse", strings.NewReader(readCall))
-	if err != nil {
-		t.Fatalf("Handle PreToolUse: %v", err)
-	}
-	if !strings.Contains(outStr, `"allow"`) {
-		t.Fatalf("expected read_file to stay allowed, got %s", outStr)
-	}
-
-	// After approval the write is allowed again.
-	if _, err := e.ApproveProposal(); err != nil {
-		t.Fatalf("ApproveProposal: %v", err)
-	}
-	outStr, err = h.Handle("PreToolUse", strings.NewReader(writeCall))
-	if err != nil {
-		t.Fatalf("Handle PreToolUse: %v", err)
-	}
-	if !strings.Contains(outStr, `"allow"`) {
-		t.Fatalf("expected allow after approval, got %s", outStr)
-	}
-}
-
-// The proposal gate must close every door that mutates the substrate, not just
-// file writes — otherwise a gated agent simply writes sideways.
-func TestPreToolUse_ProposalGateCoversAllMutations(t *testing.T) {
-	e := newTestEngine(t)
-	h := NewHandler(e)
-	_ = e.SetMode("code")
-	if _, err := h.Handle("PreInvocation", strings.NewReader(`{"conversationId":"main-1"}`)); err != nil {
-		t.Fatalf("Handle: %v", err)
-	}
-	if _, err := e.RecordProposal("tether_qa", "pending work"); err != nil {
-		t.Fatalf("RecordProposal: %v", err)
-	}
-
-	denied := []struct {
-		name string
-		body string
-	}{
-		{"write_file", `{"tool_name":"write_file","tool_call":{"name":"write_file","args":{"path":"a.go","content":"x"}}}`},
-		{"edit_file", `{"tool_name":"edit_file","tool_call":{"name":"edit_file","args":{"path":"a.go"}}}`},
-		{"session_save", `{"tool_name":"session_save","tool_call":{"name":"session_save","args":{"role":"user","content":"x"}}}`},
-		{"setting_set", `{"tool_name":"setting_set","tool_call":{"name":"setting_set","args":{"key":"k","value":"v"}}}`},
-		{"decision_add", `{"tool_name":"decision_add","tool_call":{"name":"decision_add","args":{"topic":"t"}}}`},
-		{"pattern_add", `{"tool_name":"pattern_add","tool_call":{"name":"pattern_add","args":{"type":"do"}}}`},
-		{"todo_add", `{"tool_name":"todo_add","tool_call":{"name":"todo_add","args":{"description":"x"}}}`},
-		{"sql_query insert", `{"tool_name":"sql_query","tool_call":{"name":"sql_query","args":{"query":"INSERT INTO todos (description) VALUES ('x')"}}}`},
-		{"sql_query update", `{"tool_name":"sql_query","tool_call":{"name":"sql_query","args":{"query":"update sessions set mode='plan'"}}}`},
-		{"sql_query delete", `{"tool_name":"sql_query","tool_call":{"name":"sql_query","args":{"query":"DELETE FROM todos"}}}`},
-		{"cmd tee", `{"tool_name":"run_command","command":"echo hi | tee out.txt","tool_call":{"name":"run_command","args":{"command":"echo hi | tee out.txt"}}}`},
-		{"cmd mkdir", `{"tool_name":"run_command","command":"mkdir newdir","tool_call":{"name":"run_command","args":{"command":"mkdir newdir"}}}`},
-		{"cmd cp", `{"tool_name":"run_command","command":"cp a b","tool_call":{"name":"run_command","args":{"command":"cp a b"}}}`},
-		{"cmd go generate", `{"tool_name":"run_command","command":"go generate ./...","tool_call":{"name":"run_command","args":{"command":"go generate ./..."}}}`},
-	}
-	for _, tc := range denied {
-		out, err := h.Handle("PreToolUse", strings.NewReader(tc.body))
-		if err != nil {
-			t.Fatalf("%s: Handle: %v", tc.name, err)
-		}
-		if !strings.Contains(out, `"deny"`) {
-			t.Errorf("%s should be denied while a proposal is pending, got %s", tc.name, out)
-		}
-	}
-
-	// Read-only work must keep flowing.
-	allowed := []struct {
-		name string
-		body string
-	}{
-		{"read_file", `{"tool_name":"read_file","tool_call":{"name":"read_file","args":{"path":"a.go"}}}`},
-		{"sql_query select", `{"tool_name":"sql_query","tool_call":{"name":"sql_query","args":{"query":"SELECT * FROM todos"}}}`},
-		{"session_load", `{"tool_name":"session_load","tool_call":{"name":"session_load","args":{}}}`},
-		{"todo_list", `{"tool_name":"todo_list","tool_call":{"name":"todo_list","args":{}}}`},
-	}
-	for _, tc := range allowed {
-		out, err := h.Handle("PreToolUse", strings.NewReader(tc.body))
-		if err != nil {
-			t.Fatalf("%s: Handle: %v", tc.name, err)
-		}
-		if !strings.Contains(out, `"allow"`) {
-			t.Errorf("%s should stay allowed, got %s", tc.name, out)
-		}
-	}
-}
-
 // The gate must read the command from a snake_case tool_call payload. When
 // Normalized() only looked at the camelCase field, command was always empty and
 // every command-based rule silently passed.
 func TestGateReadsSnakeCaseToolCall(t *testing.T) {
 	e := newTestEngine(t)
 	h := NewHandler(e)
-	_ = e.SetMode("code")
-	if _, err := h.Handle("PreInvocation", strings.NewReader(`{"conversationId":"main-1"}`)); err != nil {
-		t.Fatalf("Handle: %v", err)
-	}
-	if _, err := e.RecordProposal("tether_qa", "pending work"); err != nil {
-		t.Fatalf("RecordProposal: %v", err)
-	}
+	_ = e.SetMode("plan")
 
 	// Sanity: the payload really is snake_case.
 	var in HookInput
-	if err := json.Unmarshal([]byte(`{"tool_name":"run_command","tool_call":{"name":"run_command","args":{"command":"echo x | tee f.txt"}}}`), &in); err != nil {
+	if err := json.Unmarshal([]byte(`{"tool_name":"run_command","tool_call":{"name":"run_command","args":{"command":"echo x > f.txt"}}}`), &in); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	if _, cmd, _ := in.Normalized(); cmd == "" {
@@ -535,12 +288,12 @@ func TestGateReadsSnakeCaseToolCall(t *testing.T) {
 	}
 
 	out, err := h.Handle("PreToolUse", strings.NewReader(
-		`{"tool_name":"run_command","tool_call":{"name":"run_command","args":{"command":"echo x | tee f.txt"}}}`))
+		`{"tool_name":"run_command","tool_call":{"name":"run_command","args":{"command":"echo x > f.txt"}}}`))
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
 	if !strings.Contains(out, `"deny"`) {
-		t.Fatalf("tee should be denied while a proposal is pending, got %s", out)
+		t.Fatalf("mutative redirection should be denied in plan mode, got %s", out)
 	}
 
 	// Read-only commands stay allowed.
@@ -551,6 +304,27 @@ func TestGateReadsSnakeCaseToolCall(t *testing.T) {
 	}
 	if !strings.Contains(out, `"allow"`) {
 		t.Fatalf("ls should stay allowed, got %s", out)
+	}
+}
+
+func TestPreToolUse_BlocksDirectDatabaseShellAccess(t *testing.T) {
+	e := newTestEngine(t)
+	h := NewHandler(e)
+	_ = e.SetMode("code")
+
+	for _, cmd := range []string{
+		"sqlite3 .tether/session.db 'SELECT * FROM sessions'",
+		"python3 -c 'import sqlite3; sqlite3.connect(\".tether/cache.db\")'",
+		"cat session.db",
+	} {
+		payload := `{"tool_name":"run_command","tool_call":{"name":"run_command","args":{"command":` + mustQuoteTestStr(cmd) + `}}}`
+		out, err := h.Handle("PreToolUse", strings.NewReader(payload))
+		if err != nil {
+			t.Fatalf("Handle(%q): %v", cmd, err)
+		}
+		if !strings.Contains(out, `"deny"`) {
+			t.Errorf("expected direct db command %q to be denied, got %s", cmd, out)
+		}
 	}
 }
 
@@ -634,7 +408,7 @@ func TestIsWriteTool(t *testing.T) {
 	}
 }
 
-func TestPreToolUse_PlanAndProposalAllowSafeQuotedAndStderrCommands(t *testing.T) {
+func TestPreToolUse_PlanAllowsSafeQuotedAndStderrCommands(t *testing.T) {
 	e := newTestEngine(t)
 	h := NewHandler(e)
 	if err := e.SetMode("plan"); err != nil {
@@ -642,9 +416,6 @@ func TestPreToolUse_PlanAndProposalAllowSafeQuotedAndStderrCommands(t *testing.T
 	}
 	if _, err := h.Handle("PreInvocation", strings.NewReader(`{"conversationId":"main-1"}`)); err != nil {
 		t.Fatalf("PreInvocation: %v", err)
-	}
-	if _, err := e.RecordProposal("tether_qa", "pending check"); err != nil {
-		t.Fatalf("RecordProposal: %v", err)
 	}
 
 	safeCmds := []string{
@@ -659,7 +430,79 @@ func TestPreToolUse_PlanAndProposalAllowSafeQuotedAndStderrCommands(t *testing.T
 			t.Fatalf("Handle(%q): %v", cmd, err)
 		}
 		if !strings.Contains(out, `"allow"`) {
-			t.Errorf("expected read/validation command %q to be allowed in plan/pending state, got %s", cmd, out)
+			t.Errorf("expected read/validation command %q to be allowed in plan mode, got %s", cmd, out)
+		}
+	}
+}
+
+func TestPreToolUse_BlocksProtectedSubstrateWritesAndMutatingShellInCodeMode(t *testing.T) {
+	e := newTestEngine(t)
+	h := NewHandler(e)
+	if err := e.SetMode("code"); err != nil {
+		t.Fatalf("SetMode code: %v", err)
+	}
+
+	// Create symlink pointing into .tether/session.db to verify symlink resolution.
+	evilLink := filepath.Join(e.Workspace, "evil.db")
+	if err := os.Symlink(filepath.Join(e.Workspace, ".tether", "session.db"), evilLink); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	blockedWrites := []string{
+		".tether/session.db",
+		".tether/session.db-wal",
+		".tether/cache.db",
+		".tether/cache.db-shm",
+		"session.db",
+		"cache.db-wal",
+		".tether/snapshots/turn1/main.go",
+		"docs/../.tether/session.db",
+		filepath.Join(e.Workspace, ".tether", "session.db"),
+		evilLink,
+	}
+	for _, target := range blockedWrites {
+		payload := `{"tool_name":"write_file","tool_call":{"name":"write_file","args":{"path":` + mustQuoteTestStr(target) + `}}}`
+		out, err := h.Handle("PreToolUse", strings.NewReader(payload))
+		if err != nil {
+			t.Fatalf("Handle write %q: %v", target, err)
+		}
+		if !strings.Contains(out, `"deny"`) {
+			t.Errorf("expected write to protected substrate path %q to be denied in code mode, got %s", target, out)
+		}
+	}
+
+	// Non-DB .tether/PLAN.md must remain allowed in code mode.
+	planPayload := `{"tool_name":"write_file","tool_call":{"name":"write_file","args":{"path":".tether/PLAN.md"}}}`
+	if out, err := h.Handle("PreToolUse", strings.NewReader(planPayload)); err != nil || !strings.Contains(out, `"allow"`) {
+		t.Errorf("expected .tether/PLAN.md write to be allowed in code mode, got %s (err=%v)", out, err)
+	}
+
+	// Traversal into .tether/session.db via docs/../ must also be denied in plan mode.
+	if err := e.SetMode("plan"); err != nil {
+		t.Fatalf("SetMode plan: %v", err)
+	}
+	travPayload := `{"tool_name":"write_to_file","tool_call":{"name":"write_to_file","args":{"path":"docs/../.tether/session.db"}}}`
+	if out, err := h.Handle("PreToolUse", strings.NewReader(travPayload)); err != nil || !strings.Contains(out, `"deny"`) {
+		t.Errorf("expected docs/../.tether/session.db traversal to be denied in plan mode, got %s (err=%v)", out, err)
+	}
+	_ = e.SetMode("code")
+
+	for _, cmd := range []string{"rm -rf .tether", "mv .tether .tether.bak", "rm -rf .tether/snapshots"} {
+		payload := `{"tool_name":"run_command","tool_call":{"name":"run_command","args":{"command":` + mustQuoteTestStr(cmd) + `}}}`
+		out, err := h.Handle("PreToolUse", strings.NewReader(payload))
+		if err != nil {
+			t.Fatalf("Handle cmd %q: %v", cmd, err)
+		}
+		if !strings.Contains(out, `"deny"`) {
+			t.Errorf("expected mutating .tether command %q to be denied, got %s", cmd, out)
+		}
+	}
+
+	// Safe read-only inspections (even if substring '.tether' appears in '.tetherignore') stay allowed.
+	for _, cmd := range []string{"cat .tetherignore", "ls -la .tetherignore"} {
+		roPayload := `{"tool_name":"run_command","tool_call":{"name":"run_command","args":{"command":` + mustQuoteTestStr(cmd) + `}}}`
+		if out, err := h.Handle("PreToolUse", strings.NewReader(roPayload)); err != nil || !strings.Contains(out, `"allow"`) {
+			t.Errorf("expected read-only command %q to stay allowed, got %s (err=%v)", cmd, out, err)
 		}
 	}
 }

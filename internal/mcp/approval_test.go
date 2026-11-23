@@ -153,16 +153,16 @@ func TestRunCommandBlocked(t *testing.T) {
 	}
 }
 
-// TestSubstrateDatabaseIsExempt keeps session bookkeeping workable: the agent
-// must be able to save memory without a prompt.
-func TestSubstrateDatabaseIsExempt(t *testing.T) {
+// TestSubstrateDatabaseRequiresApproval ensures direct writes to substrate
+// databases are never silently exempt from the approval gate.
+func TestSubstrateDatabaseRequiresApproval(t *testing.T) {
 	s, _ := newApprovalTestServer(t)
 
-	// Writing the substrate db directly is allowed (its contents are managed by
-	// the session tools, but the gate must not block the path itself).
-	out := callWrite(t, s, "session.db", "x")
-	if strings.Contains(out, "APPROVAL REQUIRED") {
-		t.Fatalf("substrate db must be exempt from approval, got:\n%s", out)
+	for _, target := range []string{"session.db", ".tether/session.db", ".tether/cache.db"} {
+		out := callWrite(t, s, target, "x")
+		if !strings.Contains(out, "APPROVAL REQUIRED") {
+			t.Fatalf("substrate db write to %q must require approval, got:\n%s", target, out)
+		}
 	}
 }
 

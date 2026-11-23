@@ -64,7 +64,7 @@ func ClassifyRisk(toolName, target string) (RiskLevel, string) {
 	switch normTool {
 	case "read", "/read", "read_file", "view_file", "list", "list_dir", "list_files",
 		"glob", "grep", "search", "ripgrep", "session_load", "kb_search",
-		"kb_status", "todo_list", "status", "mode_get", "proposal_status":
+		"kb_status", "todo_list", "status", "mode_get":
 		return RiskLow, "Operasi baca/inspeksi aman (read-only)"
 
 	case "write", "write_file", "edit", "edit_file", "patch", "apply_diff",
@@ -127,13 +127,14 @@ func isSensitiveTarget(target string) bool {
 
 	if base == ".env" || strings.HasPrefix(base, ".env.") ||
 		base == "session.db" || strings.HasPrefix(base, "session.db-") ||
+		base == "cache.db" || strings.HasPrefix(base, "cache.db-") ||
 		base == "id_rsa" || base == "id_ed25519" || base == "id_dsa" || base == "id_ecdsa" ||
 		base == "credentials.json" || base == ".npmrc" || base == ".netrc" || base == ".pypirc" ||
 		strings.HasSuffix(base, ".pem") || strings.HasSuffix(base, ".key") ||
 		strings.HasSuffix(base, ".p12") || strings.HasSuffix(base, ".pfx") {
 		return true
 	}
-	if strings.Contains(lower, "session.db") ||
+	if strings.Contains(lower, "session.db") || strings.Contains(lower, "cache.db") ||
 		lower == ".git" || strings.HasPrefix(lower, ".git/") || strings.Contains(lower, "/.git/") || strings.HasSuffix(lower, "/.git") ||
 		lower == ".ssh" || strings.HasPrefix(lower, ".ssh/") || strings.Contains(lower, "/.ssh/") || strings.HasSuffix(lower, "/.ssh") ||
 		lower == ".tether" || strings.HasPrefix(lower, ".tether/") || strings.Contains(lower, "/.tether/") || strings.HasSuffix(lower, "/.tether") {
@@ -261,7 +262,7 @@ func IsNonCriticalTool(mode, toolName, target, command, workspaceRoot string) (b
 
 	case "read", "/read", "read_file", "view_file", "list", "list_dir", "list_files",
 		"glob", "grep", "search", "ripgrep", "session_load", "kb_search",
-		"kb_status", "todo_list", "status", "mode_get", "proposal_status":
+		"kb_status", "todo_list", "status", "mode_get":
 		if isSensitiveTarget(target) {
 			return false, ""
 		}
