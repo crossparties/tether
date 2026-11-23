@@ -223,6 +223,8 @@ func (r *Runner) ClearHistory() {
 	r.history = nil
 	r.frozenSystemPrompt = ""
 	r.frozenTools = nil
+	r.frozenExtTools = nil
+	r.syncHooksReadOnlyExternalToolsLocked()
 	r.baselineRepoMapFiles = nil
 	r.activeFileHashes = nil
 	r.lastPromptMode = ""

@@ -88,6 +88,9 @@ func ClassifyRisk(toolName, target string) (RiskLevel, string) {
 		return RiskHigh, "Eksekusi perintah shell memerlukan persetujuan (" + normTarget + ")"
 
 	default:
+		if strings.HasPrefix(normTool, "mcp_") {
+			return RiskHigh, "Eksekusi external MCP tool '" + toolName + "' memerlukan persetujuan"
+		}
 		if normTool == "" {
 			return RiskHigh, "Aksi tidak dikenal memerlukan persetujuan manual"
 		}

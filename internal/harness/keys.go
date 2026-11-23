@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/crossparties/tether/internal/core"
+	"github.com/crossparties/tether/internal/mcp"
 )
 
 const (
@@ -28,11 +29,7 @@ const (
 )
 
 func configDir() string {
-	if d := strings.TrimSpace(os.Getenv("TETHER_CONFIG_DIR")); d != "" {
-		return filepath.Clean(d)
-	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "tether")
+	return mcp.DefaultConfigDir()
 }
 
 func credentialsPath() string {
@@ -197,51 +194,21 @@ func loadSavedKey(provider string) string {
 	return sorted[0].APIKey
 }
 
-func readRawCredentialsMap(path string) map[string]json.RawMessage {
+func readRawCredentialsMap(path string) (map[string]json.RawMessage, error) {
 	raw := make(map[string]json.RawMessage)
-	if data, err := os.ReadFile(path); err == nil && len(strings.TrimSpace(string(data))) > 0 {
-		_ = json.Unmarshal(data, &raw)
-	}
-	return raw
-}
-
-func writeSecureJSON(path string, v any) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return err
-	}
-	_ = os.Chmod(dir, 0700)
-	out, err := json.MarshalIndent(v, "", "  ")
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, ".tmp-*")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(tmpPath)
+		if os.IsNotExist(err) {
+			return raw, nil
 		}
-	}()
-	if err := tmp.Chmod(0600); err != nil {
-		_ = tmp.Close()
-		return err
+		return nil, fmt.Errorf("read credentials.json: %w", err)
 	}
-	if _, err := tmp.Write(out); err != nil {
-		_ = tmp.Close()
-		return err
+	if len(strings.TrimSpace(string(data))) > 0 {
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return nil, fmt.Errorf("parse credentials.json: %w", err)
+		}
 	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		return err
-	}
-	cleanup = false
-	return nil
+	return raw, nil
 }
 
 // SaveProviderKeys persists a multi-key array for provider into credentials.json (0600).
@@ -251,7 +218,10 @@ func SaveProviderKeys(provider string, entries []ProviderKeyEntry) error {
 		return fmt.Errorf("provider name cannot be empty")
 	}
 	path := credentialsPath()
-	raw := readRawCredentialsMap(path)
+	raw, err := readRawCredentialsMap(path)
+	if err != nil {
+		return err
+	}
 
 	norm := make([]ProviderKeyEntry, 0, len(entries))
 	for i, e := range entries {
@@ -262,7 +232,7 @@ func SaveProviderKeys(provider string, entries []ProviderKeyEntry) error {
 		return err
 	}
 	raw[p] = encoded
-	return writeSecureJSON(path, raw)
+	return mcp.WriteSecureJSON(path, raw)
 }
 
 // SaveAPIKey persists the provider's API key to credentials.json (0600).
@@ -276,7 +246,10 @@ func SaveAPIKey(provider, key string) error {
 	}
 
 	path := credentialsPath()
-	raw := readRawCredentialsMap(path)
+	raw, err := readRawCredentialsMap(path)
+	if err != nil {
+		return err
+	}
 
 	if existing, ok := raw[p]; ok {
 		trimmed := strings.TrimSpace(string(existing))
@@ -311,7 +284,7 @@ func SaveAPIKey(provider, key string) error {
 		return err
 	}
 	raw[p] = encoded
-	return writeSecureJSON(path, raw)
+	return mcp.WriteSecureJSON(path, raw)
 }
 
 // KeyCandidate pairs a provider name with one configured ProviderKeyEntry.
@@ -560,7 +533,7 @@ func (p *KeyPool) saveHealthLocked() {
 	if !p.persistHealth {
 		return
 	}
-	_ = writeSecureJSON(keyHealthPath(), p.health)
+	_ = mcp.WriteSecureJSON(keyHealthPath(), p.health)
 }
 
 func negCapKey(keyID, model string) string {

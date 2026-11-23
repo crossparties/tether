@@ -16,11 +16,12 @@ import (
 
 // Handler processes lifecycle hook events from agents
 type Handler struct {
-	engine   *core.Engine
-	mount    *mount.Engine
-	snapshot *snapshot.Store
-	actorID  string
-	readOnly bool
+	engine      *core.Engine
+	mount       *mount.Engine
+	snapshot    *snapshot.Store
+	actorID     string
+	readOnly    bool
+	extReadOnly map[string]bool
 }
 
 func NewHandler(engine *core.Engine) *Handler {
@@ -53,6 +54,25 @@ func (h *Handler) SetReadOnly(ro bool) {
 	if h != nil {
 		h.readOnly = ro
 	}
+}
+
+// SetExternalReadOnlyTools installs the runner-verified set of read-only external
+// MCP tool names so alias-named Serena servers and truncated names behave consistently.
+func (h *Handler) SetExternalReadOnlyTools(tools map[string]bool) {
+	if h == nil {
+		return
+	}
+	if len(tools) == 0 {
+		h.extReadOnly = nil
+		return
+	}
+	cp := make(map[string]bool, len(tools))
+	for k, v := range tools {
+		if v {
+			cp[k] = true
+		}
+	}
+	h.extReadOnly = cp
 }
 
 func (h *Handler) mountEngine() *mount.Engine {
@@ -381,6 +401,9 @@ func (h *Handler) handlePreToolUse(input HookInput) HookOutput {
 	mode := h.activeMode()
 
 	if h.readOnly {
+		if strings.HasPrefix(toolName, "mcp_") && !h.isReadOnlyExternalHookTool(toolName) {
+			return HookOutput{Decision: "deny", Reason: fmt.Sprintf("Tether Guard: read-only crew cannot invoke external MCP tool %s.", toolName)}
+		}
 		if isWriteTool(toolName) || toolName == "mode_set" || toolName == "decision_add" {
 			return HookOutput{Decision: "deny", Reason: "Tether Guard: read-only crew cannot mutate files or governance state."}
 		}
@@ -390,6 +413,26 @@ func (h *Handler) handlePreToolUse(input HookInput) HookOutput {
 		if toolName == "run_command" || toolName == "bash" || toolName == "sh" || toolName == "shell" || toolName == "exec" {
 			if ok, _ := safety.IsReadOnlyCommand(command); !ok {
 				return HookOutput{Decision: "deny", Reason: "Tether Guard: read-only crew may only run strictly read-only commands."}
+			}
+		}
+	}
+
+	if strings.HasPrefix(toolName, "mcp_") {
+		readOnlyExt := h.isReadOnlyExternalHookTool(toolName)
+		op := mount.OpWrite
+		if readOnlyExt {
+			op = mount.OpRead
+		}
+		for _, p := range extractHookExternalPaths(input, filePath) {
+			d := h.mountEngine().AuthorizePath(p, op, mode)
+			if !d.Allowed && !(readOnlyExt && d.RelPath == ".") {
+				return HookOutput{Decision: "deny", Reason: d.Reason}
+			}
+		}
+		if mode == "plan" && !readOnlyExt {
+			return HookOutput{
+				Decision: "deny",
+				Reason:   fmt.Sprintf("Tether Guard: external MCP tool %s is blocked in PLAN mode.", toolName),
 			}
 		}
 	}
@@ -539,4 +582,58 @@ func isReadTool(name string) bool {
 		return true
 	}
 	return false
+}
+
+func (h *Handler) isReadOnlyExternalHookTool(name string) bool {
+	if !strings.HasPrefix(name, "mcp_") {
+		return false
+	}
+	if h != nil && h.extReadOnly != nil && h.extReadOnly[name] {
+		return true
+	}
+	srv, raw, ok := strings.Cut(strings.TrimPrefix(name, "mcp_"), "__")
+	if !ok || !strings.Contains(strings.ToLower(srv), "serena") {
+		return false
+	}
+	switch raw {
+	case "find_symbol", "find_referencing_symbols", "find_implementations", "get_symbols_overview", "get_diagnostics_for_file":
+		return true
+	}
+	return false
+}
+
+func extractHookExternalPaths(input HookInput, primary string) []string {
+	var out []string
+	if strings.TrimSpace(primary) != "" {
+		out = append(out, strings.TrimSpace(primary))
+	}
+	if tc := input.toolCallValue(); tc != nil && tc.Args != nil {
+		for _, k := range []string{"relative_path", "file_path", "file", "dir", "directory", "path", "target_file", "target_path", "paths"} {
+			val, ok := tc.Args[k]
+			if !ok {
+				continue
+			}
+			switch v := val.(type) {
+			case string:
+				if trimmed := strings.TrimSpace(v); trimmed != "" {
+					out = append(out, trimmed)
+				}
+			case []any:
+				for _, item := range v {
+					if s, ok := item.(string); ok {
+						if trimmed := strings.TrimSpace(s); trimmed != "" {
+							out = append(out, trimmed)
+						}
+					}
+				}
+			case []string:
+				for _, s := range v {
+					if trimmed := strings.TrimSpace(s); trimmed != "" {
+						out = append(out, trimmed)
+					}
+				}
+			}
+		}
+	}
+	return out
 }

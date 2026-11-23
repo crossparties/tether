@@ -1,11 +1,13 @@
 package harness
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	tetherctx "github.com/crossparties/tether/internal/context"
 	"github.com/crossparties/tether/internal/core"
@@ -168,24 +170,75 @@ func (r *Runner) buildFrozenTier0to3Head() (string, map[string]bool) {
 // ensureFrozenHead returns the session's immutable system prompt and frozen tool schema.
 func (r *Runner) ensureFrozenHead() (string, []openAITool) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	if r.frozenSystemPrompt == "" {
 		head, cov := r.buildFrozenTier0to3Head()
 		r.frozenSystemPrompt = head
 		r.baselineRepoMapFiles = cov
 	}
+	needTools := len(r.frozenTools) == 0
+	extMgr := r.extMCP
+	depth := r.depth
+	sameProv := r.sameProviderCrew
+	roCrew := r.readOnlyCrew
+	r.mu.Unlock()
+
+	var extTools []mcp.ExternalTool
+	if needTools && extMgr != nil && (depth == 0 || sameProv || roCrew) {
+		connCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		extTools, _ = extMgr.ListEnabledTools(connCtx)
+		cancel()
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if len(r.frozenTools) == 0 {
-		r.frozenTools = r.buildSessionToolsLocked()
+		tools, extMap := r.buildSessionToolsLocked(extTools)
+		r.frozenTools = tools
+		r.frozenExtTools = extMap
+		r.syncHooksReadOnlyExternalToolsLocked()
 	}
 	toolsCopy := make([]openAITool, len(r.frozenTools))
 	copy(toolsCopy, r.frozenTools)
 	return r.frozenSystemPrompt, toolsCopy
 }
 
-func (r *Runner) buildSessionToolsLocked() []openAITool {
+func (r *Runner) syncHooksReadOnlyExternalToolsLocked() {
+	if r.hooks == nil {
+		return
+	}
+	if len(r.frozenExtTools) == 0 {
+		r.hooks.SetExternalReadOnlyTools(nil)
+		return
+	}
+	ro := make(map[string]bool)
+	for name, t := range r.frozenExtTools {
+		if t.ReadOnly {
+			ro[name] = true
+		}
+	}
+	r.hooks.SetExternalReadOnlyTools(ro)
+}
+
+func (r *Runner) buildSessionToolsLocked(extTools []mcp.ExternalTool) ([]openAITool, map[string]mcp.ExternalTool) {
 	mcpTools := r.mcp.ListTools()
 	var selected []openAITool
+	var extMap map[string]mcp.ExternalTool
+
+	addExt := func(onlyReadOnly bool) {
+		if len(extTools) == 0 {
+			return
+		}
+		for _, et := range extTools {
+			if onlyReadOnly && !et.ReadOnly {
+				continue
+			}
+			if extMap == nil {
+				extMap = make(map[string]mcp.ExternalTool)
+			}
+			extMap[et.Name] = et
+			selected = append(selected, externalToOpenAITool(et))
+		}
+	}
 
 	switch {
 	case r.readOnlyCrew:
@@ -195,6 +248,7 @@ func (r *Runner) buildSessionToolsLocked() []openAITool {
 				selected = append(selected, toOpenAITool(t))
 			}
 		}
+		addExt(true)
 	case r.depth >= 1 && !r.sameProviderCrew:
 		// Mode 2 (Different-Provider Crew): focused core toolset without crew_* or mode/todo bloat.
 		allowed := map[string]bool{
@@ -208,13 +262,29 @@ func (r *Runner) buildSessionToolsLocked() []openAITool {
 			}
 		}
 	default:
-		// Main (depth == 0) AND Same-Provider Crew (depth >= 1): identical 10 core + 3 crew schema!
+		// Main (depth == 0) AND Same-Provider Crew (depth >= 1): identical 10 core + 3 crew + frozen external MCP schema!
 		for _, t := range mcpTools {
 			selected = append(selected, toOpenAITool(t))
 		}
 		selected = append(selected, crewToolsSchema()...)
+		addExt(false)
 	}
-	return selected
+	return selected, extMap
+}
+
+func externalToOpenAITool(t mcp.ExternalTool) openAITool {
+	params := any(t.InputSchema)
+	if len(t.InputSchema) == 0 {
+		params = mcp.InputSchema{Type: "object", Properties: map[string]mcp.Property{}}
+	}
+	return openAITool{
+		Type: "function",
+		Function: openAIFunction{
+			Name:        t.Name,
+			Description: t.Description,
+			Parameters:  params,
+		},
+	}
 }
 
 func toOpenAITool(t mcp.Tool) openAITool {

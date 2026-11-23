@@ -36,7 +36,7 @@ func main() {
 	case "init":
 		cmdInit()
 	case "mcp":
-		cmdMCP()
+		cmdMCP(os.Args[2:])
 	case "hook":
 		cmdHook()
 	case "mode":
@@ -103,27 +103,6 @@ func cmdInit() {
 		v := settings[k]
 		_ = engine.SetProjectSetting(k, v)
 		fmt.Printf("  %s detected %s: %s\n", ui.Dim("→"), ui.Bold(k), v)
-	}
-}
-
-// cmdMCP starts the MCP server (stdio transport)
-func cmdMCP() {
-	workspace, err := core.DetectWorkspace(".")
-	if err != nil {
-		fatalf("%v", err)
-		os.Exit(1)
-	}
-
-	engine, err := core.NewEngine(workspace)
-	if err != nil {
-		fatalf("%v", err)
-		os.Exit(1)
-	}
-	defer engine.Close()
-
-	server := mcp.NewServer(engine)
-	if err := server.Serve(); err != nil {
-		fatalf("mcp server: %v", err)
 	}
 }
 
@@ -586,6 +565,34 @@ func runDoctor(workspace string, fix bool, out io.Writer) (passed, warnings, fai
 		fmt.Fprintln(out, doctorLine(ui.Dim("-"), "Claude Code:", ui.Dim("Not installed / config not found")))
 	}
 
+	mcpReg := mcp.NewClientRegistry(workspace)
+	if fix {
+		if fixed, rerr := mcpReg.RepairRawSecretLeaks(); rerr == nil && fixed > 0 {
+			fmt.Fprintln(out, doctorLine(ui.Success("✔"), "External MCP Secrets:", fmt.Sprintf("migrated %d inline secret(s) to 0600 credentials.json", fixed)))
+		}
+	}
+	extServers, extErr := mcpReg.ListServers()
+	if extErr != nil {
+		fmt.Fprintln(out, doctorLine(ui.Error("✖"), "External MCP:", extErr.Error()))
+		failed++
+	} else if len(extServers) == 0 {
+		fmt.Fprintln(out, doctorLine(ui.Dim("-"), "External MCP:", ui.Dim("none configured")))
+	} else {
+		enabledCnt := 0
+		for _, s := range extServers {
+			if s.Enabled {
+				enabledCnt++
+			}
+		}
+		if leaks, lerr := mcpReg.InspectRawSecretLeaks(); lerr == nil && len(leaks) > 0 {
+			fmt.Fprintln(out, doctorLine(ui.Warn("▲"), "External MCP:", fmt.Sprintf("%d configured (%d enabled) — raw secret(s) in mcp.json (%s); run 'tether doctor --fix'", len(extServers), enabledCnt, strings.Join(leaks, ", "))))
+			warnings++
+		} else {
+			fmt.Fprintln(out, doctorLine(ui.Success("✔"), "External MCP:", fmt.Sprintf("%d configured (%d enabled, %d draft)", len(extServers), enabledCnt, len(extServers)-enabledCnt)))
+			passed++
+		}
+	}
+
 	// 4. Protocol & Binary
 	fmt.Fprintln(out, "\n"+ui.Title("[4/4] Binary & Runtime Health"))
 	selfPath, err := os.Executable()
@@ -715,7 +722,7 @@ func cmdRun(args []string) {
 	}
 
 	runner := harness.NewRunner(engine, cfg)
-	defer runner.CloseAllCrews()
+	defer func() { _ = runner.Close() }()
 	prompt := strings.TrimSpace(strings.Join(promptParts, " "))
 	if prompt == "" {
 		if useTUI || (ui.IsTerminal(os.Stdin) && ui.IsTerminalFile(os.Stdout) && os.Getenv("TETHER_LEGACY_REPL") != "1") {
@@ -890,7 +897,8 @@ Usage:
   tether status            Display real-time substrate dashboard & guardrail state
   tether mode [code|plan]  Inspect or switch active governance mode
   tether doctor [--fix]    Verify database, WAL, .tether/ignore, and credentials (read-only unless --fix)
-  tether mcp               Start MCP server (stdio transport)
+  tether mcp <subcommand>  Manage external MCP servers (add|import|list|test|enable|disable|remove|tools)
+  tether mcp serve         Start MCP server over stdio [Deferred / Legacy Bridge]
   tether hook <event>      Handle lifecycle hook event (PreInvocation|PreToolUse|PostToolUse)
   tether install [agent]   Wire tether into agent config (agy|claude|codex|cursor|windsurf|cline|roo|opencode|all)
   tether version           Show version

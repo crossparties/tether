@@ -50,6 +50,7 @@ type Config struct {
 	WarmCacheInterval time.Duration
 	WarmCacheMaxPings int
 	WarmCacheIdleMax  time.Duration
+	ExternalMCP       *mcp.ClientManager
 }
 
 type callSnapshot struct {
@@ -211,12 +212,14 @@ type Runner struct {
 	// Immutable Tier 0-3 session head & frozen tool schema (KV-cache head).
 	frozenSystemPrompt   string
 	frozenTools          []openAITool
+	frozenExtTools       map[string]mcp.ExternalTool
 	baselineRepoMapFiles map[string]bool
 	activeFileHashes     map[string]string
 	lastPromptMode       string
 	lastTodoDigest       string
 	pendingTailNotices   []string
 
+	extMCP       *mcp.ClientManager
 	keyPool      *KeyPool
 	pinnedKeyID  string
 	usageTracker *UsageTracker
@@ -269,6 +272,12 @@ func NewRunner(engine *core.Engine, cfg Config) *Runner {
 		activeFileHashes: make(map[string]string),
 		crews:            make(map[string]*crewHandle),
 		lastUserActivity: time.Now(),
+	}
+
+	if cfg.ExternalMCP != nil {
+		r.extMCP = cfg.ExternalMCP
+	} else if engine != nil && engine.Workspace != "" {
+		r.extMCP = mcp.NewClientManager(engine.Workspace)
 	}
 
 	if explicit && os.Getenv("TETHER_CONFIG_DIR") == "" {
@@ -334,6 +343,37 @@ func (r *Runner) SetKeyPool(pool *KeyPool) {
 			r.applyKeyCandidate(cand, true)
 		}
 	}
+}
+
+// SetExternalMCP replaces the optional external MCP client manager.
+// Already-frozen session tools remain immutable to preserve KV-cache stability.
+func (r *Runner) SetExternalMCP(mgr *mcp.ClientManager) {
+	r.mu.Lock()
+	r.extMCP = mgr
+	r.mu.Unlock()
+}
+
+// ExternalMCP returns the Runner's external MCP client manager.
+func (r *Runner) ExternalMCP() *mcp.ClientManager {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.extMCP
+}
+
+// Close releases active Crew leases and shuts down external MCP connections cleanly.
+func (r *Runner) Close() error {
+	if r == nil {
+		return nil
+	}
+	r.CloseAllCrews()
+	r.mu.RLock()
+	depth := r.depth
+	mgr := r.extMCP
+	r.mu.RUnlock()
+	if depth == 0 && mgr != nil {
+		return mgr.Close()
+	}
+	return nil
 }
 
 // KeyPool returns the active KeyPool attached to the runner.
@@ -608,9 +648,9 @@ type openAITool struct {
 }
 
 type openAIFunction struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description"`
-	Parameters  mcp.InputSchema `json:"parameters"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Parameters  any    `json:"parameters"`
 }
 
 // undo restores the files captured during a turn. When turn is empty the most
@@ -1037,7 +1077,7 @@ func (r *Runner) executeGuardedToolStatusWithCtx(ctx context.Context, tc toolCal
 	r.mu.RLock()
 	roCrew := r.readOnlyCrew
 	r.mu.RUnlock()
-	if roCrew && isMutatingRunnerTool(tc.Function.Name, argMap) {
+	if roCrew && r.isMutatingRunnerToolForRunner(tc.Function.Name, argMap) {
 		return fmt.Sprintf("DENIED BY TETHER GUARD: read-only crew cannot invoke %s", tc.Function.Name), true
 	}
 
@@ -1071,6 +1111,22 @@ func (r *Runner) executeGuardedToolStatusWithCtx(ctx context.Context, tc toolCal
 		return "DENIED BY TETHER GUARD: " + preOut.Reason, true
 	}
 
+	if strings.HasPrefix(tc.Function.Name, "mcp_") {
+		extTool, extMgr, ok := r.resolveFrozenExternalTool(tc.Function.Name)
+		if !ok || extMgr == nil {
+			return fmt.Sprintf("unknown or disabled external MCP tool: %s", tc.Function.Name), true
+		}
+		readOnlySemantic := extTool.ReadOnly
+		if allowed, authErr := r.mcp.AuthorizeExternalTool(tc.Function.Name, extTool.ServerName, extTool.OriginalName, readOnlySemantic, json.RawMessage(rawArgs)); !allowed {
+			r.writef(out, "🛑 [Tether Guard Blocked %s (%s)] %s\n", tc.Function.Name, agentType, authErr)
+			return authErr, true
+		}
+		r.printToolAction(out, tc.Function.Name, argMap)
+		res, isErr := extMgr.CallTool(ctx, tc.Function.Name, argMap)
+		_, _ = r.hooks.Handle("PostToolUse", mustJSONReader(hookIn))
+		return res, isErr
+	}
+
 	r.printToolAction(out, tc.Function.Name, argMap)
 	res, isErr := r.mcp.CallTool(tc.Function.Name, json.RawMessage(tc.Function.Arguments))
 	if tc.Function.Name == "edit_file" || tc.Function.Name == "write_file" {
@@ -1084,6 +1140,40 @@ func (r *Runner) executeGuardedToolStatusWithCtx(ctx context.Context, tc toolCal
 	// PostToolUse Auditor
 	_, _ = r.hooks.Handle("PostToolUse", mustJSONReader(hookIn))
 	return res, isErr
+}
+
+func (r *Runner) resolveFrozenExternalTool(name string) (mcp.ExternalTool, *mcp.ClientManager, bool) {
+	r.mu.RLock()
+	mgr := r.extMCP
+	hasFrozen := len(r.frozenTools) > 0
+	extTool, ok := r.frozenExtTools[name]
+	r.mu.RUnlock()
+	if ok && mgr != nil {
+		return extTool, mgr, true
+	}
+	if !hasFrozen && mgr != nil {
+		if t, found := mgr.LookupTool(name); found {
+			return t, mgr, true
+		}
+	}
+	return mcp.ExternalTool{}, nil, false
+}
+
+func (r *Runner) isReadOnlyExternalTool(name string) bool {
+	if !strings.HasPrefix(name, "mcp_") {
+		return false
+	}
+	if extTool, _, ok := r.resolveFrozenExternalTool(name); ok {
+		return extTool.ReadOnly
+	}
+	return false
+}
+
+func (r *Runner) isMutatingRunnerToolForRunner(name string, args map[string]any) bool {
+	if strings.HasPrefix(name, "mcp_") {
+		return !r.isReadOnlyExternalTool(name)
+	}
+	return isMutatingRunnerTool(name, args)
 }
 
 func isMutatingRunnerTool(name string, args map[string]any) bool {

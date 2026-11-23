@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -157,6 +158,14 @@ func (r *Runner) CreateCrew(ctx context.Context, req CrewCreateRequest) (CrewCre
 	mainPinned := r.pinnedKeyID
 	mainClient := r.client
 	mainBaselineCov := r.baselineRepoMapFiles
+	mainExtMCP := r.extMCP
+	var mainExtMap map[string]mcp.ExternalTool
+	if len(r.frozenExtTools) > 0 {
+		mainExtMap = make(map[string]mcp.ExternalTool, len(r.frozenExtTools))
+		for k, v := range r.frozenExtTools {
+			mainExtMap[k] = v
+		}
+	}
 	threadID := r.effectiveThreadIDLocked()
 	tracker := r.usageTracker
 	r.mu.RUnlock()
@@ -278,6 +287,7 @@ func (r *Runner) CreateCrew(ctx context.Context, req CrewCreateRequest) (CrewCre
 		threadID:             threadID,
 		sameProviderCrew:     sameProvider,
 		readOnlyCrew:         readOnly,
+		extMCP:               mainExtMCP,
 		keyPool:              crewKeyPool,
 		pinnedKeyID:          crewPinned,
 		usageTracker:         tracker,
@@ -291,11 +301,24 @@ func (r *Runner) CreateCrew(ctx context.Context, req CrewCreateRequest) (CrewCre
 		toolsCopy := make([]openAITool, len(mainTools))
 		copy(toolsCopy, mainTools)
 		crewRunner.frozenTools = toolsCopy
+		crewRunner.frozenExtTools = mainExtMap
+		crewRunner.syncHooksReadOnlyExternalToolsLocked()
 	} else {
 		// Different-Provider / ReadOnly Mode 2: compact focused system prompt & subset tools.
 		crewRunner.frozenSystemPrompt = buildFocusedCrewSystemPrompt(ws, name, req.PurposeCategory, readOnly)
+		var inheritedExt []mcp.ExternalTool
+		if readOnly && len(mainExtMap) > 0 {
+			inheritedExt = make([]mcp.ExternalTool, 0, len(mainExtMap))
+			for _, t := range mainExtMap {
+				inheritedExt = append(inheritedExt, t)
+			}
+			sort.Slice(inheritedExt, func(i, j int) bool {
+				return inheritedExt[i].Name < inheritedExt[j].Name
+			})
+		}
 		crewRunner.mu.Lock()
-		crewRunner.frozenTools = crewRunner.buildSessionToolsLocked()
+		crewRunner.frozenTools, crewRunner.frozenExtTools = crewRunner.buildSessionToolsLocked(inheritedExt)
+		crewRunner.syncHooksReadOnlyExternalToolsLocked()
 		crewRunner.mu.Unlock()
 	}
 

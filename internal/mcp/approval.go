@@ -578,3 +578,191 @@ func readIfExists(path string) (string, bool) {
 	}
 	return string(data), true
 }
+
+// AuthorizeExternalTool enforces read-only crew isolation, mount path boundaries,
+// PLAN mode blocks, and interactive approval gating for external MCP tool invocations.
+func (s *Server) AuthorizeExternalTool(namespacedName, serverName, rawToolName string, readOnlySemantic bool, args json.RawMessage) (bool, string) {
+	mode := s.mode()
+	if s.IsReadOnly() && !readOnlySemantic {
+		return false, fmt.Sprintf("DENIED BY TETHER GUARD: read-only crew cannot invoke external MCP tool %s.", namespacedName)
+	}
+
+	op := mount.OpWrite
+	if readOnlySemantic {
+		op = mount.OpRead
+	}
+	pathCandidates := extractExternalMCPPathArgs(args)
+	var resolvedDirs []string
+	for _, p := range pathCandidates {
+		d := s.mountEngine().AuthorizePath(p, op, mode)
+		if !d.Allowed && !(readOnlySemantic && d.RelPath == ".") {
+			return false, fmt.Sprintf("DENIED BY TETHER GUARD: %s", d.Reason)
+		}
+		if d.RelPath != "" {
+			dir := d.RelPath
+			if !d.IsDir {
+				dir = path.Dir(d.RelPath)
+			}
+			if dir == "" || dir == "/" {
+				dir = "."
+			}
+			resolvedDirs = append(resolvedDirs, dir)
+		}
+	}
+
+	if mode == "plan" && !readOnlySemantic {
+		return false, fmt.Sprintf("DENIED BY TETHER GUARD: external MCP tool %s is blocked in PLAN mode.", namespacedName)
+	}
+
+	if readOnlySemantic {
+		return true, ""
+	}
+
+	if s.approvesAll() {
+		return true, ""
+	}
+	if !s.forcesAskWrites() && s.hasExtToolGrant(namespacedName, resolvedDirs) {
+		return true, ""
+	}
+
+	target := namespacedName
+	if len(pathCandidates) > 0 {
+		target = pathCandidates[0]
+	}
+	dec := Decision{
+		Tool:        namespacedName,
+		Path:        target,
+		Label:       fmt.Sprintf("%s (%s/%s)", namespacedName, serverName, rawToolName),
+		Preview:     prettyCompactArgs(args),
+		FullPreview: string(args),
+		ForceAsk:    true,
+	}
+	if auto := s.AutoApprovePolicy(); auto != nil && !s.forcesAskWrites() && auto(dec) {
+		return true, ""
+	}
+	if ask := s.askPolicyWithReason(); ask != nil {
+		v, reason, ok := ask(dec)
+		if !ok {
+			if strings.TrimSpace(reason) != "" {
+				return false, "Rejected by the user: " + strings.TrimSpace(reason) + ". External MCP tool was not executed."
+			}
+			return false, "Rejected by the user. External MCP tool was not executed."
+		}
+		switch v {
+		case VerdictSession:
+			s.askMu.Lock()
+			s.approveAll = true
+			s.askMu.Unlock()
+			return true, ""
+		case VerdictFolder:
+			s.recordExtToolGrant(namespacedName, resolvedDirs)
+			return true, ""
+		case VerdictReject:
+			if strings.TrimSpace(reason) != "" {
+				return false, "Rejected by the user: " + strings.TrimSpace(reason) + ". External MCP tool was not executed."
+			}
+			return false, "Rejected by the user. External MCP tool was not executed."
+		default: // VerdictOnce
+			return true, ""
+		}
+	}
+
+	return false, fmt.Sprintf("APPROVAL REQUIRED: external MCP tool %s (%s) requires user approval before execution.", namespacedName, serverName)
+}
+
+func (s *Server) hasExtToolGrant(namespacedName string, dirs []string) bool {
+	s.askMu.Lock()
+	defer s.askMu.Unlock()
+	if len(s.extToolGrants) == 0 {
+		return false
+	}
+	if len(dirs) == 0 {
+		return s.extToolGrants["ext:"+namespacedName]
+	}
+	for _, d := range dirs {
+		if !s.hasExtToolDirGrantLocked(namespacedName, d) {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Server) hasExtToolDirGrantLocked(namespacedName, dir string) bool {
+	cur := path.Clean(dir)
+	for {
+		if s.extToolGrants["ext:"+namespacedName+":"+cur] {
+			return true
+		}
+		if cur == "." || cur == "/" || cur == "" {
+			break
+		}
+		next := path.Dir(cur)
+		if next == cur {
+			break
+		}
+		cur = next
+	}
+	return s.extToolGrants["ext:"+namespacedName+":."]
+}
+
+func (s *Server) recordExtToolGrant(namespacedName string, dirs []string) {
+	if strings.TrimSpace(namespacedName) == "" {
+		return
+	}
+	s.askMu.Lock()
+	if s.extToolGrants == nil {
+		s.extToolGrants = make(map[string]bool)
+	}
+	if len(dirs) == 0 {
+		s.extToolGrants["ext:"+namespacedName] = true
+	} else {
+		for _, d := range dirs {
+			s.extToolGrants["ext:"+namespacedName+":"+path.Clean(d)] = true
+		}
+	}
+	s.askMu.Unlock()
+}
+
+func extractExternalMCPPathArgs(raw json.RawMessage) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil || len(m) == 0 {
+		return nil
+	}
+	keys := []string{"path", "file_path", "relative_path", "target_file", "target_path", "file", "dir", "directory", "paths"}
+	var out []string
+	for _, k := range keys {
+		val, ok := m[k]
+		if !ok {
+			continue
+		}
+		switch v := val.(type) {
+		case string:
+			if s := strings.TrimSpace(v); s != "" {
+				out = append(out, s)
+			}
+		case []any:
+			for _, item := range v {
+				if s, ok := item.(string); ok {
+					if trimmed := strings.TrimSpace(s); trimmed != "" {
+						out = append(out, trimmed)
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+func prettyCompactArgs(raw json.RawMessage) string {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "{}" {
+		return "{}"
+	}
+	if len(trimmed) > 240 {
+		return trimmed[:240] + "..."
+	}
+	return trimmed
+}

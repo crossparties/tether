@@ -60,6 +60,7 @@ type Server struct {
 	// asker stays installed: replacing the asker would discard the real one.
 	approveAll     bool
 	forceAskGrants map[string]bool
+	extToolGrants  map[string]bool
 
 	snapMu         sync.RWMutex
 	snapshotStore  *snapshot.Store
