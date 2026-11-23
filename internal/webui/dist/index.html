@@ -2,76 +2,14 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Tether v0.3.0</title>
-    <style>
-      :root {
-        --base: #1e1e2e;
-        --overlay: #313244;
-        --border: #b4befe;
-        --mauve: #cba6f7;
-        --blue: #89b4fa;
-        --green: #a6e3a1;
-        --text: #cdd6f4;
-        --muted: #6c7086;
-      }
-      * {
-        box-sizing: border-box;
-      }
-      html,
-      body {
-        margin: 0;
-        min-height: 100dvh;
-        background: var(--base);
-        color: var(--text);
-        font-family: Inter, system-ui, -apple-system, sans-serif;
-        display: grid;
-        place-items: center;
-      }
-      main {
-        max-width: 560px;
-        width: calc(100% - 2rem);
-        background: var(--overlay);
-        border: 1px solid var(--border);
-        border-radius: 12px;
-        padding: 1.5rem;
-      }
-      h1 {
-        margin: 0 0 0.5rem;
-        font-size: 1.25rem;
-        color: var(--mauve);
-      }
-      p {
-        margin: 0.5rem 0;
-        line-height: 1.5;
-        color: var(--text);
-      }
-      code {
-        font-family: "JetBrains Mono", ui-monospace, monospace;
-        color: var(--blue);
-      }
-      .ok {
-        color: var(--green);
-        font-weight: 600;
-      }
-      .muted {
-        color: var(--muted);
-        font-size: 0.875rem;
-      }
-    </style>
+    <script type="module" crossorigin src="/assets/index-D1wzjypa.js"></script>
+    <link rel="modulepreload" crossorigin href="/assets/codemirror-DkgwyOvV.js">
+    <link rel="modulepreload" crossorigin href="/assets/terminal--24IGk-x.js">
+    <link rel="stylesheet" crossorigin href="/assets/index-WLEkKR3M.css">
   </head>
   <body>
-    <main>
-      <h1>Tether Local Web Server</h1>
-      <p class="ok">Backend API, SSE event hub, and PTY WebSocket are active.</p>
-      <p>
-        This embedded placeholder shell will be replaced by the compiled Svelte 5
-        UI bundle in <code>internal/webui/dist/</code>.
-      </p>
-      <p class="muted">
-        Session API: <code>GET /api/v1/auth/session</code> &middot; Events:
-        <code>GET /api/v1/events</code>
-      </p>
-    </main>
+    <div id="app"></div>
   </body>
 </html>

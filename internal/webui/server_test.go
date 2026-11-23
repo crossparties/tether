@@ -18,6 +18,7 @@ import (
 
 	"github.com/crossparties/tether/internal/core"
 	"github.com/crossparties/tether/internal/harness"
+	"github.com/crossparties/tether/internal/mcp"
 	"github.com/crossparties/tether/internal/mount"
 	"github.com/crossparties/tether/internal/snapshot"
 )
@@ -530,8 +531,9 @@ func TestSPAPlaceholderSetupBrowseSettingsAndUndoTurn(t *testing.T) {
 		resp := wc.do(http.MethodGet, route, nil, nil)
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "Tether Local Web Server") {
-			t.Fatalf("GET %s failed: status=%d body=%s", route, resp.StatusCode, string(body))
+		s := string(body)
+		if resp.StatusCode != http.StatusOK || !strings.Contains(s, "Tether v0.3.0") || !strings.Contains(s, `id="app"`) {
+			t.Fatalf("GET %s failed: status=%d body=%s", route, resp.StatusCode, s)
 		}
 	}
 
@@ -806,6 +808,7 @@ func TestPreviewSkillsMemoryDiffIgnoreAndAbortEdgeCases(t *testing.T) {
 				cur.data = strings.TrimPrefix(line, "data: ")
 			}
 		}
+		_ = sc.Err()
 	}()
 
 	srv.hub.Publish("plan.updated", json.RawMessage("{\n  \"mode\": \"build\",\n  \"nested\": {\n    \"ok\": true\n  }\n}"))
@@ -1043,11 +1046,11 @@ func TestConcurrentChatThreadsAndProjectOpenRace(t *testing.T) {
 	go func() {
 		sc := bufio.NewScanner(sseResp.Body)
 		for sc.Scan() {
-			line := sc.Text()
-			if strings.HasPrefix(line, "event: ") {
-				evCh <- strings.TrimPrefix(line, "event: ")
+			if evName, ok := strings.CutPrefix(sc.Text(), "event: "); ok {
+				evCh <- evName
 			}
 		}
+		_ = sc.Err()
 	}()
 
 	// Start active turn holding in approval.required.
@@ -1077,7 +1080,7 @@ approvalActive:
 	// Concurrent chat/send & POST /api/v1/threads while turn is active must all get 409 Conflict.
 	var conflictWG sync.WaitGroup
 	conflicts := make(chan int, 6)
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		conflictWG.Add(2)
 		go func() {
 			defer conflictWG.Done()
@@ -1125,5 +1128,260 @@ approvalActive:
 	thAfter.Body.Close()
 	if thAfter.StatusCode != http.StatusCreated {
 		t.Fatalf("POST /api/v1/threads after concurrent project/open failed: %d", thAfter.StatusCode)
+	}
+}
+
+func TestEmbeddedDistServesCompiledSvelteAssets(t *testing.T) {
+	ws := t.TempDir()
+	_, _, wc := newTestWebServer(t, ws)
+
+	resp := wc.do(http.MethodGet, "/", nil, nil)
+	bodyBytes, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatalf("read GET /: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET / status = %d, want 200", resp.StatusCode)
+	}
+	html := string(bodyBytes)
+	if !strings.Contains(html, "/assets/") || !strings.Contains(html, ".js") {
+		t.Fatalf("expected GET / to serve compiled Vite/Svelte index.html referencing /assets/*.js, got:\n%s", html)
+	}
+
+	// Extract compiled /assets/*.js and /assets/*.css paths and verify //go:embed all:dist serves both.
+	for _, suffix := range []string{".js", ".css"} {
+		needle := "/assets/"
+		pos := 0
+		var assetPath string
+		for {
+			idx := strings.Index(html[pos:], needle)
+			if idx < 0 {
+				break
+			}
+			rest := html[pos+idx:]
+			end := strings.IndexAny(rest, `"' >`)
+			if end > 0 && strings.HasSuffix(rest[:end], suffix) {
+				assetPath = rest[:end]
+				break
+			}
+			pos += idx + len(needle)
+		}
+		if assetPath == "" {
+			t.Fatalf("no %s asset path found in GET / HTML:\n%s", suffix, html)
+		}
+		aResp := wc.do(http.MethodGet, assetPath, nil, nil)
+		aBytes, aErr := io.ReadAll(aResp.Body)
+		aResp.Body.Close()
+		if aErr != nil {
+			t.Fatalf("read GET %s: %v", assetPath, aErr)
+		}
+		if aResp.StatusCode != http.StatusOK || len(aBytes) == 0 {
+			t.Fatalf("GET %s failed: status=%d bytes=%d", assetPath, aResp.StatusCode, len(aBytes))
+		}
+	}
+}
+
+func TestAuditRegressionsThreadIsolationMCPClearAndAtomicSettings(t *testing.T) {
+	t.Setenv("TETHER_CONFIG_DIR", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+
+	ws := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ws, "index.html"), []byte("<form></form>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	eng, err := core.NewEngine(ws)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	defer eng.Close()
+
+	run := harness.NewRunner(eng, harness.Config{
+		Provider: "deepseek",
+		Model:    "deepseek-chat",
+		APIKey:   "sk-init",
+		Out:      &bytes.Buffer{},
+	})
+	defer func() { _ = run.Close() }()
+
+	srv, err := NewServer(Config{Engine: eng, Runner: run})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutCtx)
+		ts.Close()
+	}()
+
+	wc := &testWebClient{
+		t:    t,
+		base: ts.URL,
+		client: &http.Client{
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
+	}
+	wc.redeemBootstrap(srv.BootstrapToken())
+
+	// 1. Thread events MUST exclude Crew events (crew_id != "") while crew messages return them.
+	th, err := eng.CreateThread("th-iso", "Isolation Thread", "code")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.CreateCrewSession(core.CrewSession{
+		ID:             "crew-1",
+		ParentThreadID: th.ID,
+		Name:           "worker",
+		Status:         "active",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.AppendThreadEvent(core.ConversationEvent{
+		ThreadID:    th.ID,
+		Role:        "user",
+		UsageID:     "main",
+		PayloadJSON: `{"role":"user","content":"main hello"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.AppendThreadEvent(core.ConversationEvent{
+		ThreadID:    th.ID,
+		CrewID:      "crew-1",
+		Role:        "assistant",
+		UsageID:     "crew:crew-1",
+		PayloadJSON: `{"role":"assistant","content":"crew secret output"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	evResp := wc.do(http.MethodGet, "/api/v1/threads/"+th.ID+"/events", nil, nil)
+	var evOut struct {
+		Events []core.ConversationEvent `json:"events"`
+	}
+	_ = json.NewDecoder(evResp.Body).Decode(&evOut)
+	evResp.Body.Close()
+	if evResp.StatusCode != http.StatusOK || len(evOut.Events) != 1 || evOut.Events[0].CrewID != "" {
+		t.Fatalf("expected only main event in thread events, got status=%d events=%+v", evResp.StatusCode, evOut.Events)
+	}
+
+	cmResp := wc.do(http.MethodGet, "/api/v1/crews/crew-1/messages", nil, nil)
+	var cmOut struct {
+		Messages []core.ConversationEvent `json:"messages"`
+	}
+	_ = json.NewDecoder(cmResp.Body).Decode(&cmOut)
+	cmResp.Body.Close()
+	if cmResp.StatusCode != http.StatusOK || len(cmOut.Messages) != 1 || cmOut.Messages[0].CrewID != "crew-1" {
+		t.Fatalf("expected crew event in crew messages, got status=%d msgs=%+v", cmResp.StatusCode, cmOut.Messages)
+	}
+
+	// 2. Preview CSP allows scripts & forms without allow-same-origin.
+	pvResp := wc.do(http.MethodGet, "/preview/index.html", nil, nil)
+	pvResp.Body.Close()
+	csp := pvResp.Header.Get("Content-Security-Policy")
+	if pvResp.StatusCode != http.StatusOK || !strings.Contains(csp, "allow-scripts") || !strings.Contains(csp, "allow-forms") || strings.Contains(csp, "allow-same-origin") {
+		t.Fatalf("unexpected preview CSP: status=%d csp=%q", pvResp.StatusCode, csp)
+	}
+
+	// 3. Invalid (provider, model) in PUT /api/v1/settings must fail atomically (400) without mutating provider/mode/settings.
+	badSet := wc.do(http.MethodPut, "/api/v1/settings", map[string]any{
+		"mode":     "plan",
+		"provider": "openai",
+		"model":    "deepseek-chat",
+		"project_settings": map[string]string{
+			"atomic_marker": "should_not_persist",
+		},
+	}, nil)
+	badSet.Body.Close()
+	if badSet.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for mismatched provider+model, got %d", badSet.StatusCode)
+	}
+	if gotProv, gotModel, gotMode := run.ProviderName(), run.ModelName(), eng.GetMode(); gotProv != "deepseek" || gotModel != "deepseek-chat" || gotMode != "code" {
+		t.Fatalf("settings mutated after 400 failure: provider=%q model=%q mode=%q", gotProv, gotModel, gotMode)
+	}
+	if v, _ := eng.GetProjectSetting("atomic_marker"); v != "" {
+		t.Fatalf("project setting persisted after 400 failure: %q", v)
+	}
+
+	// 4. Clearing env, headers, and disabled_tools via PATCH /api/v1/mcp/{name} clears secrets/fields cleanly and passes re-test + enable.
+	mcpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		w.Header().Set("Content-Type", "application/json")
+		var res any
+		switch req.Method {
+		case "initialize":
+			res = map[string]any{"protocolVersion": "2024-11-05", "capabilities": map[string]any{}, "serverInfo": map[string]any{"name": "http-helper", "version": "1"}}
+		case "tools/list":
+			res = map[string]any{"tools": []map[string]any{
+				{"name": "tool_a", "description": "A", "inputSchema": map[string]any{"type": "object"}},
+				{"name": "tool_b", "description": "B", "inputSchema": map[string]any{"type": "object"}},
+			}}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": res})
+	}))
+	defer mcpSrv.Close()
+
+	cResp := wc.do(http.MethodPost, "/api/v1/mcp", map[string]any{
+		"name":           "clear-test",
+		"transport":      "http",
+		"url":            mcpSrv.URL,
+		"scope":          "project",
+		"preset":         "full",
+		"env":            map[string]string{"API_TOKEN": "tok-abc"},
+		"headers":        map[string]string{"Authorization": "Bearer secret-hdr"},
+		"disabled_tools": []string{"tool_b"},
+		"enabled":        false,
+	}, nil)
+	cResp.Body.Close()
+	if cResp.StatusCode != http.StatusCreated {
+		t.Fatalf("create mcp failed: %d", cResp.StatusCode)
+	}
+
+	// Clear env={}, headers={}, disabled_tools=[], test with cleared payload, then PATCH + enable!
+	tCleared := wc.do(http.MethodPost, "/api/v1/mcp/test", map[string]any{
+		"name":      "clear-test",
+		"transport": "http",
+		"url":       mcpSrv.URL,
+		"scope":     "project",
+		"preset":    "full",
+		"env":       map[string]string{},
+		"headers":   map[string]string{},
+	}, nil)
+	tCleared.Body.Close()
+	if tCleared.StatusCode != http.StatusOK {
+		t.Fatalf("test cleared mcp config failed: %d", tCleared.StatusCode)
+	}
+
+	pCleared := wc.do(http.MethodPatch, "/api/v1/mcp/clear-test", map[string]any{
+		"transport":       "http",
+		"url":             mcpSrv.URL,
+		"scope":           "project",
+		"preset":          "full",
+		"env":             map[string]string{},
+		"headers":         map[string]string{},
+		"disabled_tools":  []string{},
+		"replace_secrets": true,
+		"enabled":         true,
+	}, nil)
+	pClearedBody, _ := io.ReadAll(pCleared.Body)
+	pCleared.Body.Close()
+	if pCleared.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH clearing env/headers/disabled_tools + enable failed (%d): %s", pCleared.StatusCode, string(pClearedBody))
+	}
+
+	reg := mcp.NewClientRegistry(ws)
+	savedSrv, ok, _ := reg.GetServer("clear-test")
+	if !ok || !savedSrv.Enabled || len(savedSrv.Env) != 0 || len(savedSrv.Headers) != 0 || len(savedSrv.DisabledTools) != 0 {
+		t.Fatalf("expected cleared env/headers/disabled_tools and enabled=true, got %+v ok=%v", savedSrv, ok)
+	}
+	credRaw, _ := os.ReadFile(reg.CredentialsPath())
+	if strings.Contains(string(credRaw), "tok-abc") || strings.Contains(string(credRaw), "secret-hdr") {
+		t.Fatalf("cleared MCP secrets leaked/remained in credentials.json: %s", string(credRaw))
 	}
 }

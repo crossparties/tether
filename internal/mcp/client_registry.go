@@ -98,6 +98,7 @@ type ImportResult struct {
 type SerenaSuggestion struct {
 	Recommended     bool     `json:"recommended"`
 	SerenaStatus    string   `json:"serena_status"`
+	SerenaName      string   `json:"serena_name,omitempty"`
 	Recommendation  string   `json:"recommendation,omitempty"`
 	Reasons         []string `json:"reasons,omitempty"`
 	FileCount       int      `json:"file_count"`
@@ -688,13 +689,16 @@ func (r *ClientRegistry) UpsertServer(cfg ExternalMCPConfig, sparse SparseUpdate
 	}
 	origSecrets := cloneStringMap(secrets)
 
+	envCleared := existing != nil && !sparse.ReplaceAllFields && cfg.Env != nil && len(cfg.Env) == 0
+	headersCleared := existing != nil && !sparse.ReplaceAllFields && cfg.Headers != nil && len(cfg.Headers) == 0
+
 	// Process Env secrets cleanly.
 	cleanEnv, err := r.extractAndSanitizeKV(normScope, merged.Name, "env", merged.Env, func() map[string]string {
 		if existing != nil {
 			return existing.Env
 		}
 		return nil
-	}(), !sparse.ReplaceAllSecrets, secrets)
+	}(), !sparse.ReplaceAllSecrets && !envCleared, secrets)
 	if err != nil {
 		return ExternalMCPConfig{}, err
 	}
@@ -706,14 +710,14 @@ func (r *ClientRegistry) UpsertServer(cfg ExternalMCPConfig, sparse SparseUpdate
 			return existing.Headers
 		}
 		return nil
-	}(), !sparse.ReplaceAllSecrets, secrets)
+	}(), !sparse.ReplaceAllSecrets && !headersCleared, secrets)
 	if err != nil {
 		return ExternalMCPConfig{}, err
 	}
 	merged.Headers = cleanHeaders
 
-	// Clean up removed secrets when full replace is explicitly requested.
-	if sparse.ReplaceAllSecrets {
+	// Clean up removed secrets when full replace or explicit {} clear is requested.
+	if sparse.ReplaceAllSecrets || envCleared || headersCleared {
 		keep := make(map[string]bool)
 		for k, v := range merged.Env {
 			if isSecretRef(v) {
@@ -725,9 +729,15 @@ func (r *ClientRegistry) UpsertServer(cfg ExternalMCPConfig, sparse SparseUpdate
 				keep[secretStoreKey(normScope, merged.Name, "header", k)] = true
 			}
 		}
-		prefix := strings.ToLower(normScope) + ":" + strings.ToLower(merged.Name) + ":"
+		basePrefix := strings.ToLower(normScope) + ":" + strings.ToLower(merged.Name) + ":"
 		for sk := range secrets {
-			if strings.HasPrefix(sk, prefix) && !keep[sk] {
+			if !strings.HasPrefix(sk, basePrefix) || keep[sk] {
+				continue
+			}
+			rest := strings.TrimPrefix(sk, basePrefix)
+			if sparse.ReplaceAllSecrets ||
+				(envCleared && strings.HasPrefix(rest, "env:")) ||
+				(headersCleared && strings.HasPrefix(rest, "header:")) {
 				delete(secrets, sk)
 			}
 		}
@@ -1480,10 +1490,12 @@ func EvaluateSerenaSuggestionWithRegistry(reg *ClientRegistry, mode string, isCr
 	}
 
 	status := SerenaStatusNotConfigured
+	serenaName := ""
 	if reg != nil {
 		if servers, err := reg.ListServers(); err == nil {
 			for _, s := range servers {
 				if strings.EqualFold(s.Name, "serena") || IsSerenaServer(s) {
+					serenaName = s.Name
 					if s.Enabled {
 						status = SerenaStatusEnabled
 					} else {
@@ -1515,6 +1527,7 @@ func EvaluateSerenaSuggestionWithRegistry(reg *ClientRegistry, mode string, isCr
 
 	sugg := SerenaSuggestion{
 		SerenaStatus:  status,
+		SerenaName:    serenaName,
 		FileCount:     fileCount,
 		DominantStack: dominantStack,
 		Reasons:       reasons,

@@ -944,7 +944,7 @@ func (s *Server) handleThreadEvents(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	events, err := eng.ListThreadEvents(id, 500)
+	events, err := eng.ListThreadEventsForActor(id, "", 500)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1758,17 +1758,18 @@ func (s *Server) handleMCPList(w http.ResponseWriter, _ *http.Request) {
 }
 
 type mcpPatchRequest struct {
-	Transport     string            `json:"transport"`
-	Command       string            `json:"command"`
-	Args          []string          `json:"args"`
-	Env           map[string]string `json:"env"`
-	URL           string            `json:"url"`
-	Headers       map[string]string `json:"headers"`
-	Enabled       *bool             `json:"enabled"`
-	Preset        string            `json:"preset"`
-	EnabledTools  []string          `json:"enabled_tools"`
-	DisabledTools []string          `json:"disabled_tools"`
-	Scope         string            `json:"scope"`
+	Transport      string            `json:"transport"`
+	Command        string            `json:"command"`
+	Args           []string          `json:"args"`
+	Env            map[string]string `json:"env"`
+	URL            string            `json:"url"`
+	Headers        map[string]string `json:"headers"`
+	Enabled        *bool             `json:"enabled"`
+	Preset         string            `json:"preset"`
+	EnabledTools   []string          `json:"enabled_tools"`
+	DisabledTools  []string          `json:"disabled_tools"`
+	Scope          string            `json:"scope"`
+	ReplaceSecrets bool              `json:"replace_secrets"`
 }
 
 func (s *Server) handleMCPCreate(w http.ResponseWriter, r *http.Request) {
@@ -1786,7 +1787,7 @@ func (s *Server) handleMCPCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Enabled {
-		fp := s.mcpConfigFingerprint(reg, req.ExternalMCPConfig, nil, false)
+		fp := s.mcpConfigFingerprint(reg, req.ExternalMCPConfig, nil, false, false)
 		if !s.isMCPTested(req.Name, fp) {
 			writeError(w, http.StatusBadRequest, "test MCP server connection before enabling")
 			return
@@ -1845,9 +1846,11 @@ func (s *Server) handleMCPPatch(w http.ResponseWriter, r *http.Request) {
 		cfg.Scope = req.Scope
 	}
 
-	oldFP := s.mcpConfigFingerprint(reg, existing, &existing, false)
+	oldFP := s.mcpConfigFingerprint(reg, existing, &existing, false, false)
 	candidate := mergeMCPPatchCandidate(existing, req)
-	newFP := s.mcpConfigFingerprint(reg, candidate, &existing, req.Env != nil || req.Headers != nil)
+	preserveEnv := len(req.Env) > 0 && !req.ReplaceSecrets
+	preserveHdr := len(req.Headers) > 0 && !req.ReplaceSecrets
+	newFP := s.mcpConfigFingerprint(reg, candidate, &existing, preserveEnv, preserveHdr)
 
 	nextEnabled := existing.Enabled
 	if req.Enabled != nil {
@@ -1865,7 +1868,7 @@ func (s *Server) handleMCPPatch(w http.ResponseWriter, r *http.Request) {
 	updated, err := reg.UpsertServer(cfg, mcp.SparseUpdate{
 		Enabled:           req.Enabled,
 		ReplaceAllFields:  false,
-		ReplaceAllSecrets: false,
+		ReplaceAllSecrets: req.ReplaceSecrets,
 	})
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -1925,13 +1928,13 @@ func (s *Server) handleMCPTest(w http.ResponseWriter, r *http.Request) {
 			if existing, ok, gerr := reg.GetServer(req.Name); gerr == nil && ok {
 				existingPtr = &existing
 			}
-			testedFP = s.mcpConfigFingerprint(reg, req, existingPtr, false)
+			testedFP = s.mcpConfigFingerprint(reg, req, existingPtr, false, false)
 		}
 	} else if strings.TrimSpace(req.Name) != "" {
 		res, err = mgr.TestServer(ctx, req.Name)
 		if err == nil && res.OK {
 			if existing, ok, gerr := reg.GetServer(res.Name); gerr == nil && ok {
-				testedFP = s.mcpConfigFingerprint(reg, existing, &existing, false)
+				testedFP = s.mcpConfigFingerprint(reg, existing, &existing, false, false)
 			}
 		}
 	} else {
@@ -2011,7 +2014,7 @@ func (s *Server) handleMCPToggle(w http.ResponseWriter, r *http.Request) {
 		nextEnabled = *req.Enabled
 	}
 	if nextEnabled {
-		fp := s.mcpConfigFingerprint(reg, existing, &existing, false)
+		fp := s.mcpConfigFingerprint(reg, existing, &existing, false, false)
 		if !s.isMCPTested(existing.Name, fp) {
 			writeError(w, http.StatusBadRequest, "test MCP server connection before enabling")
 			return
@@ -2098,7 +2101,7 @@ func mergeMCPPatchCandidate(existing mcp.ExternalMCPConfig, req mcpPatchRequest)
 	return merged
 }
 
-func (s *Server) mcpConfigFingerprint(reg *mcp.ClientRegistry, cfg mcp.ExternalMCPConfig, existing *mcp.ExternalMCPConfig, preserveOmitted bool) string {
+func (s *Server) mcpConfigFingerprint(reg *mcp.ClientRegistry, cfg mcp.ExternalMCPConfig, existing *mcp.ExternalMCPConfig, preserveEnvOmitted, preserveHdrOmitted bool) string {
 	scope := strings.ToLower(strings.TrimSpace(cfg.Scope))
 	if scope == "" && existing != nil {
 		scope = strings.ToLower(strings.TrimSpace(existing.Scope))
@@ -2136,8 +2139,8 @@ func (s *Server) mcpConfigFingerprint(reg *mcp.ClientRegistry, cfg mcp.ExternalM
 		exEnvRes = existingResolved.Env
 		exHeadersRes = existingResolved.Headers
 	}
-	envMap := resolveMCPMapForFingerprint(cfg.Env, exEnvRaw, exEnvRes, preserveOmitted, false)
-	hdrMap := resolveMCPMapForFingerprint(cfg.Headers, exHeadersRaw, exHeadersRes, preserveOmitted, true)
+	envMap := resolveMCPMapForFingerprint(cfg.Env, exEnvRaw, exEnvRes, preserveEnvOmitted, false)
+	hdrMap := resolveMCPMapForFingerprint(cfg.Headers, exHeadersRaw, exHeadersRes, preserveHdrOmitted, true)
 
 	h := sha256.New()
 	writeField := func(s string) {
@@ -2572,30 +2575,25 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if strings.TrimSpace(req.Mode) != "" {
-		m := strings.ToLower(strings.TrimSpace(req.Mode))
-		if m != "code" && m != "plan" && m != "review" {
-			writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid mode %q", req.Mode))
+	nextMode := strings.ToLower(strings.TrimSpace(req.Mode))
+	if nextMode != "" && nextMode != "code" && nextMode != "plan" && nextMode != "review" {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid mode %q", req.Mode))
+		return
+	}
+
+	if run != nil && (strings.TrimSpace(req.Provider) != "" || strings.TrimSpace(req.Model) != "") {
+		if _, _, err := run.SwitchProviderAndModel(req.Provider, req.Model); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if err := eng.SetMode(m); err != nil {
+	}
+
+	if nextMode != "" {
+		if err := eng.SetMode(nextMode); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		s.hub.Publish("plan.updated", map[string]any{"mode": m})
-	}
-
-	if run != nil && strings.TrimSpace(req.Provider) != "" {
-		if _, _, err := run.SwitchProvider(req.Provider); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-	}
-	if run != nil && strings.TrimSpace(req.Model) != "" {
-		if _, err := run.SwitchModel(req.Model); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
+		s.hub.Publish("plan.updated", map[string]any{"mode": nextMode})
 	}
 
 	for k, v := range req.ProjectSettings {

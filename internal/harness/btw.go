@@ -158,6 +158,39 @@ func (r *Runner) SwitchProvider(name string) (string, string, error) {
 	return finalSnap.provider, finalSnap.model, nil
 }
 
+// SwitchProviderAndModel validates both provider and optional model before mutating
+// runner or SQLite state so invalid combinations fail atomically.
+func (r *Runner) SwitchProviderAndModel(provider, model string) (string, string, error) {
+	p := strings.ToLower(strings.TrimSpace(provider))
+	m := strings.TrimSpace(model)
+	if p == "" {
+		p = strings.ToLower(strings.TrimSpace(r.ProviderName()))
+	} else if _, known := presets[p]; !known {
+		return "", "", fmt.Errorf("unknown provider %q (options: %s)", p, strings.Join(providerNames(), ", "))
+	}
+
+	var canonicalModel string
+	if m != "" {
+		c, valid := validateModel(p, m)
+		if !valid {
+			return "", "", fmt.Errorf("unknown model %q for %s (options: %s)", m, p, choiceLabels(modelsFor(p)))
+		}
+		canonicalModel = c
+	}
+
+	if strings.TrimSpace(provider) != "" {
+		if _, _, err := r.SwitchProvider(p); err != nil {
+			return "", "", err
+		}
+	}
+	if canonicalModel != "" {
+		if _, err := r.SwitchModel(canonicalModel); err != nil {
+			return "", "", err
+		}
+	}
+	return r.ProviderName(), r.ModelName(), nil
+}
+
 // ListKeysSummary formats non-secret key pool status lines without exposing raw secrets.
 func (r *Runner) ListKeysSummary() string {
 	pool := r.KeyPool()

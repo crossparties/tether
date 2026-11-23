@@ -19,3 +19,7 @@ session.db
 
 # Snapshots
 .tether/
+
+# Web UI build deps
+web/node_modules/
+web/.svelte-kit/
