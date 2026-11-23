@@ -2,7 +2,7 @@
 
 > **Product**: Tether  
 > **Version**: 0.2.0 (Architecture Baseline & Target)  
-> **Repository**: github.com/croosparties/tether  
+> **Repository**: github.com/crossparties/tether  
 > **Status**: Active Specification  
 
 ---
@@ -278,7 +278,7 @@ Usage:
 ## 8. Implementation Roadmap
 
 ### Phase 1: Substrate Solidification & Protocol Hygiene (Immediate)
-- Migrasi repository dan modul ke `github.com/croosparties/tether`.
+- Migrasi repository dan modul ke `github.com/crossparties/tether`.
 - Standarisasi MCP stdio transport menggunakan Newline-Delimited JSON (memperbaiki hang pada handshake).
 - Persistensi state mode (`code` / `plan`) di dalam database SQLite (menghilangkan in-memory struct state).
 

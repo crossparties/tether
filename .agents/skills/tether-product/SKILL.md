@@ -5,7 +5,7 @@ description: Product Architecture and Strategy Skill for Tether. Encapsulates th
 
 # Tether Product Architecture Skill
 
-Use this skill when designing features, writing specifications, evaluating agent workflows, or answering strategic product questions about **Tether** (`github.com/croosparties/tether`).
+Use this skill when designing features, writing specifications, evaluating agent workflows, or answering strategic product questions about **Tether** (`github.com/crossparties/tether`).
 
 ## The Core Concept
 **Tether** is the *Local-First Deterministic Substrate & Proactive Lifecycle Gatekeeper for Autonomous AI Coding Agents*.

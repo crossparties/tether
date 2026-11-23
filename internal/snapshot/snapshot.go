@@ -30,17 +30,17 @@ const (
 type Entry struct {
 	// Path is stored relative to the workspace when possible, so a snapshot
 	// stays valid if the workspace is moved.
-	Path    string `json:"path"`
-	State   State  `json:"state"`
-	Backup  string `json:"backup,omitempty"`
+	Path    string    `json:"path"`
+	State   State     `json:"state"`
+	Backup  string    `json:"backup,omitempty"`
 	Created time.Time `json:"created"`
 }
 
 // Index is the manifest of a single turn.
 type Index struct {
-	Turn    string  `json:"turn"`
+	Turn    string    `json:"turn"`
 	Created time.Time `json:"created"`
-	Entries []Entry `json:"entries"`
+	Entries []Entry   `json:"entries"`
 }
 
 // Store writes snapshots beneath <root>/.tether/snapshots.

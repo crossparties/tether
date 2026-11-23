@@ -355,8 +355,6 @@ func TestPreToolUse_SubagentGovernanceProtocol(t *testing.T) {
 	}
 }
 
-
-
 // A subagent must never be able to claim the main conversation identity.
 func TestPreInvocation_SubagentCannotHijackMainConversation(t *testing.T) {
 	e := newTestEngine(t)
@@ -634,4 +632,39 @@ func TestIsWriteTool(t *testing.T) {
 			t.Errorf("%s must not be treated as a file write", name)
 		}
 	}
+}
+
+func TestPreToolUse_PlanAndProposalAllowSafeQuotedAndStderrCommands(t *testing.T) {
+	e := newTestEngine(t)
+	h := NewHandler(e)
+	if err := e.SetMode("plan"); err != nil {
+		t.Fatalf("SetMode plan: %v", err)
+	}
+	if _, err := h.Handle("PreInvocation", strings.NewReader(`{"conversationId":"main-1"}`)); err != nil {
+		t.Fatalf("PreInvocation: %v", err)
+	}
+	if _, err := e.RecordProposal("tether_qa", "pending check"); err != nil {
+		t.Fatalf("RecordProposal: %v", err)
+	}
+
+	safeCmds := []string{
+		`grep "->" internal/tui/view.go 2>/dev/null`,
+		`cd internal && git status --short | head -n 10`,
+		`CGO_ENABLED=0 go test ./... | tail -n 5`,
+	}
+	for _, cmd := range safeCmds {
+		payload := `{"conversationId":"main-1","tool_name":"run_command","tool_call":{"name":"run_command","args":{"command":` + mustQuoteTestStr(cmd) + `}}}`
+		out, err := h.Handle("PreToolUse", strings.NewReader(payload))
+		if err != nil {
+			t.Fatalf("Handle(%q): %v", cmd, err)
+		}
+		if !strings.Contains(out, `"allow"`) {
+			t.Errorf("expected read/validation command %q to be allowed in plan/pending state, got %s", cmd, out)
+		}
+	}
+}
+
+func mustQuoteTestStr(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
 }

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/croosparties/tether/internal/core"
@@ -159,6 +161,29 @@ type Runner struct {
 	history    []chatMessage
 	agentType  string
 	isSubagent bool
+
+	// depth is how many spawn_subagent hops separate this runner from the
+	// session the user is talking to. A sub-runner inherits the spawn tool, so
+	// without a counter the recursion is bounded only by the model's restraint.
+	depth int
+
+	// steps counts tool-loop iterations in the last Run. It is reported in the
+	// subagent summary: the user wants to know whether a worker did eight
+	// things or hit its forty-step ceiling.
+	steps int
+
+	// DeepSeek Context Caching metrics from the latest API call
+	lastCacheHitTokens  int
+	lastCacheMissTokens int
+
+	// onSubagent receives live lifecycle events of every worker this runner spawns
+	// (start, tool steps, done). Set once at startup; nil keeps the plain-text output.
+	onSubagent func(SubagentEvent)
+
+	// onDelta, when set, switches callAPI to SSE streaming and receives live token
+	// deltas (kind: "content" | "reasoning" | "endstep"). Only the Main Agent runner
+	// sets it; subagent runners are separate structs and always use the buffered path.
+	onDelta func(kind, text string)
 }
 
 func NewRunner(engine *core.Engine, cfg Config) *Runner {
@@ -272,9 +297,17 @@ func (r *Runner) Run(ctx context.Context, prompt string) (string, error) {
 	var preInvOut hooks.HookOutput
 	_ = json.Unmarshal([]byte(preInvRaw), &preInvOut)
 
-	sysPrompt := "You are an autonomous coding agent anchored by Tether. Follow workspace guardrails strictly."
+	sysPrompt := "You are the Main Orchestrator of an autonomous coding agent CLI anchored by Tether. Be concise, direct, and technical. Avoid filler or repetitive preamble. When delegating to multiple SDLC subagents, spawn them together in a single batch and synthesize their findings clearly."
 	if r.isSubagent {
-		sysPrompt = fmt.Sprintf("You are subagent %q (SPECIALIST WORKER). You MUST NOT mutate files directly (write_file, edit_file, and mutative shell commands are blocked by Tether Guard). Analyze the codebase using read_file/kb_search and return your proposed diff and findings to the Main Agent.", r.agentType)
+		sysPrompt = fmt.Sprintf(
+			"You are specialist subagent %q (READ-ONLY WORKER). "+
+				"Rules:\n"+
+				"1. Complete your analysis in at most 2-4 tool calls using kb_search or read_file. Do NOT over-explore or repeat searches.\n"+
+				"2. Never attempt to mutate files or run mutative shell commands.\n"+
+				"3. Be concise and structured (bullet points, key findings, and diff only if code changes were explicitly requested).\n"+
+				"4. You MUST end your response with the exact line:\nSTATUS: READY_FOR_REVIEW",
+			r.agentType,
+		)
 	}
 	if len(preInvOut.InjectSteps) > 0 && preInvOut.InjectSteps[0].EphemeralMessage != "" {
 		sysPrompt += "\n\n" + preInvOut.InjectSteps[0].EphemeralMessage
@@ -303,8 +336,19 @@ func (r *Runner) Run(ctx context.Context, prompt string) (string, error) {
 		messages = append(messages, chatMessage{Role: "user", Content: prompt})
 	}
 
+	subagentAllowedTools := map[string]bool{
+		"read_file":    true,
+		"kb_search":    true,
+		"kb_status":    true,
+		"session_load": true,
+		"todo_list":    true,
+		"run_command":  true,
+	}
 	var apiTools []openAITool
 	for _, t := range r.mcp.ListTools() {
+		if r.isSubagent && !subagentAllowedTools[t.Name] {
+			continue
+		}
 		apiTools = append(apiTools, openAITool{
 			Type: "function",
 			Function: openAIFunction{
@@ -336,16 +380,19 @@ func (r *Runner) Run(ctx context.Context, prompt string) (string, error) {
 
 	// 2. Agentic Tool-Execution Loop
 	for step := 0; step < r.cfg.MaxSteps; step++ {
+		r.steps = step + 1
 		messages = compactMessagesWithLimits(messages, keepTurns, maxRunes)
 		msg, err := r.callAPI(ctx, messages, apiTools)
 		if err != nil {
 			return "", err
 		}
 
-		if msg.ReasoningContent != "" {
+		// While streaming, reasoning and intermediate text were already delivered live
+		// through onDelta; printing them again would duplicate them in the transcript.
+		if msg.ReasoningContent != "" && r.onDelta == nil {
 			fmt.Fprintf(r.cfg.Out, "💭 [reasoning] %s\n", strings.TrimSpace(msg.ReasoningContent))
 		}
-		if len(msg.ToolCalls) > 0 && strings.TrimSpace(msg.Content) != "" {
+		if len(msg.ToolCalls) > 0 && strings.TrimSpace(msg.Content) != "" && r.onDelta == nil {
 			fmt.Fprintf(r.cfg.Out, "\n%s\n", strings.TrimSpace(msg.Content))
 		}
 		messages = append(messages, msg)
@@ -356,13 +403,41 @@ func (r *Runner) Run(ctx context.Context, prompt string) (string, error) {
 			return msg.Content, nil
 		}
 
+		// Execute parallel spawn_subagent calls concurrently when the model dispatches multiple subagents in one turn
+		allSubagents := len(msg.ToolCalls) > 1 && !r.isSubagent
 		for _, tc := range msg.ToolCalls {
-			resultText := r.executeGuardedTool(tc)
-			messages = append(messages, chatMessage{
-				Role:       "tool",
-				ToolCallID: tc.ID,
-				Content:    resultText,
-			})
+			if tc.Function.Name != "spawn_subagent" {
+				allSubagents = false
+				break
+			}
+		}
+		if allSubagents {
+			results := make([]string, len(msg.ToolCalls))
+			var wg sync.WaitGroup
+			for i, tc := range msg.ToolCalls {
+				wg.Add(1)
+				go func(idx int, call toolCall) {
+					defer wg.Done()
+					results[idx] = r.executeGuardedToolWithCtx(ctx, call)
+				}(i, tc)
+			}
+			wg.Wait()
+			for i, tc := range msg.ToolCalls {
+				messages = append(messages, chatMessage{
+					Role:       "tool",
+					ToolCallID: tc.ID,
+					Content:    results[i],
+				})
+			}
+		} else {
+			for _, tc := range msg.ToolCalls {
+				resultText := r.executeGuardedToolWithCtx(ctx, tc)
+				messages = append(messages, chatMessage{
+					Role:       "tool",
+					ToolCallID: tc.ID,
+					Content:    resultText,
+				})
+			}
 		}
 	}
 
@@ -391,11 +466,22 @@ func (r *Runner) compactionLimits() (int, int) {
 }
 
 func (r *Runner) executeGuardedTool(tc toolCall) string {
+	return r.executeGuardedToolWithCtx(context.Background(), tc)
+}
+
+func (r *Runner) executeGuardedToolWithCtx(parentCtx context.Context, tc toolCall) string {
 	var argMap map[string]interface{}
-	_ = json.Unmarshal([]byte(tc.Function.Arguments), &argMap)
+	rawArgs := strings.TrimSpace(tc.Function.Arguments)
+	if rawArgs != "" && rawArgs != "{}" {
+		if err := json.Unmarshal([]byte(rawArgs), &argMap); err != nil {
+			// DeepSeek API best practice: strictly validate tool call JSON before execution
+			// so hallucinated/truncated JSON is immediately reported back for self-correction.
+			return fmt.Sprintf("invalid tool arguments JSON for %s: %v. Please retry with valid JSON.", tc.Function.Name, err)
+		}
+	}
 
 	if tc.Function.Name == "spawn_subagent" && !r.isSubagent {
-		return r.runSubagent(argMap)
+		return r.runSubagentWithCtx(parentCtx, argMap)
 	}
 
 	hookIn := hooks.HookInput{
@@ -436,18 +522,46 @@ func (r *Runner) executeGuardedTool(tc toolCall) string {
 }
 
 func (r *Runner) runSubagent(args map[string]interface{}) string {
-	role, _ := args["role"].(string)
+	return r.runSubagentWithCtx(context.Background(), args)
+}
+
+func (r *Runner) runSubagentWithCtx(parentCtx context.Context, args map[string]interface{}) string {
+	roleArg, _ := args["role"].(string)
 	task, _ := args["task"].(string)
-	if role == "" {
-		role = "tether_architect"
-	}
 	if strings.TrimSpace(task) == "" {
 		return "invalid params: task is required for spawn_subagent"
 	}
 
-	fmt.Fprintf(r.cfg.Out, "\n🤖 [spawn_subagent:%s] Task: %s\n", role, task)
+	// A rejected role is returned to the model as an error rather than
+	// forwarded as agentType. An unvalidated role reaches HookInput.AgentType,
+	// where CheckIsSubagent treats any non-"main" value as a subagent -- the
+	// right verdict for the wrong reason, and a typo would silently become a
+	// new role.
+	role, roleErr := ValidateSubagentRole(roleArg)
+	if roleErr != nil {
+		return roleErr.Error()
+	}
+
+	// Recursion guard. A sub-runner inherits spawn_subagent, so without this a
+	// worker can spawn workers indefinitely and the only bound is the model.
+	if r.depth >= MaxSubagentDepth {
+		return fmt.Sprintf("spawn refused: subagent depth %d reached the limit of %d", r.depth, MaxSubagentDepth)
+	}
+
+	start := time.Now()
+	run := subagentRun{Role: role}
+	subID := r.emitSubagentStart(role, task)
+
+	// The worker's output goes to a buffer, not r.cfg.Out. Inheriting the
+	// terminal writer meant every tool call the worker made printed into the
+	// main session, burying the answer the user was waiting for. The buffer is
+	// dropped after the run: its only consumer would be a log command that does
+	// not exist yet, and keeping it would imply otherwise.
+	var workerLog bytes.Buffer
 	subCfg := r.cfg
-	subCfg.MaxSteps = 40
+	subCfg.Out = r.newSubagentTee(&workerLog, subID, role)
+	subCfg.MaxSteps = SubagentMaxSteps
+
 	subRunner := &Runner{
 		engine:     r.engine,
 		hooks:      r.hooks,
@@ -456,31 +570,88 @@ func (r *Runner) runSubagent(args map[string]interface{}) string {
 		client:     r.client,
 		agentType:  role,
 		isSubagent: true,
+		depth:      r.depth + 1,
 	}
 
-	ans, err := subRunner.Run(context.Background(), task)
+	// Derive from parentCtx so Esc/Ctrl+C in the TUI immediately cancels the active subagent.
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parentCtx, SubagentTimeout)
+	defer cancel()
+
+	var ans string
+	var err error
+	defer func() {
+		r.emitSubagentDone(subID, role, start, subRunner.steps, &run, ans)
+	}()
+	ui.RunWithSpinner(r.cfg.Out, fmt.Sprintf("🤖 %s working", role), func() {
+		ans, err = subRunner.Run(ctx, task)
+		run.Elapsed = time.Since(start)
+		run.Steps = subRunner.steps
+	})
+
 	if err != nil {
-		fmt.Fprintf(r.cfg.Out, "🤖 [subagent:%s error] %v\n", role, err)
+		// A timeout is worth naming: "context deadline exceeded" alone reads as
+		// a crash rather than as a limit that was configured on purpose.
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			err = fmt.Errorf("timed out after %s", SubagentTimeout)
+		}
+		run.Err = err
+		r.printRunSummary(run)
 		return fmt.Sprintf("subagent %s error: %v", role, err)
 	}
-	fmt.Fprintf(r.cfg.Out, "🤖 [subagent:%s completed] Returned proposal to Main Agent.\n\n", role)
+
 	_ = r.engine.AddContext(role, "plan", ans)
 
-	// Record the subagent's output as a proposal awaiting user approval. The
+	// Parse the status before recording anything. A report without a parseable
+	// STATUS is not a completed task: cc-sdd's rule is to re-dispatch once and
+	// then stop, never to fill the gap by inference.
+	status, statusErr := statusFromReport(ans)
+	if statusErr != nil {
+		// One silent re-dispatch asking for the block and nothing else.
+		retryTask := task + "\n\nReturn ONLY the structured status block at the end of your report. " +
+			"STATUS must be exactly one of: READY_FOR_REVIEW, BLOCKED, NEEDS_CONTEXT."
+		ans, err = subRunner.Run(ctx, retryTask)
+		run.Steps = subRunner.steps
+		run.Elapsed = time.Since(start)
+		if err == nil {
+			status, statusErr = statusFromReport(ans)
+		}
+	}
+
+	if statusErr != nil {
+		run.Status = core.StatusNeedsContext
+		run.Elapsed = time.Since(start)
+		r.printRunSummary(run)
+		return fmt.Sprintf(
+			"[Subagent %s — NO PARSEABLE STATUS]\n%s\n\n"+
+				"The worker did not return a STATUS field (READY_FOR_REVIEW | BLOCKED | NEEDS_CONTEXT), "+
+				"so its report cannot be treated as finished. Ask the user how to proceed rather than "+
+				"assuming the work is done.", role, ans)
+	}
+	run.Status = status
+
+	// Record the worker's output as a proposal awaiting user approval. The
 	// PreToolUse gate refuses any mutation until approve_proposal is called, so
 	// the "propose first, mutate later" rule is enforced rather than hoped for.
 	//
 	// Read-only analysis must NOT lock the workspace: a pure audit produces
 	// nothing to approve, so locking for it would block the user for no reason.
-	if !producesMutation(role, ans) {
-		fmt.Fprintf(r.cfg.Out, "🔓 [subagent:%s] analysis only — no proposal recorded, writes stay unlocked.\n\n", role)
+	// Only lock when the output actually contains an actionable diff/patch/proposal block.
+	if !producesMutation(role, ans) || !producesMutation("tether_qa", ans) {
+		run.Analysis = true
+		r.printRunSummary(run)
 		return fmt.Sprintf("[Subagent %s Report]:\n%s", role, ans)
 	}
 
 	proposalID, recErr := r.engine.RecordProposal(role, ans)
 	if recErr != nil {
-		fmt.Fprintf(r.cfg.Out, "⚠️  [subagent:%s] could not record proposal: %v\n", role, recErr)
+		run.Err = recErr
+		r.printRunSummary(run)
 	} else {
+		run.Proposal = proposalID
+		r.printRunSummary(run)
 		r.printApprovalRequired(proposalID, role, ans)
 	}
 
@@ -564,11 +735,39 @@ func clipLines(s string, max int) []string {
 }
 
 func (r *Runner) callAPI(ctx context.Context, messages []chatMessage, tools []openAITool) (chatMessage, error) {
-	reqBody, _ := json.Marshal(map[string]interface{}{
+	payload := map[string]interface{}{
 		"model":    r.cfg.Model,
 		"messages": messages,
-		"tools":    tools,
-	})
+	}
+	// DeepSeek API spec: omit "tools" completely when empty (sending "tools": null or [] is discouraged)
+	if len(tools) > 0 {
+		payload["tools"] = tools
+	}
+
+	// DeepSeek API Parameter Optimization:
+	// - In Thinking Mode (deepseek-reasoner), temperature/top_p/penalties are unsupported and ignored,
+	//   while max_tokens should be generous (8192) so CoT + tool call JSON never truncates.
+	// - In Non-Thinking Mode (deepseek-chat), temperature=0.0 is recommended by DeepSeek for
+	//   deterministic coding & function calling.
+	modelLower := strings.ToLower(r.cfg.Model)
+	isReasoner := strings.Contains(modelLower, "reasoner") || strings.Contains(modelLower, "r1")
+	if strings.EqualFold(r.cfg.Provider, "deepseek") {
+		if isReasoner {
+			payload["max_tokens"] = 8192
+		} else {
+			payload["temperature"] = 0.0
+			payload["max_tokens"] = 4096
+		}
+	}
+
+	// Live token streaming (SSE): used only when a delta consumer is attached.
+	if r.onDelta != nil {
+		payload["stream"] = true
+		payload["stream_options"] = map[string]interface{}{"include_usage": true}
+		return r.streamRequest(ctx, payload)
+	}
+
+	reqBody, _ := json.Marshal(payload)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.cfg.BaseURL, bytes.NewReader(reqBody))
 	if err != nil {
@@ -594,9 +793,24 @@ func (r *Runner) callAPI(ctx context.Context, messages []chatMessage, tools []op
 		Choices []struct {
 			Message chatMessage `json:"message"`
 		} `json:"choices"`
+		Usage struct {
+			PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens"`
+			PromptCacheMissTokens int `json:"prompt_cache_miss_tokens"`
+			PromptTokensDetails   struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
+		} `json:"usage"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil || len(parsed.Choices) == 0 {
 		return chatMessage{}, fmt.Errorf("invalid API response: %s", string(body))
+	}
+	hit := parsed.Usage.PromptCacheHitTokens
+	if hit == 0 {
+		hit = parsed.Usage.PromptTokensDetails.CachedTokens
+	}
+	if hit > 0 || parsed.Usage.PromptCacheMissTokens > 0 {
+		r.lastCacheHitTokens = hit
+		r.lastCacheMissTokens = parsed.Usage.PromptCacheMissTokens
 	}
 	return parsed.Choices[0].Message, nil
 }
@@ -610,8 +824,20 @@ func mustJSONReader(v interface{}) io.Reader {
 func (r *Runner) RunInteractive(ctx context.Context, in io.Reader) error {
 	scanner := bufio.NewScanner(in)
 
+	// Connect the approval gate to this terminal. Without it a blocked write is
+	// only a message to the model, and the user is never asked. Hook and
+	// JSON-RPC entry points never reach this line, so they keep the
+	// refuse-with-instructions behaviour.
+	r.mcp.SetAutoApprovePolicy(r.DefaultAutoApprovePolicy())
+	r.mcp.SetAskPolicy(newAsker(r.cfg.Out, scanner))
+
 	fmt.Fprintf(r.cfg.Out, "⚓ Tether Interactive Agent (%s / %s | mode: %s)\n", r.cfg.Provider, r.cfg.Model, r.engine.GetMode())
-	fmt.Fprintf(r.cfg.Out, "Commands: /plan, /code, /model <name>, /provider <name>, /key <api_key>, /status, /exit\n\n")
+	// Derived from the registry, not typed by hand. The hand-written line that
+	// used to sit here had already drifted: it advertised /plan, /code, /model,
+	// /provider, /key, /status and /exit, and omitted /quit, /clear and /undo,
+	// all of which the REPL handled.
+	fmt.Fprintf(r.cfg.Out, "Commands: %s\n", commandNameList())
+	fmt.Fprintf(r.cfg.Out, "Type %s for the menu, %s for the full table.\n\n", ui.Dim("/"), ui.Dim("/help"))
 
 	if r.cfg.Provider != "ollama" && r.cfg.APIKey == "" {
 		fmt.Fprintf(r.cfg.Out, "🔑 Enter %s API Key (saved to ~/.config/tether/credentials.json): ", r.cfg.Provider)
@@ -641,72 +867,42 @@ func (r *Runner) RunInteractive(ctx context.Context, in io.Reader) error {
 		}
 
 		if strings.HasPrefix(line, "/") {
-			parts := strings.Fields(line)
-			switch parts[0] {
-			case "/exit", "/quit":
-				return nil
-			case "/plan":
-				_ = r.engine.SetMode("plan")
-				fmt.Fprintln(r.cfg.Out, "🔵 Switched to PLAN mode (codebase writes locked).")
-				continue
-			case "/code":
-				_ = r.engine.SetMode("code")
-				fmt.Fprintln(r.cfg.Out, "🟢 Switched to CODE mode (codebase writes unlocked).")
-				continue
-			case "/model":
-				if len(parts) >= 2 {
-					r.cfg.Model = parts[1]
-					_ = r.engine.SetProjectSetting("model", r.cfg.Model)
-					fmt.Fprintf(r.cfg.Out, "✓ Model set to %s\n", r.cfg.Model)
+			// A bare "/" opens the command menu instead of being an unknown
+			// command: users type "/" to look things up, and answering that
+			// with "unknown command" teaches them nothing. Picking a number
+			// runs the command through the same registry as typing its name,
+			// so the two paths cannot diverge.
+			if line == "/" {
+				if chosen, ok := chooseCommand(r.cfg.Out, scanner); ok {
+					line = "/" + chosen
 				} else {
-					fmt.Fprintf(r.cfg.Out, "Current model: %s (e.g. /model deepseek-reasoner or /model deepseek-chat)\n", r.cfg.Model)
+					continue
 				}
-				continue
-			case "/provider":
-				if len(parts) >= 2 {
-					p := strings.ToLower(parts[1])
-					r.cfg.Provider = p
-					if preset, ok := presets[p]; ok {
-						r.cfg.BaseURL = preset.BaseURL
-						r.cfg.Model = preset.DefaultModel
-					}
-					r.cfg.APIKey = loadSavedKey(p)
-					_ = r.engine.SetProjectSetting("provider", p)
-					fmt.Fprintf(r.cfg.Out, "✓ Provider set to %s (%s)\n", r.cfg.Provider, r.cfg.Model)
-				}
-				continue
-			case "/key":
-				if len(parts) >= 2 {
-					r.cfg.APIKey = parts[1]
-					_ = SaveAPIKey(r.cfg.Provider, r.cfg.APIKey)
-					fmt.Fprintf(r.cfg.Out, "✓ API key saved for %s\n", r.cfg.Provider)
-				}
-				continue
-			case "/status":
-				kbStats, _ := r.engine.KBStatus()
-				fmt.Fprintf(r.cfg.Out, "Workspace: %s | Session: %s | Mode: %s | KB: %d files | Provider: %s (%s)\n",
-					r.engine.Workspace, r.engine.SessionID, r.engine.GetMode(), kbStats.TotalFiles, r.cfg.Provider, r.cfg.Model)
-				continue
-			case "/clear":
-				r.history = nil
-				fmt.Fprintln(r.cfg.Out, "✓ Conversation history cleared (substrate memory in session.db retained).")
-				continue
-			case "/undo":
-				turn := ""
-				if len(parts) >= 2 {
-					turn = parts[1]
-				}
-				r.undo(turn)
-				continue
 			}
-		}
 
-		ans, err := r.Run(ctx, line)
-		if err != nil {
-			fmt.Fprintf(r.cfg.Out, "✖ %v\n\n", err)
+			done, known := dispatchCommand(r, line)
+			if done {
+				return nil
+			}
+			if !known {
+				fmt.Fprintf(r.cfg.Out, "✖ unknown command %q. Type / for the menu, or /help.\n", strings.Fields(line)[0])
+			}
 			continue
 		}
-		fmt.Fprintf(r.cfg.Out, "\n%s\n\n", ans)
+
+		// Print the answer first, then the mark that closes it. On failure the
+		// error is the answer, and the mark still follows so the outcome is
+		// never left implicit.
+		res := runTurn(r, ctx, line)
+		if res.panicMsg != nil {
+			fmt.Fprintf(r.cfg.Out, "✖ panic: %v\n", res.panicMsg)
+		}
+		if res.err != nil {
+			fmt.Fprintf(r.cfg.Out, "✖ %v\n", res.err)
+		} else {
+			fmt.Fprintf(r.cfg.Out, "\n%s\n", res.answer)
+		}
+		fmt.Fprintf(r.cfg.Out, "%s\n\n", DoneRule(res.outcome, res.elapsed))
 	}
 }
 
@@ -715,10 +911,10 @@ func compactMessages(messages []chatMessage) []chatMessage {
 }
 
 // compactMessagesWithLimits implements surgical turn-aware context management:
-// - Keeps system prompt (idx 0), user prompt (idx 1), and the last keepAssistantTurns full turns
-//   (including all parallel tool responses in those turns) at 100% fidelity.
-// - For older turns outside the active window: strips stale reasoning_content and compacts
-//   large tool outputs (>maxStaleToolRunes) using UTF-8 rune-safe head+tail summarization.
+//   - Keeps system prompt (idx 0), user prompt (idx 1), and the last keepAssistantTurns full turns
+//     (including all parallel tool responses in those turns) at 100% fidelity.
+//   - For older turns outside the active window: strips stale reasoning_content and compacts
+//     large tool outputs (>maxStaleToolRunes) using UTF-8 rune-safe head+tail summarization.
 func compactMessagesWithLimits(messages []chatMessage, keepAssistantTurns, maxStaleToolRunes int) []chatMessage {
 
 	cutoff := len(messages)
@@ -739,9 +935,24 @@ func compactMessagesWithLimits(messages []chatMessage, keepAssistantTurns, maxSt
 	out := make([]chatMessage, len(messages))
 	copy(out, messages)
 
+	// Find the index of the latest user turn. Per DeepSeek API specification for
+	// Thinking Mode + Tool Calls, every assistant message with tool_calls inside
+	// the active user turn MUST retain its reasoning_content, whereas older
+	// completed user turns (or non-tool assistant messages outside the window)
+	// should have reasoning_content stripped.
+	lastUserIdx := 1
+	for i := len(out) - 1; i >= 1; i-- {
+		if out[i].Role == "user" {
+			lastUserIdx = i
+			break
+		}
+	}
+
 	for i := 2; i < cutoff; i++ {
 		if out[i].Role == "assistant" && out[i].ReasoningContent != "" {
-			out[i].ReasoningContent = ""
+			if i < lastUserIdx || len(out[i].ToolCalls) == 0 {
+				out[i].ReasoningContent = ""
+			}
 		}
 		if out[i].Role == "tool" && !strings.Contains(out[i].Content, "[compacted ") {
 			runes := []rune(out[i].Content)

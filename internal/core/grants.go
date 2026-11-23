@@ -286,6 +286,12 @@ func scopeCoversPath(scope, p string) bool {
 	if scope == "" || scope == "." {
 		return true
 	}
+	// Both sides must be cleaned. Cleaning only the scope let a caller walk
+	// out of a grant with a relative segment: scope "internal/hooks" matched
+	// "internal/hooks/../core/x.go" by prefix, even though that path resolves
+	// to internal/core, a package the grant never covered. The boundary check
+	// in handoff.go shares this function, so a leak here widened both.
+	p = filepath.ToSlash(filepath.Clean(p))
 	if scope == p {
 		return true
 	}

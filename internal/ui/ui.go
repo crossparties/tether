@@ -94,6 +94,11 @@ func SetEnabled(v bool) {
 	override = &v
 }
 
+// ClearLine returns the sequence that erases the current line and returns the
+// cursor to column zero. It is emitted by the spinner, which owns exactly one
+// line and is never allowed to touch another.
+func ClearLine() string { return "\033[2K\r" }
+
 // ClearOverride drops a SetEnabled override and re-detects.
 func ClearOverride() {
 	mu.Lock()

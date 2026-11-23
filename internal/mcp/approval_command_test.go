@@ -154,21 +154,24 @@ func TestBlockMessageDistinguishesCommandFromFile(t *testing.T) {
 // arguments, which would make "all" meaningless.
 func TestCommandPrefixSuggestion(t *testing.T) {
 	cases := map[string]string{
-		"go test ./...":     "go test",
-		"git commit -m x":   "git commit",
-		"make":              "make",
-		"npm run build":     "npm run",
+		"go test ./...":       "go test",
+		"git commit -m x":     "git commit",
+		"make":                "make",
+		"npm run build":       "npm run",
 		"rm -rf node_modules": "rm",
 		// Binaries that take a positional argument, not a subcommand. Widening
 		// these to two words yields a prefix that matches nothing else.
-		"echo first":  "echo",
-		"echo hello":  "echo",
-		"cat a.txt":   "cat",
+		"echo first":   "echo",
+		"echo hello":   "echo",
+		"cat a.txt":    "cat",
 		"grep -rn x .": "grep",
 		// Subcommand tools still widen.
-		"go build ./...":  "go build",
-		"docker ps -a":    "docker ps",
-		"cargo test":      "cargo test",
+		"go build ./...": "go build",
+		"docker ps -a":   "docker ps",
+		"cargo test":     "cargo test",
+		// Leading cd / env prefixes preserve the actual verb instead of bare "cd".
+		"cd sub && python3 app.py": "cd sub && python3",
+		"cd /app && rm -rf build":  "cd /app && rm",
 	}
 	for cmd, want := range cases {
 		if got := commandPrefix(cmd); got != want {

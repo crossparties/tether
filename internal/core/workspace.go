@@ -40,11 +40,11 @@ func DetectProjectSettings(workspace string) map[string]string {
 
 	// Detect by config files
 	detectors := []struct {
-		file      string
-		key       string
-		value     string
-		buildCmd  string
-		testCmd   string
+		file     string
+		key      string
+		value    string
+		buildCmd string
+		testCmd  string
 	}{
 		{"go.mod", "tech_stack", "go", "go build ./...", "go test ./..."},
 		{"Cargo.toml", "tech_stack", "rust", "cargo build", "cargo test"},

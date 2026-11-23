@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/croosparties/tether/internal/core"
 	"github.com/croosparties/tether/internal/preview"
 	"github.com/croosparties/tether/internal/ui"
 )
@@ -141,13 +142,20 @@ func (s *Server) requireApproval(tool string, args json.RawMessage) string {
 		return ""
 	}
 
+	if s.approvesAll() {
+		return ""
+	}
+
 	// Shell commands are authorized by command grants, never by path grants:
 	// saying "you may write in ./internal" must not imply "you may run rm there".
 	if m.command != "" {
 		if ok, err := s.engine.HasCommandGrant(m.command); err == nil && ok {
 			return ""
 		}
-		return s.approvalRequest(m)
+		if auto := s.AutoApprovePolicy(); auto != nil && auto(m.decision()) {
+			return ""
+		}
+		return s.gate(m)
 	}
 
 	if m.scope != "" {
@@ -156,7 +164,106 @@ func (s *Server) requireApproval(tool string, args json.RawMessage) string {
 		}
 	}
 
+	if auto := s.AutoApprovePolicy(); auto != nil && auto(m.decision()) {
+		return ""
+	}
+
+	return s.gate(m)
+}
+
+// gate turns a blocked mutation into a decision. When an interactive asker is
+// attached the user is asked directly and the verdict is stored as a grant, so
+// the corrected tool call passes on the retry that follows. Without an asker --
+// JSON-RPC, hooks, any non-interactive caller -- the request is refused with the
+// instructions it always carried, because there is nobody to ask.
+func (s *Server) gate(m *mutation) string {
+	if s.approvesAll() {
+		// The user chose "approve everything": apply without asking.
+		return ""
+	}
+	if ask := s.AskPolicy(); ask != nil {
+		if v, ok := ask(m.decision()); ok {
+			return s.applyVerdict(m, v)
+		}
+		return "Rejected by the user. Nothing was written. Do not retry the same change; " +
+			"ask the user what they would prefer instead."
+	}
 	return s.approvalRequest(m)
+}
+
+// approvesAll reports whether the user granted blanket approval for the session.
+func (s *Server) approvesAll() bool {
+	s.askMu.Lock()
+	defer s.askMu.Unlock()
+	return s.approveAll
+}
+
+// decision describes a blocked mutation to the interactive asker. It is inert
+// data: rendering and choice live in the caller so this package stays free of
+// terminal concerns.
+func (m *mutation) decision() Decision {
+	label := m.scope
+	if m.command != "" {
+		label = m.command
+	}
+	return Decision{
+		Tool:        m.tool,
+		Command:     m.command,
+		Path:        m.scope,
+		Label:       label,
+		Preview:     m.change.Render(),
+		FullPreview: m.change.RenderFull(),
+	}
+}
+
+// applyVerdict records the user's answer as a grant and explains it in the
+// tool result, so the model knows the retry will go through.
+func (s *Server) applyVerdict(m *mutation, v Verdict) string {
+	switch v {
+	case VerdictSession:
+		// Blanket approval lives on the server, not in the asker: the real asker
+		// stays installed so a later SetAskPolicy(nil) still restores the
+		// non-interactive contract for machine callers.
+		s.askMu.Lock()
+		s.approveAll = true
+		s.askMu.Unlock()
+		return "Approved for the rest of this session. Every change will be applied without asking.\n" +
+			"Repeat the original tool call to apply this change."
+	case VerdictFolder:
+		if m.command != "" {
+			prefix := commandPrefix(m.command)
+			if err := s.engine.AddCommandGrant(prefix, true); err != nil {
+				return fmt.Sprintf("error recording approval: %v", err)
+			}
+			return fmt.Sprintf("Approved: every command starting with %q is allowed until %s.\nRepeat the original tool call to run it.",
+				prefix, core.GrantExpiryHint())
+		}
+		dir := path.Dir(m.scope)
+		if dir == "." || dir == "/" {
+			dir = m.scope
+		}
+		if err := s.engine.AddApprovalGrant(dir, "path"); err != nil {
+			return fmt.Sprintf("error recording approval: %v", err)
+		}
+		return fmt.Sprintf("Approved: all changes under %q are allowed until %s (session-scoped).\nRepeat the original tool call to apply this change.",
+			dir, core.GrantExpiryHint())
+	case VerdictReject:
+		return "Rejected by the user. Nothing was written. Do not retry the same change; " +
+			"ask the user what they would prefer instead."
+	default: // VerdictOnce
+		if m.command != "" {
+			if err := s.engine.AddCommandGrant(m.command, false); err != nil {
+				return fmt.Sprintf("error recording approval: %v", err)
+			}
+			return fmt.Sprintf("Approved: %q may run until %s.\nRepeat the original tool call to run it.",
+				m.command, core.GrantExpiryHint())
+		}
+		if err := s.engine.AddApprovalGrant(m.scope, "path"); err != nil {
+			return fmt.Sprintf("error recording approval: %v", err)
+		}
+		return fmt.Sprintf("Approved: %q for this path until %s.\nRepeat the original tool call to apply the change.",
+			m.scope, core.GrantExpiryHint())
+	}
 }
 
 // approvalTag identifies one approval request so a reader can tell a fresh
@@ -264,30 +371,64 @@ func approvalRule(label string) string {
 	return ui.Warn(ui.Rule(label))
 }
 
-// commandPrefix picks the token run a prefix grant should cover. Offering the
+// CommandPrefix picks the token run a prefix grant should cover. Offering the
 // full command would make "allow every X command" identical to "once", so the
 // suggestion keeps the leading command words and drops the arguments:
 //
 //	"go test ./..."        -> "go test"
 //	"git commit -m 'x'"    -> "git commit"
 //	"make"                 -> "make"
+//	"cd sub && rm -rf out" -> "cd sub && rm"
 //
 // It stops at the first argument-looking token so a grant never silently widens
 // to an entire binary the user did not mean to trust.
-func commandPrefix(cmd string) string {
-	fields := strings.Fields(strings.TrimSpace(cmd))
-	if len(fields) == 0 {
+func CommandPrefix(cmd string) string {
+	trimmed := strings.TrimSpace(cmd)
+	if trimmed == "" {
 		return ""
 	}
+	var prefixTokens []string
+	rest := trimmed
+	if strings.HasPrefix(rest, "cd ") || strings.HasPrefix(rest, "cd\t") {
+		if idx := strings.Index(rest, "&&"); idx > 0 {
+			cdPart := strings.TrimSpace(rest[:idx])
+			cdFields := strings.Fields(cdPart)
+			if len(cdFields) >= 1 && len(cdFields) <= 2 && cdFields[0] == "cd" {
+				prefixTokens = append(prefixTokens, strings.Join(cdFields, " "), "&&")
+				rest = strings.TrimSpace(rest[idx+2:])
+			}
+		}
+	}
+	fields := strings.Fields(rest)
+	if len(fields) == 0 {
+		if len(prefixTokens) > 0 {
+			return trimmed
+		}
+		return ""
+	}
+	i := 0
+	for i < len(fields) && strings.Contains(fields[i], "=") && !strings.HasPrefix(fields[i], "=") && !strings.HasPrefix(fields[i], "-") {
+		prefixTokens = append(prefixTokens, fields[i])
+		i++
+	}
+	if i >= len(fields) {
+		return trimmed
+	}
+	cmdFields := fields[i:]
 	keep := 1
 	// Only widen to a subcommand when the binary actually takes one. "echo
 	// first" must grant "echo", not "echo first": a prefix of "echo first"
 	// matches that one line and nothing else, so the user would approve a
 	// grant that never fires again.
-	if len(fields) > 1 && takesSubcommand(fields[0]) && !looksLikeArg(fields[1]) {
+	if len(cmdFields) > 1 && takesSubcommand(filepath.Base(cmdFields[0])) && !looksLikeArg(cmdFields[1]) {
 		keep = 2
 	}
-	return strings.Join(fields[:keep], " ")
+	prefixTokens = append(prefixTokens, cmdFields[:keep]...)
+	return strings.Join(prefixTokens, " ")
+}
+
+func commandPrefix(cmd string) string {
+	return CommandPrefix(cmd)
 }
 
 // takesSubcommand reports whether name is a tool whose second bare word is a

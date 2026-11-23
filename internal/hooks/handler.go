@@ -6,9 +6,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/croosparties/tether/internal/core"
+	"github.com/croosparties/tether/internal/safety"
 	"github.com/croosparties/tether/internal/snapshot"
 )
 
@@ -125,7 +127,6 @@ func (h *HookInput) Normalized() (toolName, command, filePath string) {
 	return
 }
 
-
 // HookOutput is the JSON response returned to the agent
 type HookOutput struct {
 	Decision    string       `json:"decision,omitempty"` // allow | deny | ask
@@ -207,38 +208,48 @@ func (h *Handler) handlePreInvocation(input HookInput) HookOutput {
 	patterns, _ := h.engine.InjectPatterns(injectPatternLimit)
 	summary, _ := h.engine.GetSessionSummary()
 
+	// DeepSeek Context Caching Optimization (Prefix Stability):
+	// Place static protocol instructions and deterministically sorted project settings
+	// at the very beginning of the system prompt so 64-token prefix blocks stay cached
+	// across turns and tool-loop steps. Keep dynamic recent context at the end.
 	context := "## Tether Context (auto-injected)\n"
 	context += fmt.Sprintf("- Workspace: %s\n", h.engine.Workspace)
 	context += fmt.Sprintf("- Session: %s\n", h.engine.SessionID)
 	context += fmt.Sprintf("- Mode: %s (writes %s)\n", h.engine.GetMode(),
 		map[bool]string{true: "allowed", false: "BLOCKED"}[h.engine.IsWriteAllowed()])
 
-	if summary != "" {
-		context += fmt.Sprintf("- Session summary: %s\n", summary)
-	}
+	context += "\n### ⚠️ TETHER SUBSTRATE MEMORY PROTOCOL\n"
+	context += "- NEVER use python3/bash scripts to query or edit session.db.\n"
+	context += "- ALWAYS use Tether MCP tools (`sql_query`, `session_load`, `session_save`, `todo_*`) or inspect auto-injected context above.\n"
 
-	recent, _ := h.engine.GetRecentContext(50)
-	var meaningful []core.ContextEntry
-	for _, entry := range recent {
-		if entry.Role != "tool_use" {
-			meaningful = append(meaningful, entry)
-			if len(meaningful) >= 6 {
-				break
+	// Subagent Governance Protocol: Specialist workers propose changes, Main Agent requests user approval
+	context += "\n### ⚠️ SUBAGENT GOVERNANCE & APPROVAL PROTOCOL (MANDATORY)\n"
+	context += "- Subagents are SPECIALIST WORKERS: analyze, research, and compose proposed changes.\n"
+	context += "- Subagents MUST NOT mutate the codebase or run destructive commands directly.\n"
+	context += "- Subagents MUST return their proposed diff/commands in a message to the Main Agent.\n"
+	context += "- The Main Agent presents the proposal to the user in the main chat for approval.\n"
+	context += "- Only after user approval in the main session are the mutations executed.\n"
+
+	if len(settings) > 0 {
+		var keys []string
+		for k := range settings {
+			// Skip volatile per-turn timestamp so DeepSeek prefix cache is not invalidated every turn
+			if k == "current_turn" {
+				continue
+			}
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		if len(keys) > 0 {
+			context += "\n### Project Settings\n"
+			for _, k := range keys {
+				context += fmt.Sprintf("- %s: %s\n", k, truncate(settings[k], 240))
 			}
 		}
 	}
-	if len(meaningful) > 0 {
-		context += "\n### Recent Session Context\n"
-		for _, entry := range meaningful {
-			context += fmt.Sprintf("- [%s/%s] %s\n", entry.Agent, entry.Role, truncate(entry.Content, 300))
-		}
-	}
 
-	if len(settings) > 0 {
-		context += "\n### Project Settings\n"
-		for k, v := range settings {
-			context += fmt.Sprintf("- %s: %s\n", k, truncate(v, 240))
-		}
+	if summary != "" {
+		context += fmt.Sprintf("- Session summary: %s\n", summary)
 	}
 
 	if len(decisions) > 0 {
@@ -264,10 +275,22 @@ func (h *Handler) handlePreInvocation(input HookInput) HookOutput {
 		}
 	}
 
-	context += "\n### ⚠️ TETHER SUBSTRATE MEMORY PROTOCOL\n"
-	context += "- NEVER use python3/bash scripts to query or edit session.db.\n"
-	context += "- ALWAYS use Tether MCP tools (`sql_query`, `session_load`, `session_save`, `todo_*`) or inspect auto-injected context above.\n"
-
+	recent, _ := h.engine.GetRecentContext(50)
+	var meaningful []core.ContextEntry
+	for _, entry := range recent {
+		if entry.Role != "tool_use" {
+			meaningful = append(meaningful, entry)
+			if len(meaningful) >= 6 {
+				break
+			}
+		}
+	}
+	if len(meaningful) > 0 {
+		context += "\n### Recent Session Context\n"
+		for _, entry := range meaningful {
+			context += fmt.Sprintf("- [%s/%s] %s\n", entry.Agent, entry.Role, truncate(entry.Content, 300))
+		}
+	}
 
 	if input.Prompt != "" {
 		mode := core.ClassifyTask(input.Prompt)
@@ -296,14 +319,6 @@ func (h *Handler) handlePreInvocation(input HookInput) HookOutput {
 		context += "- Present plan inline in response.\n"
 		context += "- Run 'tether mode code' or call MCP mode_set(mode=\"code\") when ready to implement.\n"
 	}
-
-	// Subagent Governance Protocol: Specialist workers propose changes, Main Agent requests user approval
-	context += "\n### ⚠️ SUBAGENT GOVERNANCE & APPROVAL PROTOCOL (MANDATORY)\n"
-	context += "- Subagents are SPECIALIST WORKERS: analyze, research, and compose proposed changes.\n"
-	context += "- Subagents MUST NOT mutate the codebase or run destructive commands directly.\n"
-	context += "- Subagents MUST return their proposed diff/commands in a message to the Main Agent.\n"
-	context += "- The Main Agent presents the proposal to the user in the main chat for approval.\n"
-	context += "- Only after user approval in the main session are the mutations executed.\n"
 
 	// Anti-Pipe Deadlock: Hard cap at 16KB
 	if len(context) > 16384 {
@@ -357,16 +372,21 @@ func (h *Handler) handlePreToolUse(input HookInput) HookOutput {
 		// State-mutating tools that are not file writes but still change the
 		// substrate. Leaving them open would let a gated agent write "sideways":
 		// recording a decision or doctoring todos instead of waiting.
+		// The proposal-control tools are NOT in this list on purpose. They used
+		// to be, and that deadlocked the gate: approve_proposal and
+		// reject_proposal are the only way out of the pending state, so gating
+		// them on "a proposal is pending" made that state permanent. The first
+		// subagent proposal locked the session until the row was resolved by
+		// hand from another entry point. They are the exit, not a sideways path
+		// around it.
 		stateTools := map[string]bool{
-			"session_save":    true,
-			"setting_set":     true,
-			"decision_add":    true,
-			"pattern_add":     true,
-			"todo_add":        true,
-			"todo_complete":   true,
-			"todo_remove":     true,
-			"approve_proposal": true,
-			"reject_proposal":  true,
+			"session_save":  true,
+			"setting_set":   true,
+			"decision_add":  true,
+			"pattern_add":   true,
+			"todo_add":      true,
+			"todo_complete": true,
+			"todo_remove":   true,
 		}
 
 		blocked := writeTools[toolName] || stateTools[toolName]
@@ -383,15 +403,19 @@ func (h *Handler) handlePreToolUse(input HookInput) HookOutput {
 		}
 
 		if !blocked && (toolName == "run_command" || toolName == "bash") {
-			sanitized := sanitizeRedirections(strings.ToLower(command))
-			for _, sig := range []string{
-				">", ">>", "sed -i", "rm ", "mv ", "cp ", "tee ", "chmod ", "chown ",
-				"mkdir ", "touch ", "truncate ", "dd ", "git checkout", "git reset",
-				"git push", "git apply", "go generate", "make ", "npm install", "pip install",
-			} {
-				if strings.Contains(sanitized, sig) {
-					blocked = true
-					break
+			if okRO, _ := safety.IsReadOnlyCommand(command); !okRO {
+				if okVal, _ := safety.IsValidationCommand(command); !okVal {
+					sanitized := sanitizeRedirections(strings.ToLower(command))
+					for _, sig := range []string{
+						">", ">>", "sed -i", "rm ", "mv ", "cp ", "tee ", "chmod ", "chown ",
+						"mkdir ", "touch ", "truncate ", "dd ", "git checkout", "git reset",
+						"git push", "git apply", "go generate", "make ", "npm install", "pip install",
+					} {
+						if strings.Contains(sanitized, sig) {
+							blocked = true
+							break
+						}
+					}
 				}
 			}
 		}
@@ -415,39 +439,20 @@ func (h *Handler) handlePreToolUse(input HookInput) HookOutput {
 		}
 	}
 
-	// 3. Subagent Gating: Subagents must NOT mutate codebase or run mutative commands directly.
-	// They must propose changes to the Main Agent so the user can approve in the main session.
+	// 3. Subagent Gating.
+	//
+	// This used to fall through to "allow" for every tool it did not recognise,
+	// which made the guard a denylist in disguise: a new MCP tool inherited
+	// permission without anyone deciding it should. checkSubagentAccess is an
+	// allowlist -- reads, read-only queries, and validation commands only -- and
+	// it denies commits even when the parent passes them in a subset. See
+	// subagent_access.go for the source this follows.
 	if isSubagent {
-		writeTools := map[string]bool{
-			"write_to_file":              true,
-			"write_file":                 true,
-			"edit_file":                  true,
-			"replace_file_content":       true,
-			"multi_replace_file_content": true,
+		var subagentArgs map[string]interface{}
+		if tc := input.toolCallValue(); tc != nil {
+			subagentArgs = tc.Args
 		}
-
-		if writeTools[toolName] {
-			return HookOutput{
-				Decision: "deny",
-				Reason:   "Tether Guard: Subagents cannot mutate codebase directly without user approval. Send your proposed diff/patch to the Main Agent. The Main Agent will present it to the user for approval in the main session before execution.",
-			}
-		}
-
-		if toolName == "run_command" || toolName == "bash" {
-			sanitized := sanitizeRedirections(strings.ToLower(command))
-			mutativeSignals := []string{">", ">>", "sed -i", "rm ", "mv ", "git checkout", "git reset", "git push", "mkdir "}
-			for _, sig := range mutativeSignals {
-				if strings.Contains(sanitized, sig) {
-					return HookOutput{
-						Decision: "deny",
-						Reason:   fmt.Sprintf("Tether Guard: Subagent shell mutation '%s' requires user approval. Send your proposed command to the Main Agent for approval in the main session.", sig),
-					}
-				}
-			}
-		}
-
-		// Read tools and MCP tools are allowed for subagents
-		return HookOutput{Decision: "allow", Reason: "Subagent read/query action allowed"}
+		return checkSubagentAccess(toolName, command, subagentArgs)
 	}
 
 	// 3. Main Agent: Planning Mode Gating
@@ -484,13 +489,17 @@ func (h *Handler) handlePreToolUse(input HookInput) HookOutput {
 
 		// Shell mutative command risk tiering
 		if toolName == "run_command" || toolName == "bash" {
-			sanitized := sanitizeRedirections(strings.ToLower(command))
-			mutativeSignals := []string{">", ">>", "sed -i", "rm ", "mv ", "git checkout", "git reset", "git push"}
-			for _, sig := range mutativeSignals {
-				if strings.Contains(sanitized, sig) {
-					return HookOutput{
-						Decision: "deny",
-						Reason:   fmt.Sprintf("Tether Guard: Mutative shell operation '%s' blocked in PLAN mode. Allowed: write plans to docs/. To unlock: run 'tether mode code' or call MCP mode_set(mode=\"code\").", sig),
+			if okRO, _ := safety.IsReadOnlyCommand(command); !okRO {
+				if okVal, _ := safety.IsValidationCommand(command); !okVal {
+					sanitized := sanitizeRedirections(strings.ToLower(command))
+					mutativeSignals := []string{">", ">>", "sed -i", "rm ", "mv ", "git checkout", "git reset", "git push"}
+					for _, sig := range mutativeSignals {
+						if strings.Contains(sanitized, sig) {
+							return HookOutput{
+								Decision: "deny",
+								Reason:   fmt.Sprintf("Tether Guard: Mutative shell operation '%s' blocked in PLAN mode. Allowed: write plans to docs/. To unlock: run 'tether mode code' or call MCP mode_set(mode=\"code\").", sig),
+							}
+						}
 					}
 				}
 			}
@@ -507,7 +516,7 @@ func (h *Handler) handlePreToolUse(input HookInput) HookOutput {
 }
 
 func sanitizeRedirections(cmd string) string {
-	for _, r := range []string{"2>&1", ">/dev/null", "> /dev/null"} {
+	for _, r := range []string{"2>&1", "2>/dev/null", "2> /dev/null", "1>/dev/null", "1> /dev/null", ">/dev/null", "> /dev/null"} {
 		cmd = strings.ReplaceAll(cmd, r, "")
 	}
 	return cmd
@@ -545,7 +554,6 @@ func (h *Handler) handlePostToolUse(input HookInput) HookOutput {
 
 	return HookOutput{}
 }
-
 
 // writeToolNames are the tools that overwrite a single known file. sql_query,
 // session_save and the todo tools mutate state but have no single file to

@@ -1,10 +1,10 @@
 # Portfolio: Tether — The Deterministic Cognitive Substrate
 
 > **Apple Developer Academy Portfolio Showcase**  
-> **Project**: Tether (`github.com/croosparties/tether`)  
+> **Project**: Tether (`github.com/crossparties/tether`)  
 > **Domain**: Developer Tools / Autonomous AI Systems / Systems Engineering  
 > **Tech Stack**: Go (1.23+), Embedded SQLite (FTS5 BM25, WAL Mode), Model Context Protocol (MCP stdio JSON-RPC 2.0), OS Lifecycle Hooks  
-> **Repository**: [croosparties/tether](https://github.com/croosparties/tether)
+> **Repository**: [crossparties/tether](https://github.com/crossparties/tether)
 
 ---
 
@@ -334,4 +334,4 @@ Tether was built adhering to strict minimalist systems engineering principles (*
 ---
 
 *Authored for the Apple Developer Academy Portfolio Showcase.*  
-*Engineered by [croosparties](https://github.com/croosparties/tether).*
+*Engineered by [crossparties](https://github.com/crossparties/tether).*

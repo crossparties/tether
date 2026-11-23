@@ -5,6 +5,7 @@ session.db
 
 # Binaries
 /tether
+/bin/
 /harness
 
 # Go
@@ -14,6 +15,7 @@ session.db
 # IDE
 .idea/
 .vscode/
+.serena/
 
 # Snapshots
 .tether/

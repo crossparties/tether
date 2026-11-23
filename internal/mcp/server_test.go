@@ -119,7 +119,6 @@ func TestMCPServer_SQLQuery(t *testing.T) {
 	}
 }
 
-
 // runTool calls a tool with JSON arguments and returns its text payload.
 func runTool(t *testing.T, server *Server, tool string, args map[string]interface{}) string {
 	t.Helper()

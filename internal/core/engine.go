@@ -929,7 +929,6 @@ func ClassifyTask(prompt string) string {
 	return "tether_direct"
 }
 
-
 // --- Types ---
 
 type ContextEntry struct {
@@ -940,9 +939,9 @@ type ContextEntry struct {
 }
 
 type Decision struct {
-	Topic    string
-	Decision string
-	Reason   string
+	Topic     string
+	Decision  string
+	Reason    string
 	CreatedAt time.Time
 }
 
@@ -1220,4 +1219,3 @@ func (e *Engine) ExecuteSQL(query string) (interface{}, error) {
 		"last_insert_id": lastID,
 	}, nil
 }
-

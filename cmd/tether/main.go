@@ -7,13 +7,18 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/croosparties/tether/internal/adapter"
 	"github.com/croosparties/tether/internal/core"
 	"github.com/croosparties/tether/internal/harness"
 	"github.com/croosparties/tether/internal/hooks"
 	"github.com/croosparties/tether/internal/mcp"
+	"github.com/croosparties/tether/internal/orchestrator"
+	"github.com/croosparties/tether/internal/safety"
 	"github.com/croosparties/tether/internal/snapshot"
+	"github.com/croosparties/tether/internal/tui"
+	"github.com/croosparties/tether/internal/tui/views"
 	"github.com/croosparties/tether/internal/ui"
 )
 
@@ -44,6 +49,8 @@ func main() {
 		cmdInstall()
 	case "proposal", "proposals":
 		cmdProposal(os.Args[2:])
+	case "tui":
+		cmdRun(append([]string{"--tui"}, os.Args[2:]...))
 	case "run", "agent", "chat":
 		cmdRun(os.Args[2:])
 	case "version":
@@ -782,9 +789,12 @@ func cmdInstall() {
 func cmdRun(args []string) {
 	var cfg harness.Config
 	var promptParts []string
+	var useTUI bool
 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
+		case "--tui":
+			useTUI = true
 		case "--provider", "-p":
 			if i+1 < len(args) {
 				cfg.Provider = args[i+1]
@@ -838,18 +848,162 @@ func cmdRun(args []string) {
 	runner := harness.NewRunner(engine, cfg)
 	prompt := strings.TrimSpace(strings.Join(promptParts, " "))
 	if prompt == "" {
+		if useTUI || (ui.IsTerminal(os.Stdin) && ui.IsTerminalFile(os.Stdout) && os.Getenv("TETHER_LEGACY_REPL") != "1") {
+			orch := orchestrator.NewEngine()
+			defer orch.Close()
+			bridge := buildTUIBridge(runner, engine)
+			if err := tui.RunTUI(context.Background(), os.Stdin, os.Stdout, workspace, strings.ToUpper(engine.GetMode()), engine.Branch, orch, bridge); err != nil {
+				fatalf("%v", err)
+			}
+			return
+		}
 		if err := runner.RunInteractive(context.Background(), os.Stdin); err != nil {
 			fatalf("%v", err)
 		}
 		return
 	}
 
+	runner.SetAutoApprovePolicy(func(d mcp.Decision) bool {
+		if d.Tool == "run_command" {
+			if ok, _ := safety.IsReadOnlyCommand(d.Command); ok {
+				return true
+			}
+			if ok, _ := safety.IsValidationCommand(d.Command); ok {
+				return true
+			}
+		}
+		return false
+	})
+
+	start := time.Now()
 	out, err := runner.Run(context.Background(), prompt)
 	if err != nil {
+		// A failed run prints nothing after the answer, so mark it here too.
+		fmt.Fprintln(os.Stderr, harness.DoneRule("failed", time.Since(start)))
 		fatalf("harness: %v", err)
 	}
 	// Agent output is streamed verbatim: it may contain its own formatting.
 	fmt.Println(out)
+	// A one-shot run has the same problem as the REPL: the answer appears and
+	// nothing says the turn is over. The REPL marks this inside runTurn, but
+	// this path never enters it, so the mark is printed here instead.
+	fmt.Println(harness.DoneRule("done", time.Since(start)))
+}
+
+func buildTUIBridge(runner *harness.Runner, engine *core.Engine) *tui.AgentBridge {
+	runner.SetAutoApprovePolicy(runner.DefaultAutoApprovePolicy())
+	return &tui.AgentBridge{
+		Provider:        runner.ProviderName,
+		Model:           runner.ModelName,
+		Mode:            runner.ModeName,
+		Branch:          func() string { return engine.Branch },
+		NeedsAPIKey:     runner.NeedsAPIKey,
+		SaveAPIKey:      runner.SaveProviderKey,
+		SwitchModel:     runner.SwitchModel,
+		SwitchProvider:  runner.SwitchProvider,
+		SwitchMode:      runner.SwitchMode,
+		ClearHistory:    runner.ClearHistory,
+		Undo:            runner.UndoTurn,
+		StatusSummary:   runner.StatusSummary,
+		ExecuteCommand:  runner.ExecuteGatedCommand,
+		RunPrompt:       runner.RunWithOutput,
+		RunPromptStream: runner.RunWithOutputStream,
+		RunSideChat:     runner.RunSideChat,
+		SpawnSubagent:   runner.SpawnSubagentWithOutput,
+		ListModels: func() []tui.PickerOption {
+			choices := runner.ListModels()
+			out := make([]tui.PickerOption, len(choices))
+			for i, c := range choices {
+				out[i] = tui.PickerOption{Label: c.Label, Detail: c.Detail}
+			}
+			return out
+		},
+		ListProviders: func() []tui.PickerOption {
+			choices := runner.ListProviders()
+			out := make([]tui.PickerOption, len(choices))
+			for i, c := range choices {
+				out[i] = tui.PickerOption{Label: c.Label, Detail: c.Detail}
+			}
+			return out
+		},
+		BindSubagents: func(emit func(tui.SubagentEventMsg)) {
+			runner.SetSubagentObserver(func(ev harness.SubagentEvent) {
+				emit(tui.SubagentEventMsg{
+					ID: ev.ID, Role: ev.Role, Task: ev.Task, Kind: ev.Kind, Line: ev.Line,
+					Steps: ev.Steps, Elapsed: ev.Elapsed, Status: ev.Status, Summary: ev.Summary,
+					Err: ev.Err, Proposal: ev.Proposal, Analysis: ev.Analysis,
+				})
+			})
+		},
+		BindApproval: func(askFn func(req tui.ApprovalRequest) int) {
+			runner.SetAskPolicy(func(d mcp.Decision) (mcp.Verdict, bool) {
+				target := d.Path
+				if target == "" {
+					target = d.Command
+				}
+				if target == "" {
+					target = d.Label
+				}
+				mode := "code"
+				ws := "."
+				if engine != nil {
+					mode = engine.GetMode()
+					if engine.Workspace != "" {
+						ws = engine.Workspace
+					}
+				}
+				// Defense-in-depth: non-critical actions (read/validation shell,
+				// routine undoable workspace edits in CODE mode, plan artifacts
+				// in PLAN mode) never interrupt the user.
+				if ok, _ := safety.IsNonCriticalTool(mode, d.Tool, target, d.Command, ws); ok {
+					return mcp.VerdictOnce, true
+				}
+				risk, reason := safety.ClassifyRisk(d.Tool, target)
+				if risk == safety.RiskLow {
+					// e.g. temp/cache writes: not critical, no prompt.
+					return mcp.VerdictOnce, true
+				}
+				var scopeHint string
+				if d.Command != "" {
+					if prefix := mcp.CommandPrefix(d.Command); prefix != "" {
+						scopeHint = fmt.Sprintf("commands starting with %q", prefix)
+					}
+				} else if d.Path != "" {
+					dir := filepath.ToSlash(filepath.Dir(d.Path))
+					if dir == "." || dir == "/" || dir == "" {
+						dir = filepath.ToSlash(d.Path)
+					}
+					scopeHint = fmt.Sprintf("changes under %q", dir)
+				}
+				diffRaw := d.FullPreview
+				if diffRaw == "" {
+					diffRaw = d.Preview
+				}
+				var diffLines []string
+				if strings.TrimSpace(diffRaw) != "" {
+					diffLines = strings.Split(strings.TrimRight(diffRaw, "\n"), "\n")
+				}
+				choice := views.ApprovalOptionIndex(askFn(tui.ApprovalRequest{
+					AgentName:      "Main Agent / Sub-Agent Worker",
+					ActionType:     d.Tool,
+					Target:         target,
+					ScopeHint:      scopeHint,
+					MainEvaluation: reason,
+					DiffLines:      diffLines,
+				}))
+				switch choice {
+				case views.ApprovalApproveAndRun:
+					return mcp.VerdictOnce, true
+				case views.ApprovalApproveFolder:
+					return mcp.VerdictFolder, true
+				case views.ApprovalApproveSession:
+					return mcp.VerdictSession, true
+				default:
+					return mcp.VerdictReject, true
+				}
+			})
+		},
+	}
 }
 
 func printUsage() {

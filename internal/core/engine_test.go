@@ -229,7 +229,6 @@ func TestEngine_ExecuteSQL_And_Optimizations(t *testing.T) {
 	}
 }
 
-
 func TestRecordAndApproveProposal(t *testing.T) {
 	e := newTestEngine(t)
 

@@ -50,6 +50,16 @@ type Change struct {
 // yields a short descriptive line rather than an error, because a preview must
 // always be shown.
 func (c Change) Render() string {
+	return c.render(maxDiffLines)
+}
+
+// RenderFull produces the complete preview without collapsing long diffs, used
+// when the user explicitly asks to inspect the full diff before deciding.
+func (c Change) RenderFull() string {
+	return c.render(0)
+}
+
+func (c Change) render(limit int) string {
 	var b strings.Builder
 
 	switch c.Kind {
@@ -73,7 +83,12 @@ func (c Change) Render() string {
 		fmt.Fprintf(&b, "  Target:  %s\n", c.Detail)
 	}
 
-	diff := Diff(c.Before, c.After)
+	var diff string
+	if limit <= 0 {
+		diff = FullDiff(c.Before, c.After)
+	} else {
+		diff = diffWithLimit(c.Before, c.After, limit)
+	}
 	if diff != "" {
 		b.WriteString("\n")
 		b.WriteString(indent(diff, "    "))
@@ -101,6 +116,17 @@ func (c Change) Summary() string {
 // around each change is kept short. Good enough to judge a change, cheap enough
 // to run on every write.
 func Diff(before, after string) string {
+	return diffWithLimit(before, after, maxDiffLines)
+}
+
+// FullDiff renders the complete diff between before and after without
+// collapsing after maxDiffLines, so the user can inspect every changed line
+// before approving.
+func FullDiff(before, after string) string {
+	return diffWithLimit(before, after, 0)
+}
+
+func diffWithLimit(before, after string, limit int) string {
 	if before == after {
 		return ""
 	}
@@ -138,7 +164,7 @@ func Diff(before, after string) string {
 
 	// Removed lines.
 	for _, line := range beforeLines[start:endBefore] {
-		if emitted >= maxDiffLines {
+		if limit > 0 && emitted >= limit {
 			out = append(out, fmt.Sprintf("  ... (%d more changed lines)", (endBefore-start)+(endAfter-start)-emitted))
 			emitted = -1
 			break
@@ -149,7 +175,7 @@ func Diff(before, after string) string {
 	// Added lines.
 	if emitted >= 0 {
 		for _, line := range afterLines[start:endAfter] {
-			if emitted >= maxDiffLines {
+			if limit > 0 && emitted >= limit {
 				out = append(out, fmt.Sprintf("  ... (%d more changed lines)", (endBefore-start)+(endAfter-start)-emitted))
 				emitted = -1
 				break

@@ -16,7 +16,6 @@ import (
 	"github.com/croosparties/tether/internal/core"
 )
 
-
 // Server implements MCP protocol over stdio
 type Server struct {
 	engine *core.Engine
@@ -27,6 +26,81 @@ type Server struct {
 	mu           sync.Mutex
 	approvalSeq  int
 	approvalSeen map[string]bool
+
+	// ask, when set, connects the approval gate to a human. The gate itself
+	// cannot ask: it only knows how to refuse. The interactive REPL installs an
+	// asker that reads the same input stream as the chat; hook and JSON-RPC
+	// callers leave it nil and keep the refuse-with-instructions behaviour. ok
+	// is false when the user cancelled, which is treated as a rejection.
+	askMu sync.Mutex
+	ask   func(Decision) (Verdict, bool)
+
+	// autoApprove, when set, permits matching non-critical mutations (e.g.
+	// read-only shell commands, test/build validation, or undoable routine
+	// workspace edits) to execute in a single step without gating or retry.
+	autoApprove func(Decision) bool
+
+	// approveAll is set when the user chose to approve everything for the rest
+	// of the session. It is separate from ask because it must survive while the
+	// asker stays installed: replacing the asker would discard the real one.
+	approveAll bool
+}
+
+// Verdict is the user's answer to an approval request.
+type Verdict int
+
+const (
+	// VerdictOnce authorises this one change, recorded as an exact-scope grant.
+	VerdictOnce Verdict = iota
+	// VerdictFolder authorises everything in the containing directory (or the
+	// command prefix) for the rest of the session.
+	VerdictFolder
+	// VerdictSession authorises every further change without asking again.
+	VerdictSession
+	// VerdictReject discards the change.
+	VerdictReject
+)
+
+// Decision is what the interactive asker is shown. It carries no behaviour so
+// that rendering stays with the caller.
+type Decision struct {
+	Tool        string // tool requesting the change, e.g. "write_file"
+	Command     string // shell command, empty for file changes
+	Path        string // path the change targets, empty for commands
+	Label       string // one-line subject used in the heading
+	Preview     string // rendered diff (collapsed after maxDiffLines), or a description for commands
+	FullPreview string // untruncated diff for "View full diff"
+}
+
+// SetAskPolicy installs the interactive asker. Passing nil restores the
+// non-interactive behaviour. Safe to call while tool calls are in flight.
+func (s *Server) SetAskPolicy(fn func(Decision) (Verdict, bool)) {
+	s.askMu.Lock()
+	defer s.askMu.Unlock()
+	s.ask = fn
+}
+
+// AskPolicy returns the installed asker, or nil.
+func (s *Server) AskPolicy() func(Decision) (Verdict, bool) {
+	s.askMu.Lock()
+	defer s.askMu.Unlock()
+	return s.ask
+}
+
+// SetAutoApprovePolicy installs a predicate that lets non-critical mutations
+// execute immediately in one step without prompting or requiring a retry.
+// Passing nil restores strict gate-every-mutation behaviour.
+func (s *Server) SetAutoApprovePolicy(fn func(Decision) bool) {
+	s.askMu.Lock()
+	defer s.askMu.Unlock()
+	s.autoApprove = fn
+}
+
+// AutoApprovePolicy returns the installed auto-approval predicate, or nil.
+func (s *Server) AutoApprovePolicy() func(Decision) bool {
+	s.askMu.Lock()
+	defer s.askMu.Unlock()
+	return s.autoApprove
 }
 
 func NewServer(engine *core.Engine) *Server {
@@ -55,9 +129,9 @@ type RPCError struct {
 
 // MCP Protocol types
 type InitializeResult struct {
-	ProtocolVersion string     `json:"protocolVersion"`
+	ProtocolVersion string       `json:"protocolVersion"`
 	Capabilities    Capabilities `json:"capabilities"`
-	ServerInfo      ServerInfo `json:"serverInfo"`
+	ServerInfo      ServerInfo   `json:"serverInfo"`
 }
 
 type Capabilities struct {
@@ -1142,7 +1216,6 @@ func (s *Server) toolTaskClassify(args json.RawMessage) string {
 	}
 }
 
-
 // toolFilesModified returns all files modified in this session
 func (s *Server) toolFilesModified() string {
 	entries, err := s.engine.GetRecentContext(100)
@@ -1195,7 +1268,6 @@ func (s *Server) toolSubagentSpawnRules() string {
 - tether_frontend: Frontend component design and styling diffs
 - tether_product: Product specification and planning`
 }
-
 
 func (s *Server) toolSQLQuery(args json.RawMessage) (string, bool) {
 	var params struct {
@@ -1488,5 +1560,3 @@ func (s *Server) toolRunCommand(args json.RawMessage) (string, bool) {
 	}
 	return output, false
 }
-
-
