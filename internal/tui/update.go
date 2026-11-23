@@ -1255,6 +1255,12 @@ func (m *Model) ingestStreamLog(_ string, raw string) {
 			case "read_file":
 				verb = "Read"
 				m.LiveStatus = "Reading " + truncateTask(detail, 56) + "…"
+			case "glob":
+				verb = "Glob"
+				m.LiveStatus = "Finding " + truncateTask(detail, 56) + "…"
+			case "grep":
+				verb = "Grep"
+				m.LiveStatus = "Searching " + truncateTask(detail, 56) + "…"
 			case "run_command":
 				verb = "Ran"
 				detail = strings.TrimSpace(strings.TrimPrefix(detail, "$"))
@@ -1262,9 +1268,15 @@ func (m *Model) ingestStreamLog(_ string, raw string) {
 			case "kb_search":
 				verb = "Searched"
 				m.LiveStatus = "Searching " + truncateTask(detail, 56) + "…"
-			case "kb_index":
-				verb = "Indexed"
-				m.LiveStatus = "Indexing " + truncateTask(detail, 56) + "…"
+			case "todo_manage":
+				verb = "Todo"
+				m.LiveStatus = "Updating todos…"
+			case "mode_set":
+				verb = "Mode"
+				m.LiveStatus = "Setting mode " + truncateTask(detail, 56) + "…"
+			case "decision_add":
+				verb = "Decision"
+				m.LiveStatus = "Recording decision…"
 			default:
 				m.LiveStatus = "Running " + toolName + "…"
 			}

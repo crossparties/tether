@@ -244,3 +244,67 @@ func TestSafeReadWorkspaceFileSecurityBoundaries(t *testing.T) {
 		t.Error("expected error when attempting to read .tether/cache.db, got nil")
 	}
 }
+
+func TestIndexerAndSafeReadEnforceTetherIgnoreAndSymlinks(t *testing.T) {
+	root := setupTestWorkspace(t)
+
+	extra := map[string]string{
+		".env":                "SECRET=123\n",
+		"certs/server.pem":    "PRIVATE KEY\n",
+		"private/token.txt":   "ignored-token\n",
+		"logs/debug.log":      "ignored-log\n",
+		"logs/important.log":  "keep-me\n",
+		"regex_secret_01.txt": "regex-secret\n",
+		".tether/ignore":      "private/\n*.log\n!important.log\nre:^regex_secret_.*\\.txt$\n",
+	}
+	for rel, body := range extra {
+		full := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", full, err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatalf("write %s: %v", full, err)
+		}
+	}
+
+	// Symlink inside workspace pointing to .env must be excluded from Scan and blocked in SafeReadWorkspaceFile.
+	_ = os.Symlink(filepath.Join(root, ".env"), filepath.Join(root, "env_alias.txt"))
+	// Dangling symlink pointing outside workspace.
+	_ = os.Symlink(filepath.Join(t.TempDir(), "future_secret.txt"), filepath.Join(root, "dangling_out.txt"))
+
+	idx := NewIndexer(root)
+	entries, err := idx.Scan()
+	if err != nil {
+		t.Fatalf("Scan(): %v", err)
+	}
+	seen := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		seen[e.RelPath] = true
+	}
+
+	if !seen["logs/important.log"] {
+		t.Errorf("expected negated !important.log to remain in @file index")
+	}
+	for _, blocked := range []string{
+		".env",
+		"certs/server.pem",
+		"private/token.txt",
+		"logs/debug.log",
+		"regex_secret_01.txt",
+		"env_alias.txt",
+		"dangling_out.txt",
+		".tether/ignore",
+	} {
+		if seen[blocked] {
+			t.Errorf("expected %q to be excluded from Scan(), but it was indexed", blocked)
+		}
+		if _, _, rerr := SafeReadWorkspaceFile(root, blocked, 4096); rerr == nil {
+			t.Errorf("expected SafeReadWorkspaceFile(%q) to fail, got nil", blocked)
+		}
+	}
+
+	content, cleanRel, rerr := SafeReadWorkspaceFile(root, "logs/important.log", 4096)
+	if rerr != nil || cleanRel != "logs/important.log" || content != "keep-me\n" {
+		t.Fatalf("expected negated logs/important.log to be readable, got (%q, %q, %v)", content, cleanRel, rerr)
+	}
+}

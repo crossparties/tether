@@ -7,11 +7,12 @@ import (
 	"fmt"
 	"os"
 	"path"
-	"path/filepath"
 	"strings"
 
 	"github.com/crossparties/tether/internal/core"
+	"github.com/crossparties/tether/internal/mount"
 	"github.com/crossparties/tether/internal/preview"
+	"github.com/crossparties/tether/internal/safety"
 	"github.com/crossparties/tether/internal/ui"
 )
 
@@ -29,43 +30,59 @@ import (
 
 // mutation describes a tool call that changes the workspace.
 type mutation struct {
-	tool    string
-	paths   []string
-	scope   string // the path a standing grant would cover
-	command string // set for run_command, empty otherwise
-	change  preview.Change
+	tool       string
+	paths      []string
+	scope      string // the path a standing grant would cover
+	accessMode mount.AccessMode
+	command    string // set for run_command, empty otherwise
+	canonPath  string
+	relPath    string
+	content    string
+	target     string
+	replace    string
+	change     preview.Change
 }
 
-// toolRequiresApproval reports whether a tool mutates the workspace and what it
-// would touch. Tools that only read never reach the gate.
-func (s *Server) buildMutation(tool string, args json.RawMessage) (*mutation, error) {
+// prepareMutation evaluates a mutating tool invocation once against mount & shell
+// security boundaries and constructs its preview before the approval gate runs.
+func (s *Server) prepareMutation(tool string, args json.RawMessage) (mut *mutation, securityErr string, paramErr string) {
 	switch tool {
 	case "write_file":
 		var p struct {
 			Path    string `json:"path"`
 			Content string `json:"content"`
 		}
-		if err := json.Unmarshal(args, &p); err != nil || p.Path == "" {
-			return nil, fmt.Errorf("invalid params: path and content required")
+		if err := json.Unmarshal(args, &p); err != nil || strings.TrimSpace(p.Path) == "" {
+			return nil, "", "invalid params: path and content required"
 		}
-		full := s.resolvePath(p.Path)
-		before, existed := readIfExists(full)
+		d := s.mountEngine().AuthorizePath(p.Path, mount.OpWrite, s.mode())
+		if !d.Allowed {
+			return nil, d.Reason, ""
+		}
+		if d.IsDir {
+			return nil, fmt.Sprintf("access denied: %q is a directory", d.RelPath), ""
+		}
+		before, existed := readIfExists(d.CanonicalPath)
 		kind := preview.KindCreate
 		if existed {
 			kind = preview.KindUpdate
 		}
 		return &mutation{
-			tool:  tool,
-			paths: []string{full},
-			scope: s.grantScope(p.Path),
+			tool:       tool,
+			paths:      []string{d.CanonicalPath},
+			scope:      d.RelPath,
+			accessMode: d.AccessMode,
+			canonPath:  d.CanonicalPath,
+			relPath:    d.RelPath,
+			content:    p.Content,
 			change: preview.Change{
 				Kind:      kind,
-				Path:      s.displayPath(full),
+				Path:      d.RelPath,
 				Before:    before,
 				After:     p.Content,
 				HasBefore: existed,
 			},
-		}, nil
+		}, "", ""
 
 	case "edit_file":
 		var p struct {
@@ -73,74 +90,80 @@ func (s *Server) buildMutation(tool string, args json.RawMessage) (*mutation, er
 			Target      string `json:"target"`
 			Replacement string `json:"replacement"`
 		}
-		if err := json.Unmarshal(args, &p); err != nil || p.Path == "" || p.Target == "" {
-			return nil, fmt.Errorf("invalid params: path, target and replacement required")
+		if err := json.Unmarshal(args, &p); err != nil || strings.TrimSpace(p.Path) == "" || p.Target == "" {
+			return nil, "", "invalid params: path and target required"
 		}
-		full := s.resolvePath(p.Path)
-		before, existed := readIfExists(full)
+		d := s.mountEngine().AuthorizePath(p.Path, mount.OpWrite, s.mode())
+		if !d.Allowed {
+			return nil, d.Reason, ""
+		}
+		if d.IsDir {
+			return nil, fmt.Sprintf("access denied: %q is a directory", d.RelPath), ""
+		}
+		before, existed := readIfExists(d.CanonicalPath)
 		after := before
 		if existed {
 			after = strings.Replace(before, p.Target, p.Replacement, 1)
 		}
 		return &mutation{
-			tool:  tool,
-			paths: []string{full},
-			scope: s.grantScope(p.Path),
+			tool:       tool,
+			paths:      []string{d.CanonicalPath},
+			scope:      d.RelPath,
+			accessMode: d.AccessMode,
+			canonPath:  d.CanonicalPath,
+			relPath:    d.RelPath,
+			target:     p.Target,
+			replace:    p.Replacement,
 			change: preview.Change{
 				Kind:      preview.KindUpdate,
-				Path:      s.displayPath(full),
+				Path:      d.RelPath,
 				Before:    before,
 				After:     after,
 				HasBefore: existed,
-				Detail:    "matching text: " + preview.RelativeTo(s.engine.Workspace, p.Target),
+				Detail:    "matching text: " + preview.RelativeTo(s.workspace(), p.Target),
 			},
-		}, nil
+		}, "", ""
 
 	case "run_command":
 		var p struct {
 			Command string `json:"command"`
 		}
 		if err := json.Unmarshal(args, &p); err != nil || strings.TrimSpace(p.Command) == "" {
-			return nil, fmt.Errorf("invalid params: command required")
+			return nil, "", "invalid params: command required"
 		}
+		cmd := strings.TrimSpace(p.Command)
+		if ok, reason := safety.CheckShellCommandWithMount(cmd, s.workspace(), s.shellAuthorizer()); !ok {
+			return nil, reason, ""
+		}
+		ws := s.workspace()
 		return &mutation{
 			tool:    tool,
-			paths:   nil,
-			scope:   "",
-			command: strings.TrimSpace(p.Command),
+			command: cmd,
 			change: preview.Change{
 				Kind:   preview.KindCommand,
-				Path:   s.engine.Workspace,
+				Path:   ws,
 				Before: p.Command,
-				Detail: preview.RelativeTo(".", s.engine.Workspace),
+				Detail: preview.RelativeTo(".", ws),
 			},
-		}, nil
+		}, "", ""
 	}
-	return nil, nil
+	return nil, "", ""
 }
 
-// requireApproval checks the gate for a mutating tool. It returns an empty
-// string when the call may proceed, or a message explaining that approval is
-// required and how to grant it.
-func (s *Server) requireApproval(tool string, args json.RawMessage) string {
-	m, err := s.buildMutation(tool, args)
-	if err != nil {
-		// Let the tool itself report the malformed arguments.
-		return ""
-	}
-	if m == nil {
-		return ""
-	}
-
-	if s.approvesAll() {
+// authorizeMutation checks the approval gate for a validated mutation. It returns
+// an empty string when execution may proceed, or the denial/approval message.
+func (s *Server) authorizeMutation(m *mutation) string {
+	if m == nil || s.approvesAll() {
 		return ""
 	}
 
 	// Shell commands are authorized by command grants, never by path grants:
 	// saying "you may write in ./internal" must not imply "you may run rm there".
 	if m.command != "" {
-		if ok, err := s.engine.HasCommandGrant(m.command); err == nil && ok {
-			return ""
+		if s.engine != nil {
+			if ok, err := s.engine.HasCommandGrant(m.command); err == nil && ok {
+				return ""
+			}
 		}
 		if auto := s.AutoApprovePolicy(); auto != nil && auto(m.decision()) {
 			return ""
@@ -148,13 +171,13 @@ func (s *Server) requireApproval(tool string, args json.RawMessage) string {
 		return s.gate(m)
 	}
 
-	if m.scope != "" {
+	if m.scope != "" && s.engine != nil {
 		if ok, err := s.engine.HasApprovalGrant(m.scope); err == nil && ok {
 			return ""
 		}
 	}
 
-	if auto := s.AutoApprovePolicy(); auto != nil && auto(m.decision()) {
+	if auto := s.AutoApprovePolicy(); auto != nil && m.accessMode != mount.AccessGuarded && auto(m.decision()) {
 		return ""
 	}
 
@@ -410,7 +433,7 @@ func CommandPrefix(cmd string) string {
 	// first" must grant "echo", not "echo first": a prefix of "echo first"
 	// matches that one line and nothing else, so the user would approve a
 	// grant that never fires again.
-	if len(cmdFields) > 1 && takesSubcommand(filepath.Base(cmdFields[0])) && !looksLikeArg(cmdFields[1]) {
+	if len(cmdFields) > 1 && takesSubcommand(path.Base(cmdFields[0])) && !looksLikeArg(cmdFields[1]) {
 		keep = 2
 	}
 	prefixTokens = append(prefixTokens, cmdFields[:keep]...)
@@ -445,18 +468,6 @@ func looksLikeArg(tok string) bool {
 		return true
 	}
 	return strings.ContainsAny(tok, "=*/.")
-}
-
-// grantScope converts a tool path into the prefix a standing grant would cover.
-// Grants are path-scoped, so the scope is the path itself; "all under a
-// directory" is expressed by granting the directory.
-func (s *Server) grantScope(p string) string {
-	return preview.RelativeTo(s.engine.Workspace, s.resolvePath(p))
-}
-
-// displayPath shortens a path for the preview.
-func (s *Server) displayPath(full string) string {
-	return preview.RelativeTo(s.engine.Workspace, full)
 }
 
 // readIfExists returns file contents and whether the file was present.

@@ -99,16 +99,22 @@ func TestApproveAllCoversSiblingPaths(t *testing.T) {
 }
 
 // TestGrantDoesNotLeakToSiblingByName catches prefix matching done on raw
-// strings: a grant for "docs" must not authorize "docs-secret".
+// strings: a grant for "docs" must not authorize "docs-secret", and secret
+// file patterns like *.pem remain hard-blocked by mount rules.
 func TestGrantDoesNotLeakToSiblingByName(t *testing.T) {
 	s, _ := newApprovalTestServer(t)
 
 	args, _ := json.Marshal(map[string]string{"path": "docs", "scope": "all"})
 	s.CallTool("approve_change", args)
 
-	out := callWrite(t, s, "docs-secret/key.pem", "secret\n")
+	out := callWrite(t, s, "docs-secret/notes.txt", "note\n")
 	if !strings.Contains(out, "APPROVAL REQUIRED") {
 		t.Fatalf("grant for docs must not cover docs-secret, got:\n%s", out)
+	}
+
+	blocked := callWrite(t, s, "docs-secret/key.pem", "secret\n")
+	if !strings.Contains(blocked, "access denied") {
+		t.Fatalf("write to secret *.pem must be hard-denied by mount rules, got:\n%s", blocked)
 	}
 }
 
@@ -153,15 +159,16 @@ func TestRunCommandBlocked(t *testing.T) {
 	}
 }
 
-// TestSubstrateDatabaseRequiresApproval ensures direct writes to substrate
-// databases are never silently exempt from the approval gate.
+// TestSubstrateDatabaseBlocked ensures direct writes to substrate databases or
+// legacy root DB files are hard-denied by built-in mount rules (even if approveAll
+// is attempted).
 func TestSubstrateDatabaseRequiresApproval(t *testing.T) {
 	s, _ := newApprovalTestServer(t)
 
 	for _, target := range []string{"session.db", ".tether/session.db", ".tether/cache.db"} {
 		out := callWrite(t, s, target, "x")
-		if !strings.Contains(out, "APPROVAL REQUIRED") {
-			t.Fatalf("substrate db write to %q must require approval, got:\n%s", target, out)
+		if !strings.Contains(out, "access denied") {
+			t.Fatalf("substrate db write to %q must be denied, got:\n%s", target, out)
 		}
 	}
 }

@@ -1,9 +1,10 @@
 package safety
 
 import (
-	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/crossparties/tether/internal/mount"
 )
 
 // RiskLevel classifies whether an agent tool invocation can auto-run or requires explicit human approval.
@@ -63,12 +64,14 @@ func ClassifyRisk(toolName, target string) (RiskLevel, string) {
 
 	switch normTool {
 	case "read", "/read", "read_file", "view_file", "list", "list_dir", "list_files",
-		"glob", "grep", "search", "ripgrep", "session_load", "kb_search",
-		"kb_status", "todo_list", "status", "mode_get":
+		"glob", "grep", "search", "ripgrep", "kb_search", "todo_manage":
 		return RiskLow, "Operasi baca/inspeksi aman (read-only)"
 
 	case "write", "write_file", "edit", "edit_file", "patch", "apply_diff",
 		"create_file", "replace", "multi_edit":
+		if mount.IsPolicyConfigRel(normTarget) {
+			return RiskHigh, "Perubahan kebijakan mount/ignore (" + normTarget + ") memerlukan persetujuan"
+		}
 		// PRD §3.6: Writing to temporary .tmp cache files inside workspace is Low Risk (Auto-Approve)
 		if isSafeTempFile(normTarget) {
 			return RiskLow, "Penulisan file cache temporer (.tmp) disetujui otomatis oleh Main Agent"
@@ -104,16 +107,7 @@ func isSafeTempFile(target string) bool {
 }
 
 func isDependencyManifest(target string) bool {
-	base := strings.ToLower(filepath.Base(filepath.ToSlash(target)))
-	switch base {
-	case "go.mod", "go.sum",
-		"package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
-		"cargo.toml", "cargo.lock",
-		"requirements.txt", "pyproject.toml", "poetry.lock":
-		return true
-	default:
-		return false
-	}
+	return mount.IsDependencyManifest(target)
 }
 
 // isSensitiveTarget reports whether target references credentials, keys, VCS internals,
@@ -122,18 +116,10 @@ func isSensitiveTarget(target string) bool {
 	if target == "" {
 		return false
 	}
-	lower := strings.ToLower(filepath.ToSlash(strings.TrimSpace(target)))
-	base := filepath.Base(lower)
-
-	if base == ".env" || strings.HasPrefix(base, ".env.") ||
-		base == "session.db" || strings.HasPrefix(base, "session.db-") ||
-		base == "cache.db" || strings.HasPrefix(base, "cache.db-") ||
-		base == "id_rsa" || base == "id_ed25519" || base == "id_dsa" || base == "id_ecdsa" ||
-		base == "credentials.json" || base == ".npmrc" || base == ".netrc" || base == ".pypirc" ||
-		strings.HasSuffix(base, ".pem") || strings.HasSuffix(base, ".key") ||
-		strings.HasSuffix(base, ".p12") || strings.HasSuffix(base, ".pfx") {
+	if _, ok := mount.MatchesBuiltinSecret(target); ok {
 		return true
 	}
+	lower := strings.ToLower(filepath.ToSlash(strings.TrimSpace(target)))
 	if strings.Contains(lower, "session.db") || strings.Contains(lower, "cache.db") ||
 		lower == ".git" || strings.HasPrefix(lower, ".git/") || strings.Contains(lower, "/.git/") || strings.HasSuffix(lower, "/.git") ||
 		lower == ".ssh" || strings.HasPrefix(lower, ".ssh/") || strings.Contains(lower, "/.ssh/") || strings.HasSuffix(lower, "/.ssh") ||
@@ -203,21 +189,18 @@ func IsValidationCommand(cmdStr string) (bool, string) {
 }
 
 // IsPlanArtifactTarget reports whether target is a safe documentation or plan
-// artifact path inside workspaceRoot (docs/, .agents/, or *.plan.md).
+// artifact path inside workspaceRoot (.tether/PLAN.md, docs/, .agents/, or *.plan.md).
 func IsPlanArtifactTarget(target, workspaceRoot string) bool {
-	rel, inside := resolveWithinWorkspace(target, workspaceRoot)
-	if !inside || isSensitiveTarget(rel) || isDependencyManifest(rel) {
+	d := mount.NewEngine(workspaceRoot).AuthorizePath(target, mount.OpWrite, "plan")
+	if !d.Allowed || d.IsDir || d.AccessMode == mount.AccessGuarded {
 		return false
 	}
-	low := strings.ToLower(rel)
-	return low == "docs" || strings.HasPrefix(low, "docs/") || strings.Contains(low, "/docs/") ||
-		low == ".agents" || strings.HasPrefix(low, ".agents/") || strings.Contains(low, "/.agents/") ||
-		strings.HasSuffix(low, ".plan.md")
+	return !isDependencyManifest(d.RelPath)
 }
 
 // IsRoutineWorkspaceEdit reports whether toolName + target represents a routine,
 // recoverable workspace file edit (not outside workspace, not symlink-escaped,
-// not sensitive, and not a dependency manifest/lockfile).
+// not sensitive, not ignored/ro/guarded, and not a dependency manifest/lockfile).
 func IsRoutineWorkspaceEdit(toolName, target, workspaceRoot string) (bool, string) {
 	switch strings.ToLower(strings.TrimSpace(toolName)) {
 	case "write", "write_file", "write_to_file", "edit", "edit_file",
@@ -226,14 +209,14 @@ func IsRoutineWorkspaceEdit(toolName, target, workspaceRoot string) (bool, strin
 	default:
 		return false, ""
 	}
-	if strings.TrimSpace(target) == "" || isSensitiveTarget(target) || isDependencyManifest(target) {
+	if strings.TrimSpace(target) == "" || isDependencyManifest(target) {
 		return false, ""
 	}
-	rel, inside := resolveWithinWorkspace(target, workspaceRoot)
-	if !inside || isSensitiveTarget(rel) || isDependencyManifest(rel) {
+	d := mount.NewEngine(workspaceRoot).AuthorizePath(target, mount.OpWrite, "code")
+	if !d.Allowed || d.IsDir || d.AccessMode == mount.AccessGuarded || isDependencyManifest(d.RelPath) {
 		return false, ""
 	}
-	return true, "Routine workspace edit (" + rel + ") auto-approved (undoable via /undo)"
+	return true, "Routine workspace edit (" + d.RelPath + ") auto-approved (undoable via /undo)"
 }
 
 // IsNonCriticalTool reports whether a tool invocation is non-critical in the active
@@ -252,6 +235,9 @@ func IsNonCriticalTool(mode, toolName, target, command, workspaceRoot string) (b
 		if cmd == "" {
 			cmd = strings.TrimSpace(target)
 		}
+		if ok, _ := CheckShellCommand(cmd, workspaceRoot); !ok {
+			return false, ""
+		}
 		if ok, reason := IsReadOnlyCommand(cmd); ok {
 			return true, reason
 		}
@@ -260,9 +246,31 @@ func IsNonCriticalTool(mode, toolName, target, command, workspaceRoot string) (b
 		}
 		return false, ""
 
-	case "read", "/read", "read_file", "view_file", "list", "list_dir", "list_files",
-		"glob", "grep", "search", "ripgrep", "session_load", "kb_search",
-		"kb_status", "todo_list", "status", "mode_get":
+	case "read", "/read", "read_file", "view_file", "list", "list_dir", "list_files":
+		trimmedTarget := strings.TrimSpace(target)
+		if (normTool == "list" || normTool == "list_dir" || normTool == "list_files") &&
+			(trimmedTarget == "" || trimmedTarget == ".") {
+			return true, "Operasi baca/inspeksi aman (read-only)"
+		}
+		d := mount.NewEngine(workspaceRoot).AuthorizePath(trimmedTarget, mount.OpRead, normMode)
+		if !d.Allowed {
+			return false, ""
+		}
+		return true, "Operasi baca/inspeksi aman (read-only)"
+
+	case "glob", "grep", "search", "ripgrep":
+		if isSensitiveTarget(target) {
+			return false, ""
+		}
+		trimmedTarget := strings.TrimSpace(target)
+		if strings.Contains(trimmedTarget, "..") || filepath.IsAbs(trimmedTarget) || strings.HasPrefix(trimmedTarget, "./") {
+			if d := mount.NewEngine(workspaceRoot).AuthorizePath(trimmedTarget, mount.OpRead, normMode); !d.Allowed {
+				return false, ""
+			}
+		}
+		return true, "Operasi baca/inspeksi aman (read-only)"
+
+	case "kb_search", "todo_manage":
 		if isSensitiveTarget(target) {
 			return false, ""
 		}
@@ -271,10 +279,6 @@ func IsNonCriticalTool(mode, toolName, target, command, workspaceRoot string) (b
 	case "write", "write_file", "write_to_file", "edit", "edit_file",
 		"replace_file_content", "multi_replace_file_content",
 		"create_file", "replace", "multi_edit", "patch", "apply_diff":
-		ok, reason := IsRoutineWorkspaceEdit(normTool, target, workspaceRoot)
-		if !ok {
-			return false, ""
-		}
 		switch normMode {
 		case "review":
 			return false, ""
@@ -284,79 +288,10 @@ func IsNonCriticalTool(mode, toolName, target, command, workspaceRoot string) (b
 			}
 			return true, "Plan artifact write (" + target + ") auto-approved in PLAN mode"
 		default: // "code"
-			return true, reason
+			return IsRoutineWorkspaceEdit(normTool, target, workspaceRoot)
 		}
 
 	default:
 		return false, ""
-	}
-}
-
-func resolveWithinWorkspace(target, workspaceRoot string) (string, bool) {
-	trimmed := strings.TrimSpace(target)
-	if trimmed == "" {
-		return "", false
-	}
-	root := strings.TrimSpace(workspaceRoot)
-	if root == "" {
-		root = "."
-	}
-	absRoot, err := filepath.Abs(root)
-	if err != nil {
-		return "", false
-	}
-	realRoot, err := evalSymlinksWithAncestor(absRoot)
-	if err != nil {
-		realRoot = absRoot
-	}
-
-	var full string
-	if filepath.IsAbs(trimmed) {
-		full = filepath.Clean(trimmed)
-	} else {
-		full = filepath.Join(absRoot, trimmed)
-	}
-	// Reject lexical traversal (e.g. "../outside.go") even if target does not exist yet.
-	lexRel, err := filepath.Rel(absRoot, full)
-	if err != nil || lexRel == ".." || strings.HasPrefix(lexRel, ".."+string(filepath.Separator)) {
-		return "", false
-	}
-
-	// Resolve symlinks to block symlink escapes out of workspaceRoot.
-	realTarget, err := evalSymlinksWithAncestor(full)
-	if err != nil {
-		return "", false
-	}
-	rel, err := filepath.Rel(realRoot, realTarget)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
-		return "", false
-	}
-	if rel == "." {
-		return "", false
-	}
-	return filepath.ToSlash(rel), true
-}
-
-func evalSymlinksWithAncestor(p string) (string, error) {
-	clean := filepath.Clean(p)
-	var suffix []string
-	cur := clean
-	for {
-		if _, err := os.Lstat(cur); err == nil {
-			resolved, rerr := filepath.EvalSymlinks(cur)
-			if rerr != nil {
-				return "", rerr
-			}
-			for i := len(suffix) - 1; i >= 0; i-- {
-				resolved = filepath.Join(resolved, suffix[i])
-			}
-			return filepath.Clean(resolved), nil
-		}
-		parent := filepath.Dir(cur)
-		if parent == cur {
-			return clean, nil
-		}
-		suffix = append(suffix, filepath.Base(cur))
-		cur = parent
 	}
 }

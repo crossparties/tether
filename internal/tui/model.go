@@ -4,13 +4,12 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 	"time"
 
+	tetherctx "github.com/crossparties/tether/internal/context"
 	"github.com/crossparties/tether/internal/tui/views"
 )
 
@@ -346,50 +345,29 @@ func (m *Model) SetFiles(files []FileCandidate) {
 	copy(m.FileIndex, files)
 }
 
-// IndexWorkspaceFiles scans workspace (ignoring .git, .tether, node_modules, vendor) to populate @ file candidates.
+// IndexWorkspaceFiles scans workspace via context.Indexer (enforcing .tether/ignore,
+// built-in secrets, and symlink containment) to populate @ file candidates.
 func (m *Model) IndexWorkspaceFiles(maxFiles int) {
 	if maxFiles <= 0 {
 		maxFiles = 200
 	}
-	var out []FileCandidate
-	_ = filepath.WalkDir(m.Workspace, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		name := d.Name()
-		if d.IsDir() {
-			if name == ".git" || name == "node_modules" || name == "vendor" || name == ".tether" || name == ".bin" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if strings.HasPrefix(name, "session.db") || strings.HasPrefix(name, "cache.db") {
-			return nil
-		}
-		rel, rerr := filepath.Rel(m.Workspace, path)
-		if rerr != nil {
-			return nil
-		}
-		rel = filepath.ToSlash(rel)
-		info, ierr := d.Info()
-		var sz int64
-		if ierr == nil {
-			sz = info.Size()
-		}
-		ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(name)), ".")
-		out = append(out, FileCandidate{
-			RelPath:   rel,
+	entries, err := tetherctx.NewIndexer(m.Workspace).Scan()
+	if err != nil {
+		m.FileIndex = nil
+		return
+	}
+	if len(entries) > maxFiles {
+		entries = entries[:maxFiles]
+	}
+	out := make([]FileCandidate, len(entries))
+	for i, e := range entries {
+		ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(e.RelPath)), ".")
+		out[i] = FileCandidate{
+			RelPath:   e.RelPath,
 			Extension: formatExtLabel(ext),
-			SizeBytes: sz,
-		})
-		if len(out) >= maxFiles {
-			return filepath.SkipAll
+			SizeBytes: e.SizeBytes,
 		}
-		return nil
-	})
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].RelPath < out[j].RelPath
-	})
+	}
 	m.FileIndex = out
 }
 

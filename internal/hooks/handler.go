@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/crossparties/tether/internal/core"
+	"github.com/crossparties/tether/internal/mount"
 	"github.com/crossparties/tether/internal/safety"
 	"github.com/crossparties/tether/internal/snapshot"
 )
@@ -17,11 +17,52 @@ import (
 // Handler processes lifecycle hook events from agents
 type Handler struct {
 	engine   *core.Engine
+	mount    *mount.Engine
 	snapshot *snapshot.Store
 }
 
 func NewHandler(engine *core.Engine) *Handler {
-	return &Handler{engine: engine, snapshot: snapshot.New(engine.Workspace)}
+	var m *mount.Engine
+	ws := "."
+	if engine != nil {
+		ws = engine.Workspace
+		m = engine.Mount()
+	}
+	return &Handler{
+		engine:   engine,
+		mount:    m,
+		snapshot: snapshot.New(ws),
+	}
+}
+
+func (h *Handler) mountEngine() *mount.Engine {
+	if h.mount != nil {
+		return h.mount
+	}
+	if h.engine != nil {
+		return h.engine.Mount()
+	}
+	return mount.NewEngine(".")
+}
+
+func (h *Handler) activeMode() string {
+	if h.engine != nil {
+		return h.engine.GetMode()
+	}
+	return "code"
+}
+
+func (h *Handler) shellAuthorizer() func(rawPath string, write bool) (bool, string) {
+	m := h.mountEngine()
+	mode := h.activeMode()
+	return func(rawPath string, write bool) (bool, string) {
+		op := mount.OpRead
+		if write {
+			op = mount.OpWrite
+		}
+		d := m.AuthorizePath(rawPath, op, mode)
+		return d.Allowed, d.Reason
+	}
 }
 
 // captureBeforeWrite records the pre-write state of a file so the turn can be
@@ -198,7 +239,7 @@ func (h *Handler) handlePreInvocation(input HookInput) HookOutput {
 
 	context += "\n### ⚠️ TETHER SUBSTRATE MEMORY PROTOCOL\n"
 	context += "- NEVER use python3/bash scripts to query or edit .tether/session.db or .tether/cache.db.\n"
-	context += "- ALWAYS use Tether MCP tools (`sql_query`, `session_load`, `session_save`, `todo_*`) or inspect auto-injected context above.\n"
+	context += "- ALWAYS use Tether core tools (`kb_search`, `todo_manage`, `decision_add`, `mode_set`) or inspect auto-injected context above.\n"
 
 	if len(settings) > 0 {
 		var keys []string
@@ -223,7 +264,7 @@ func (h *Handler) handlePreInvocation(input HookInput) HookOutput {
 	}
 
 	if len(decisions) > 0 {
-		context += fmt.Sprintf("\n### Previous Decisions (newest %d; full history via sql_query)\n", len(decisions))
+		context += fmt.Sprintf("\n### Previous Decisions (newest %d)\n", len(decisions))
 		for _, d := range decisions {
 			context += fmt.Sprintf("- [%s] %s (reason: %s)\n",
 				d.Topic, truncate(d.Decision, injectEntryMaxRunes), truncate(d.Reason, injectEntryMaxRunes))
@@ -231,7 +272,7 @@ func (h *Handler) handlePreInvocation(input HookInput) HookOutput {
 	}
 
 	if len(patterns) > 0 {
-		context += fmt.Sprintf("\n### Learned Patterns (newest %d; full history via sql_query)\n", len(patterns))
+		context += fmt.Sprintf("\n### Learned Patterns (newest %d)\n", len(patterns))
 		for _, p := range patterns {
 			context += fmt.Sprintf("- [%s] %s\n", p.Type, truncate(p.Description, injectEntryMaxRunes))
 		}
@@ -305,69 +346,70 @@ func (h *Handler) handlePreInvocation(input HookInput) HookOutput {
 // handlePreToolUse gates operations according to Tether governance rules
 func (h *Handler) handlePreToolUse(input HookInput) HookOutput {
 	toolName, command, filePath := input.Normalized()
+	ws := "."
+	if h.engine != nil {
+		ws = h.engine.Workspace
+	}
+	mode := h.activeMode()
 
-	// 1. Catastrophic command & protected substrate protection (always active across all modes)
-	if toolName == "run_command" || toolName == "bash" {
+	// 1. Catastrophic command, Point-2 shell guard & protected substrate protection
+	if toolName == "run_command" || toolName == "bash" || toolName == "sh" || toolName == "shell" || toolName == "exec" {
 		if d := classifyCommand(command); d.level == deny {
 			return HookOutput{Decision: "deny", Reason: d.describe()}
 		}
+		if ok, reason := safety.CheckShellCommandWithMount(command, ws, h.shellAuthorizer()); !ok {
+			return HookOutput{Decision: "deny", Reason: reason}
+		}
 		cmdLower := strings.ToLower(command)
-
-		// Prevent raw bash access to .tether/*.db or mutative commands touching .tether/.
 		isDirectDB := strings.Contains(cmdLower, "session.db") || strings.Contains(cmdLower, "cache.db") ||
 			(strings.Contains(cmdLower, "sqlite3") && strings.Contains(cmdLower, ".db"))
-		isMutatingTether := false
-		if strings.Contains(cmdLower, ".tether") {
-			okRO, _ := safety.IsReadOnlyCommand(command)
-			isMutatingTether = !okRO
-		}
-		if isDirectDB || isMutatingTether {
+		if isDirectDB {
 			return HookOutput{
 				Decision: "deny",
-				Reason:   "Tether Guard: Direct bash access to .tether/session.db, .tether/cache.db, or mutating .tether/ state is blocked. Use Tether MCP tools (session_load, sql_query, todo_list) instead.",
+				Reason:   "Tether Guard: Direct bash access to .tether/session.db or .tether/cache.db is blocked. Use Tether core tools (kb_search, todo_manage, decision_add) instead.",
 			}
+		}
+	}
+
+	if isReadTool(toolName) && filePath != "" {
+		if d := h.mountEngine().AuthorizePath(filePath, mount.OpRead, mode); !d.Allowed {
+			return HookOutput{Decision: "deny", Reason: d.Reason}
 		}
 	}
 
 	if isWriteTool(toolName) {
-		ws := ""
-		if h.engine != nil {
-			ws = h.engine.Workspace
-		}
-		if isProtectedSubstratePath(ws, filePath) {
-			return HookOutput{
-				Decision: "deny",
-				Reason:   "Tether Guard: Direct writes to .tether/ databases or snapshots are blocked. Use Tether MCP tools (session_load, sql_query, todo_list, undo) instead.",
+		if filePath == "" {
+			if mode == "plan" {
+				return HookOutput{
+					Decision: "deny",
+					Reason:   "Tether Guard: Project is in PLAN mode. Mutation to production codebase is blocked. Allowed: write plans to .tether/PLAN.md or docs/. To unlock: run 'tether mode code' or call MCP mode_set(mode=\"code\").",
+				}
+			}
+		} else {
+			d := h.mountEngine().AuthorizePath(filePath, mount.OpWrite, mode)
+			if !d.Allowed {
+				return HookOutput{Decision: "deny", Reason: d.Reason}
+			}
+			if d.IsDir {
+				return HookOutput{Decision: "deny", Reason: fmt.Sprintf("access denied: %q is a directory", d.RelPath)}
+			}
+			if mode == "plan" {
+				if mount.IsDependencyManifest(d.RelPath) || !mount.IsPlanArtifactRel(d.RelPath) {
+					return HookOutput{
+						Decision: "deny",
+						Reason:   "Tether Guard: Project is in PLAN mode. Mutation to production codebase is blocked. Allowed: write plans to .tether/PLAN.md or docs/. To unlock: run 'tether mode code' or call MCP mode_set(mode=\"code\").",
+					}
+				}
+				return HookOutput{Decision: "allow", Reason: "Plan artifact writing allowed in .tether/PLAN.md, docs/, and .agents/"}
 			}
 		}
 	}
 
-	// 2. Planning Mode Gating
-	if h.engine.GetMode() == "plan" {
-		if isWriteTool(toolName) {
-			targetPath := filePath
-			if targetPath != "" {
-				resolvedPath, err := filepath.EvalSymlinks(targetPath)
-				if err != nil {
-					resolvedPath = targetPath
-				}
-				cleanPath := filepath.ToSlash(resolvedPath)
-				// Path-aware plan sandboxing: allow writes to docs/ and .agents/
-				if strings.Contains(cleanPath, "/docs/") || strings.HasPrefix(cleanPath, "docs/") ||
-					strings.Contains(cleanPath, "/.agents/") || strings.HasPrefix(cleanPath, ".agents/") ||
-					strings.HasSuffix(cleanPath, ".plan.md") {
-					return HookOutput{Decision: "allow", Reason: "Plan artifact writing allowed in docs/ and .agents/"}
-				}
-			}
-
-			return HookOutput{
-				Decision: "deny",
-				Reason:   "Tether Guard: Project is in PLAN mode. Mutation to production codebase is blocked. Allowed: write plans to docs/ or present inline. To unlock: run 'tether mode code' or call MCP mode_set(mode=\"code\").",
-			}
-		}
+	// 2. Planning Mode shell guardrails
+	if mode == "plan" {
 
 		// Shell mutative command risk tiering
-		if toolName == "run_command" || toolName == "bash" {
+		if toolName == "run_command" || toolName == "bash" || toolName == "sh" || toolName == "shell" || toolName == "exec" {
 			if okRO, _ := safety.IsReadOnlyCommand(command); !okRO {
 				if okVal, _ := safety.IsValidationCommand(command); !okVal {
 					sanitized := sanitizeRedirections(strings.ToLower(command))
@@ -433,9 +475,9 @@ func (h *Handler) handlePostToolUse(input HookInput) HookOutput {
 	return HookOutput{}
 }
 
-// writeToolNames are the tools that overwrite a single known file. sql_query,
-// session_save and the todo tools mutate state but have no single file to
-// snapshot, so they are deliberately excluded.
+// writeToolNames are the tools that overwrite a single known file. todo_manage,
+// decision_add, and mode_set mutate substrate state via MCP tools rather than raw
+// workspace files, so they are excluded here.
 var writeToolNames = map[string]bool{
 	"write_to_file":              true,
 	"write_file":                 true,
@@ -449,88 +491,10 @@ func isWriteTool(name string) bool {
 	return writeToolNames[name]
 }
 
-// isProtectedSubstratePath reports whether targetPath refers (directly, via
-// traversal, or via symlinks) to Tether's root or .tether/ SQLite databases or
-// snapshot backups. Non-DB files like .tether/PLAN.md are deliberately excluded.
-func isProtectedSubstratePath(workspace, targetPath string) bool {
-	trimmed := strings.TrimSpace(targetPath)
-	if trimmed == "" {
-		return false
-	}
-
-	isSubstrateRel := func(rel string) bool {
-		s := strings.ToLower(strings.TrimPrefix(filepath.ToSlash(filepath.Clean(rel)), "./"))
-		return strings.HasPrefix(s, "session.db") ||
-			strings.HasPrefix(s, "cache.db") ||
-			strings.HasPrefix(s, ".tether/session.db") ||
-			strings.HasPrefix(s, ".tether/cache.db") ||
-			s == ".tether/snapshots" || strings.HasPrefix(s, ".tether/snapshots/")
-	}
-
-	if !filepath.IsAbs(trimmed) && isSubstrateRel(trimmed) {
-		return true
-	}
-	if workspace == "" {
-		return false
-	}
-
-	absRoot, err := filepath.Abs(workspace)
-	if err != nil {
-		return false
-	}
-	canonRoot := resolvePathWithAncestor(absRoot)
-
-	var candidate string
-	if filepath.IsAbs(trimmed) {
-		candidate = filepath.Clean(trimmed)
-	} else {
-		candidate = filepath.Join(absRoot, trimmed)
-	}
-	if rel, err := filepath.Rel(absRoot, candidate); err == nil && isSubstrateRel(rel) {
-		return true
-	}
-
-	canonTarget := resolvePathWithAncestor(candidate)
-	if rel, err := filepath.Rel(canonRoot, canonTarget); err == nil && isSubstrateRel(rel) {
+func isReadTool(name string) bool {
+	switch name {
+	case "read_file", "view_file", "read":
 		return true
 	}
 	return false
-}
-
-func resolvePathWithAncestor(p string) string {
-	clean := filepath.Clean(p)
-	var suffix []string
-	cur := clean
-	symlinkHops := 0
-	for {
-		if info, err := os.Lstat(cur); err == nil {
-			if resolved, rerr := filepath.EvalSymlinks(cur); rerr == nil {
-				for i := len(suffix) - 1; i >= 0; i-- {
-					resolved = filepath.Join(resolved, suffix[i])
-				}
-				return filepath.Clean(resolved)
-			}
-			if info.Mode()&os.ModeSymlink != 0 && symlinkHops < 16 {
-				if linkTarget, lerr := os.Readlink(cur); lerr == nil {
-					if !filepath.IsAbs(linkTarget) {
-						linkTarget = filepath.Join(filepath.Dir(cur), linkTarget)
-					}
-					for i := len(suffix) - 1; i >= 0; i-- {
-						linkTarget = filepath.Join(linkTarget, suffix[i])
-					}
-					cur = filepath.Clean(linkTarget)
-					suffix = nil
-					symlinkHops++
-					continue
-				}
-			}
-			return clean
-		}
-		parent := filepath.Dir(cur)
-		if parent == cur {
-			return clean
-		}
-		suffix = append(suffix, filepath.Base(cur))
-		cur = parent
-	}
 }

@@ -4,13 +4,16 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/crossparties/tether/internal/mount"
 	"github.com/google/uuid"
 	_ "modernc.org/sqlite"
 )
@@ -36,6 +39,31 @@ func (e *Engine) ReadDB() *sql.DB { return e.readDB }
 
 // CacheDB returns the connection handle for .tether/cache.db.
 func (e *Engine) CacheDB() *sql.DB { return e.cacheDB }
+
+// OpenReadOnlyDB opens a SQLite database in strict read-only (mode=ro, query_only=ON) mode.
+// When the WAL sidecar is absent or empty (e.g. closed DB scanned by `tether doctor`),
+// immutable=1 prevents SQLite from creating a `-shm` file in a read-only probe.
+func OpenReadOnlyDB(dbPath string) (*sql.DB, error) {
+	dsn := sqliteDSN(dbPath, true)
+	if walInfo, err := os.Stat(dbPath + "-wal"); err != nil || walInfo.Size() == 0 {
+		dsn += "&immutable=1"
+	}
+	return sql.Open("sqlite", dsn)
+}
+
+// Mount returns a Mount Engine bound to this Engine's workspace and SQLite pools.
+func (e *Engine) Mount() *mount.Engine {
+	m := mount.NewEngine(e.Workspace)
+	if e.readDB != nil || e.writeDB != nil {
+		m.BindDB(e.readDB, e.writeDB)
+	}
+	return m
+}
+
+// EnsureGitignore ensures .tether runtime artifacts are ignored in .gitignore.
+func (e *Engine) EnsureGitignore() error {
+	return e.ensureGitignore()
+}
 
 // DetectGitBranch reads .git/HEAD directly with <0.1ms latency.
 func DetectGitBranch(workspace string) string {
@@ -961,9 +989,19 @@ func indexFileChunks(delStmt, insStmt *sql.Stmt, filePath, content string) error
 	return nil
 }
 
-// IndexFile indexes a file into .tether/cache.db inside a single transaction with prepared statements.
+// IndexFile indexes an authorized workspace file into .tether/cache.db inside
+// a single transaction with prepared statements, blocking secrets, ignored paths,
+// and symlink escapes.
 func (e *Engine) IndexFile(filePath string) error {
-	content, err := os.ReadFile(filePath)
+	dec := e.Mount().AuthorizePath(filePath, mount.OpRead, "code")
+	if !dec.Allowed {
+		return fmt.Errorf("%s", dec.Reason)
+	}
+	if dec.IsDir {
+		return fmt.Errorf("cannot index directory %q as file", dec.RelPath)
+	}
+
+	content, err := os.ReadFile(dec.CanonicalPath)
 	if err != nil {
 		return err
 	}
@@ -992,38 +1030,73 @@ func (e *Engine) IndexFile(filePath string) error {
 	return tx.Commit()
 }
 
-// IndexDirectory indexes matching files in a directory inside a single cache.db transaction.
+// IndexDirectory indexes authorized matching files in dirPath inside a single
+// cache.db transaction. When extensions is empty, it focuses on repository
+// Markdown/documentation files (md, mdx, rst, txt), always prioritizing *.md first.
 func (e *Engine) IndexDirectory(dirPath string, extensions []string) (int, error) {
-	root := filepath.Clean(dirPath)
+	mountEngine := e.Mount()
+	relDir, canonDir, _, rerr := mount.ResolveWithinWorkspace(dirPath, e.Workspace)
+	if rerr != nil {
+		return 0, rerr
+	}
+	if relDir != "." {
+		if d := mountEngine.AuthorizePath(dirPath, mount.OpRead, "code"); !d.Allowed {
+			return 0, fmt.Errorf("%s", d.Reason)
+		}
+		canonDir = dCanonOr(canonDir, dirPath)
+	}
+
+	if len(extensions) == 0 {
+		extensions = []string{"md", "mdx", "rst", "txt"}
+	}
+	extSet := make(map[string]bool, len(extensions))
+	for _, ext := range extensions {
+		clean := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(ext)), ".")
+		if clean != "" {
+			extSet[clean] = true
+		}
+	}
+
 	var files []string
-	walkErr := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+	walkErr := filepath.WalkDir(canonDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
-		if info.IsDir() {
-			if path == root {
-				return nil
-			}
-			base := filepath.Base(path)
-			if strings.HasPrefix(base, ".") || base == "node_modules" || base == "vendor" || base == "__pycache__" {
+		if d.Type()&fs.ModeSymlink != 0 {
+			if d.IsDir() {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		if len(extensions) > 0 {
-			ext := strings.TrimPrefix(filepath.Ext(path), ".")
-			matched := false
-			for _, want := range extensions {
-				if ext == want {
-					matched = true
-					break
+		if d.IsDir() {
+			if path == canonDir {
+				return nil
+			}
+			base := d.Name()
+			if strings.HasPrefix(base, ".") || mount.IsDefaultSkipDirName(base) {
+				return filepath.SkipDir
+			}
+			if relSub, _, _, err := mount.ResolveWithinWorkspace(path, e.Workspace); err == nil && relSub != "." {
+				if mountEngine.ShouldSkipDir(relSub) {
+					return filepath.SkipDir
 				}
 			}
-			if !matched {
+			return nil
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		if len(extSet) > 0 {
+			ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(path)), ".")
+			if !extSet[ext] {
 				return nil
 			}
 		}
-		if info.Size() > 1024*1024 {
+		info, ierr := d.Info()
+		if ierr != nil || info.Size() > 1024*1024 {
+			return nil
+		}
+		if dec := mountEngine.AuthorizePath(path, mount.OpRead, "code"); !dec.Allowed || dec.IsDir {
 			return nil
 		}
 		files = append(files, path)
@@ -1032,6 +1105,16 @@ func (e *Engine) IndexDirectory(dirPath string, extensions []string) (int, error
 	if walkErr != nil {
 		return 0, walkErr
 	}
+
+	// Prioritize Markdown documentation (*.md / *.mdx) before other text/code files.
+	sort.Slice(files, func(i, j int) bool {
+		mi := isMarkdownPath(files[i])
+		mj := isMarkdownPath(files[j])
+		if mi != mj {
+			return mi
+		}
+		return files[i] < files[j]
+	})
 
 	tx, err := e.cacheDB.Begin()
 	if err != nil {
@@ -1068,11 +1151,111 @@ func (e *Engine) IndexDirectory(dirPath string, extensions []string) (int, error
 	return count, nil
 }
 
-// SearchKB performs full-text search across indexed documents in .tether/cache.db.
+func dCanonOr(canon, fallback string) string {
+	if canon != "" {
+		return canon
+	}
+	return fallback
+}
+
+func isMarkdownPath(p string) bool {
+	ext := strings.ToLower(filepath.Ext(p))
+	return ext == ".md" || ext == ".mdx" || ext == ".markdown"
+}
+
+// ReconcileKB purges stale rows from kb_documents (and kb_fts via delete trigger)
+// that match isIgnored or violate current mount ignore/secret/containment rules.
+func (e *Engine) ReconcileKB(isIgnored func(relPath string) bool) (int, error) {
+	if e.cacheDB == nil {
+		return 0, nil
+	}
+	if isIgnored == nil {
+		m := e.Mount()
+		isIgnored = func(relPath string) bool {
+			return !m.AuthorizePath(relPath, mount.OpRead, "code").Allowed
+		}
+	}
+
+	rows, err := e.cacheDB.Query(`SELECT DISTINCT file_path FROM kb_documents`)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	absRoot, _ := filepath.Abs(e.Workspace)
+	realRoot, rerr := mount.EvalSymlinksWithAncestor(absRoot)
+	if rerr != nil {
+		realRoot = absRoot
+	}
+
+	var toDelete []string
+	for rows.Next() {
+		var stored string
+		if err := rows.Scan(&stored); err != nil {
+			return 0, err
+		}
+		rel := stored
+		outside := false
+		if filepath.IsAbs(stored) {
+			if r, err := filepath.Rel(absRoot, stored); err == nil && r != ".." && !strings.HasPrefix(r, ".."+string(filepath.Separator)) {
+				rel = filepath.ToSlash(r)
+			} else if r, err := filepath.Rel(realRoot, stored); err == nil && r != ".." && !strings.HasPrefix(r, ".."+string(filepath.Separator)) {
+				rel = filepath.ToSlash(r)
+			} else {
+				outside = true
+			}
+		} else {
+			rel = filepath.ToSlash(filepath.Clean(stored))
+			if rel == ".." || strings.HasPrefix(rel, "../") {
+				outside = true
+			}
+		}
+		if outside || isIgnored(rel) {
+			toDelete = append(toDelete, stored)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	if len(toDelete) == 0 {
+		return 0, nil
+	}
+
+	tx, err := e.cacheDB.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	delStmt, err := tx.Prepare(`DELETE FROM kb_documents WHERE file_path = ?`)
+	if err != nil {
+		return 0, err
+	}
+	defer delStmt.Close()
+
+	purged := 0
+	for _, p := range toDelete {
+		if _, err := delStmt.Exec(p); err != nil {
+			return purged, err
+		}
+		purged++
+	}
+	if err := tx.Commit(); err != nil {
+		return purged, err
+	}
+	return purged, nil
+}
+
+// SearchKB performs full-text search across authorized indexed documents in .tether/cache.db.
 func (e *Engine) SearchKB(query string, limit int) ([]KBResult, error) {
-	if limit == 0 {
+	if limit <= 0 {
 		limit = 10
 	}
+	mountEngine := e.Mount()
+	_, _ = e.ReconcileKB(func(relPath string) bool {
+		return !mountEngine.AuthorizePath(relPath, mount.OpRead, "code").Allowed
+	})
 
 	rows, err := e.cacheDB.Query(`
 		SELECT d.file_path, d.chunk_index, snippet(kb_fts, 0, '>>>', '<<<', '...', 64) as snippet,
@@ -1093,6 +1276,9 @@ func (e *Engine) SearchKB(query string, limit int) ([]KBResult, error) {
 		var r KBResult
 		if err := rows.Scan(&r.FilePath, &r.ChunkIndex, &r.Snippet, &r.Score); err != nil {
 			return nil, err
+		}
+		if !mountEngine.AuthorizePath(r.FilePath, mount.OpRead, "code").Allowed {
+			continue
 		}
 		results = append(results, r)
 	}
@@ -1169,14 +1355,26 @@ func (e *Engine) ListTodos(includeCompleted bool) ([]Todo, error) {
 }
 
 func (e *Engine) CompleteTodo(id int) error {
-	_, err := e.writeDB.Exec(`UPDATE todos SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = ? AND session_id = ?`,
+	res, err := e.writeDB.Exec(`UPDATE todos SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = ? AND session_id = ?`,
 		id, e.SessionID)
-	return err
+	if err != nil {
+		return err
+	}
+	if n, rerr := res.RowsAffected(); rerr == nil && n == 0 {
+		return fmt.Errorf("todo #%d not found in session %s", id, e.SessionID)
+	}
+	return nil
 }
 
 func (e *Engine) RemoveTodo(id int) error {
-	_, err := e.writeDB.Exec(`DELETE FROM todos WHERE id = ? AND session_id = ?`, id, e.SessionID)
-	return err
+	res, err := e.writeDB.Exec(`DELETE FROM todos WHERE id = ? AND session_id = ?`, id, e.SessionID)
+	if err != nil {
+		return err
+	}
+	if n, rerr := res.RowsAffected(); rerr == nil && n == 0 {
+		return fmt.Errorf("todo #%d not found in session %s", id, e.SessionID)
+	}
+	return nil
 }
 
 type Todo struct {

@@ -48,8 +48,8 @@ func TestStreamingToolLoopDeliversLiveDeltas(t *testing.T) {
 			sse(w,
 				`{"choices":[{"delta":{"reasoning_content":"think "}}]}`,
 				`{"choices":[{"delta":{"content":"Checking "}}]}`,
-				`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"todo_list","arguments":"{"}}]}}]}`,
-				`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]}}]}`,
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"todo_manage","arguments":"{\"action\":"}}]}}]}`,
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"list\"}"}}]}}]}`,
 			)
 			return
 		}

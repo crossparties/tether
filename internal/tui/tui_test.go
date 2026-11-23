@@ -631,6 +631,9 @@ func TestIndexWorkspaceFilesExcludesSubstrateDBs(t *testing.T) {
 		".tether/session.db",
 		".tether/cache.db",
 		".tether/PLAN.md",
+		".tether/ignore",
+		".env",
+		"secret.ignored",
 		"session.db",
 		"session.db-wal",
 		"cache.db",
@@ -640,10 +643,15 @@ func TestIndexWorkspaceFilesExcludesSubstrateDBs(t *testing.T) {
 		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 			t.Fatalf("mkdir %s: %v", rel, err)
 		}
-		if err := os.WriteFile(full, []byte("x"), 0o644); err != nil {
+		body := "x"
+		if rel == ".tether/ignore" {
+			body = "*.ignored\n"
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
 			t.Fatalf("write %s: %v", rel, err)
 		}
 	}
+	_ = os.Symlink(filepath.Join(t.TempDir(), "escape.go"), filepath.Join(ws, "escape_link.go"))
 
 	m := NewModel(ws)
 	m.IndexWorkspaceFiles(50)
@@ -659,6 +667,10 @@ func TestIndexWorkspaceFilesExcludesSubstrateDBs(t *testing.T) {
 		".tether/session.db",
 		".tether/cache.db",
 		".tether/PLAN.md",
+		".tether/ignore",
+		".env",
+		"secret.ignored",
+		"escape_link.go",
 		"session.db",
 		"session.db-wal",
 		"cache.db",

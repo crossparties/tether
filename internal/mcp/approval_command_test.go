@@ -114,8 +114,12 @@ func TestFileGrantDoesNotAuthorizeCommand(t *testing.T) {
 		t.Fatalf("path grant should allow writes, got:\n%s", out)
 	}
 	// ...but not commands.
-	if out := callCommand(t, s, "rm -rf /"); !strings.Contains(out, "APPROVAL REQUIRED") {
+	if out := callCommand(t, s, "touch should-ask.txt"); !strings.Contains(out, "APPROVAL REQUIRED") {
 		t.Fatalf("path grant must not authorize shell commands, got:\n%s", out)
+	}
+	// And dangerous/outside-workspace commands are hard-denied even before approval.
+	if out := callCommand(t, s, "rm -rf /"); !strings.Contains(out, "access denied") && !strings.Contains(out, "escapes workspace") {
+		t.Fatalf("outside-workspace command must be hard-denied, got:\n%s", out)
 	}
 }
 

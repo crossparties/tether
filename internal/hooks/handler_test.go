@@ -235,7 +235,7 @@ func TestPreToolUse_AntigravityPayloadAndAutoApprove(t *testing.T) {
 
 	// 2. In plan mode, toolCall with TargetFile in code directory must be denied
 	_ = e.SetMode("plan")
-	planWrite := `{"toolCall":{"name":"replace_file_content","args":{"TargetFile":"/repo/internal/core/engine.go"}}}`
+	planWrite := `{"toolCall":{"name":"replace_file_content","args":{"TargetFile":` + mustQuoteTestStr(filepath.Join(e.Workspace, "internal", "core", "engine.go")) + `}}}`
 	outStr, err := h.Handle("PreToolUse", strings.NewReader(planWrite))
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
@@ -246,8 +246,8 @@ func TestPreToolUse_AntigravityPayloadAndAutoApprove(t *testing.T) {
 		t.Errorf("expected plan mode write to be denied, got %s", out.Decision)
 	}
 
-	// 3. In plan mode, toolCall with docs/ or .agents/ must be allowed
-	planDoc := `{"toolCall":{"name":"write_to_file","args":{"TargetFile":"/repo/docs/spec.md"}}}`
+	// 3. In plan mode, toolCall with docs/ or .agents/ inside workspace must be allowed
+	planDoc := `{"toolCall":{"name":"write_to_file","args":{"TargetFile":` + mustQuoteTestStr(filepath.Join(e.Workspace, "docs", "spec.md")) + `}}}`
 	outStr, err = h.Handle("PreToolUse", strings.NewReader(planDoc))
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
@@ -471,21 +471,65 @@ func TestPreToolUse_BlocksProtectedSubstrateWritesAndMutatingShellInCodeMode(t *
 		}
 	}
 
-	// Non-DB .tether/PLAN.md must remain allowed in code mode.
+	// .tether/PLAN.md must be denied in code mode and allowed ONLY in plan mode (even via absolute workspace path).
 	planPayload := `{"tool_name":"write_file","tool_call":{"name":"write_file","args":{"path":".tether/PLAN.md"}}}`
-	if out, err := h.Handle("PreToolUse", strings.NewReader(planPayload)); err != nil || !strings.Contains(out, `"allow"`) {
-		t.Errorf("expected .tether/PLAN.md write to be allowed in code mode, got %s (err=%v)", out, err)
+	if out, err := h.Handle("PreToolUse", strings.NewReader(planPayload)); err != nil || !strings.Contains(out, `"deny"`) {
+		t.Errorf("expected .tether/PLAN.md write to be denied in code mode, got %s (err=%v)", out, err)
 	}
-
-	// Traversal into .tether/session.db via docs/../ must also be denied in plan mode.
+	absPlanPayload := `{"tool_name":"write_file","tool_call":{"name":"write_file","args":{"path":` + mustQuoteTestStr(filepath.Join(e.Workspace, ".tether", "PLAN.md")) + `}}}`
 	if err := e.SetMode("plan"); err != nil {
 		t.Fatalf("SetMode plan: %v", err)
 	}
+	if out, err := h.Handle("PreToolUse", strings.NewReader(planPayload)); err != nil || !strings.Contains(out, `"allow"`) {
+		t.Errorf("expected relative .tether/PLAN.md write to be allowed in plan mode, got %s (err=%v)", out, err)
+	}
+	if out, err := h.Handle("PreToolUse", strings.NewReader(absPlanPayload)); err != nil || !strings.Contains(out, `"allow"`) {
+		t.Errorf("expected absolute .tether/PLAN.md write to be allowed in plan mode, got %s (err=%v)", out, err)
+	}
+	if out, err := h.Handle("PreToolUse", strings.NewReader(`{"tool_name":"read_file","tool_call":{"name":"read_file","args":{"path":`+mustQuoteTestStr(filepath.Join(e.Workspace, ".tether", "PLAN.md"))+`}}}`)); err != nil || !strings.Contains(out, `"allow"`) {
+		t.Errorf("expected absolute .tether/PLAN.md read to be allowed in plan mode, got %s (err=%v)", out, err)
+	}
+
+	// Outside-workspace absolute paths must ALWAYS be denied (even if basename/folder matches /docs/).
+	for _, outsideRead := range []string{"/etc/shadow", "/etc/passwd"} {
+		p := `{"tool_name":"read_file","tool_call":{"name":"read_file","args":{"path":` + mustQuoteTestStr(outsideRead) + `}}}`
+		if out, err := h.Handle("PreToolUse", strings.NewReader(p)); err != nil || !strings.Contains(out, `"deny"`) {
+			t.Errorf("expected outside read %q to be denied, got %s (err=%v)", outsideRead, out, err)
+		}
+	}
+	outsideDocWrite := `{"tool_name":"write_to_file","tool_call":{"name":"write_to_file","args":{"path":"/tmp/docs/x.md"}}}`
+	if out, err := h.Handle("PreToolUse", strings.NewReader(outsideDocWrite)); err != nil || !strings.Contains(out, `"deny"`) {
+		t.Errorf("expected /tmp/docs/x.md write to be denied in plan mode, got %s (err=%v)", out, err)
+	}
+
+	// Dependency manifests and ignore policies remain blocked in plan mode.
+	for _, planDenied := range []string{"go.mod", "docs/package.json", ".tetherignore"} {
+		p := `{"tool_name":"write_file","tool_call":{"name":"write_file","args":{"path":` + mustQuoteTestStr(planDenied) + `}}}`
+		if out, err := h.Handle("PreToolUse", strings.NewReader(p)); err != nil || !strings.Contains(out, `"deny"`) {
+			t.Errorf("expected %q write to be denied in plan mode, got %s (err=%v)", planDenied, out, err)
+		}
+	}
+
+	// Traversal into .tether/session.db via docs/../ must also be denied in plan mode.
 	travPayload := `{"tool_name":"write_to_file","tool_call":{"name":"write_to_file","args":{"path":"docs/../.tether/session.db"}}}`
 	if out, err := h.Handle("PreToolUse", strings.NewReader(travPayload)); err != nil || !strings.Contains(out, `"deny"`) {
 		t.Errorf("expected docs/../.tether/session.db traversal to be denied in plan mode, got %s (err=%v)", out, err)
 	}
 	_ = e.SetMode("code")
+
+	// Custom .tether/ignore rule must block shell access in PreToolUse (Exit 2 contract).
+	if err := os.WriteFile(filepath.Join(e.Workspace, ".tether", "ignore"), []byte("private_custom.txt\nre:^internal_key.*$\n"), 0644); err != nil {
+		t.Fatalf("write .tether/ignore: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(e.Workspace, "private_custom.txt"), []byte("secret\n"), 0600); err != nil {
+		t.Fatalf("write private_custom.txt: %v", err)
+	}
+	for _, cmd := range []string{"cat private_custom.txt", "cat --file=private_custom.txt", "echo x > internal_key_1.txt"} {
+		payload := `{"tool_name":"run_command","tool_call":{"name":"run_command","args":{"command":` + mustQuoteTestStr(cmd) + `}}}`
+		if out, err := h.Handle("PreToolUse", strings.NewReader(payload)); err != nil || !strings.Contains(out, `"deny"`) {
+			t.Errorf("expected custom .tether/ignore rule to deny %q in PreToolUse, got %s (err=%v)", cmd, out, err)
+		}
+	}
 
 	for _, cmd := range []string{"rm -rf .tether", "mv .tether .tether.bak", "rm -rf .tether/snapshots"} {
 		payload := `{"tool_name":"run_command","tool_call":{"name":"run_command","args":{"command":` + mustQuoteTestStr(cmd) + `}}}`
@@ -503,6 +547,15 @@ func TestPreToolUse_BlocksProtectedSubstrateWritesAndMutatingShellInCodeMode(t *
 		roPayload := `{"tool_name":"run_command","tool_call":{"name":"run_command","args":{"command":` + mustQuoteTestStr(cmd) + `}}}`
 		if out, err := h.Handle("PreToolUse", strings.NewReader(roPayload)); err != nil || !strings.Contains(out, `"allow"`) {
 			t.Errorf("expected read-only command %q to stay allowed, got %s (err=%v)", cmd, out, err)
+		}
+	}
+
+	// Point 2 Shell Guard in PreToolUse: block secret globs, subshells, and redirections even in code mode.
+	for _, cmd := range []string{"cat .env", "cat .e*", "head *.pem", "cat $(echo .env)", "echo secret > .env"} {
+		payload := `{"tool_name":"run_command","tool_call":{"name":"run_command","args":{"command":` + mustQuoteTestStr(cmd) + `}}}`
+		out, err := h.Handle("PreToolUse", strings.NewReader(payload))
+		if err != nil || !strings.Contains(out, `"deny"`) {
+			t.Errorf("expected Point 2 shell guard to deny %q in PreToolUse, got %s (err=%v)", cmd, out, err)
 		}
 	}
 }

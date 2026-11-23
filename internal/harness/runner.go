@@ -180,7 +180,7 @@ func NewRunner(engine *core.Engine, cfg Config) *Runner {
 	}
 }
 
-// bootstrapSubstrate ensures project settings and FTS5 KB are populated on first launch
+// bootstrapSubstrate ensures project settings and FTS5 Markdown docs KB are populated on first launch
 func bootstrapSubstrate(engine *core.Engine) {
 	if settings, err := engine.GetAllProjectSettings(); err == nil && len(settings) == 0 {
 		for k, v := range core.DetectProjectSettings(engine.Workspace) {
@@ -188,7 +188,7 @@ func bootstrapSubstrate(engine *core.Engine) {
 		}
 	}
 	if stats, err := engine.KBStatus(); err == nil && stats.TotalFiles == 0 {
-		_, _ = engine.IndexDirectory(engine.Workspace, []string{"go", "md", "py", "js", "ts", "java", "rs"})
+		_, _ = engine.IndexDirectory(engine.Workspace, nil)
 	}
 }
 
@@ -454,29 +454,50 @@ func (r *Runner) printToolAction(name string, args map[string]interface{}) {
 		} else {
 			fmt.Fprintf(r.cfg.Out, "🔧 [read_file] %s\n", path)
 		}
+	case "glob":
+		pat, _ := args["pattern"].(string)
+		p, _ := args["path"].(string)
+		if p != "" && p != "." {
+			fmt.Fprintf(r.cfg.Out, "🔧 [glob] %s (in %s)\n", pat, p)
+		} else {
+			fmt.Fprintf(r.cfg.Out, "🔧 [glob] %s\n", pat)
+		}
+	case "grep":
+		pat, _ := args["pattern"].(string)
+		if pat == "" {
+			pat, _ = args["query"].(string)
+		}
+		p, _ := args["path"].(string)
+		if p != "" && p != "." {
+			fmt.Fprintf(r.cfg.Out, "🔧 [grep] %q in %s\n", pat, p)
+		} else {
+			fmt.Fprintf(r.cfg.Out, "🔧 [grep] %q\n", pat)
+		}
 	case "run_command":
 		cmd, _ := args["command"].(string)
 		fmt.Fprintf(r.cfg.Out, "🔧 [run_command] $ %s\n", cmd)
 	case "kb_search":
 		q, _ := args["query"].(string)
 		fmt.Fprintf(r.cfg.Out, "🔧 [kb_search] %q\n", q)
-	case "kb_index":
-		p, _ := args["path"].(string)
-		fmt.Fprintf(r.cfg.Out, "🔧 [kb_index] %s\n", p)
-	case "sql_query":
-		q, _ := args["query"].(string)
-		fmt.Fprintf(r.cfg.Out, "🔧 [sql_query] %s\n", q)
+	case "todo_manage":
+		act, _ := args["action"].(string)
+		d, _ := args["description"].(string)
+		id, _ := args["id"].(float64)
+		switch {
+		case d != "":
+			fmt.Fprintf(r.cfg.Out, "🔧 [todo_manage] %s: %s\n", act, d)
+		case id > 0:
+			fmt.Fprintf(r.cfg.Out, "🔧 [todo_manage] %s #%.0f\n", act, id)
+		default:
+			fmt.Fprintf(r.cfg.Out, "🔧 [todo_manage] %s\n", act)
+		}
+	case "mode_set":
+		m, _ := args["mode"].(string)
+		fmt.Fprintf(r.cfg.Out, "🔧 [mode_set] %s\n", m)
 	case "decision_add":
 		t, _ := args["topic"].(string)
 		d, _ := args["decision"].(string)
 		fmt.Fprintf(r.cfg.Out, "🔧 [decision_add] [%s] %s\n", t, d)
-	case "pattern_add":
-		t, _ := args["type"].(string)
-		d, _ := args["description"].(string)
-		fmt.Fprintf(r.cfg.Out, "🔧 [pattern_add] [%s] %s\n", t, d)
-	case "todo_add":
-		d, _ := args["description"].(string)
-		fmt.Fprintf(r.cfg.Out, "🔧 [todo_add] %s\n", d)
 	default:
 		fmt.Fprintf(r.cfg.Out, "🔧 [tool:%s]\n", name)
 	}

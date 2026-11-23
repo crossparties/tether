@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"unicode"
+
+	"github.com/crossparties/tether/internal/mount"
 )
 
 // DefaultMaxFileBytes is the fallback byte limit for SafeReadWorkspaceFile when maxBytes <= 0.
@@ -50,12 +52,7 @@ func (idx *Indexer) Root() string {
 
 // isIgnoredDir reports whether a directory name must be skipped during workspace indexing.
 func isIgnoredDir(name string) bool {
-	switch name {
-	case ".git", "node_modules", "vendor", ".bin", ".tether":
-		return true
-	default:
-		return false
-	}
+	return name == ".git" || name == ".tether" || mount.IsDefaultSkipDirName(name)
 }
 
 // isIgnoredFile reports whether a file name must be excluded from workspace indexing.
@@ -109,6 +106,7 @@ func (idx *Indexer) Scan() ([]FileEntry, error) {
 		return nil, fmt.Errorf("workspace root %q is not a directory", idx.root)
 	}
 
+	mountEngine := mount.NewEngine(idx.root)
 	var results []FileEntry
 	walkErr := filepath.WalkDir(idx.root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -118,10 +116,24 @@ func (idx *Indexer) Scan() ([]FileEntry, error) {
 			return nil
 		}
 
+		if d.Type()&fs.ModeSymlink != 0 {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
 		name := d.Name()
 		if d.IsDir() {
-			if path != idx.root && isIgnoredDir(name) {
-				return filepath.SkipDir
+			if path != idx.root {
+				if isIgnoredDir(name) {
+					return filepath.SkipDir
+				}
+				if relDir, rerr := filepath.Rel(idx.root, path); rerr == nil {
+					if mountEngine.ShouldSkipDir(filepath.ToSlash(relDir)) {
+						return filepath.SkipDir
+					}
+				}
 			}
 			return nil
 		}
@@ -130,7 +142,7 @@ func (idx *Indexer) Scan() ([]FileEntry, error) {
 			return nil
 		}
 
-		if d.Type()&fs.ModeSymlink != 0 || !d.Type().IsRegular() {
+		if !d.Type().IsRegular() {
 			return nil
 		}
 
@@ -139,6 +151,9 @@ func (idx *Indexer) Scan() ([]FileEntry, error) {
 			return nil
 		}
 		relSlash := filepath.ToSlash(rel)
+		if dec := mountEngine.AuthorizePath(relSlash, mount.OpRead, "code"); !dec.Allowed || dec.IsDir {
+			return nil
+		}
 
 		var sizeBytes int64
 		if fi, statErr := d.Info(); statErr == nil {
@@ -375,8 +390,9 @@ func ReplaceAtToken(input string, startByte, endByte int, relPath string) (newIn
 	return newInput, newCursorByte
 }
 
-// SafeReadWorkspaceFile safely reads a file inside workspaceRoot, rejecting path traversal (".."),
-// symlink escapes outside workspaceRoot, directories, binary files, and files exceeding maxBytes.
+// SafeReadWorkspaceFile safely reads a file inside workspaceRoot, enforcing
+// mount.Engine AuthorizePath (lexical traversal, symlink escape blocking,
+// built-in secrets, and .tether/ignore), plus directory, binary, and size checks.
 func SafeReadWorkspaceFile(workspaceRoot, relOrAbsPath string, maxBytes int64) (content string, cleanRel string, err error) {
 	if strings.TrimSpace(workspaceRoot) == "" {
 		return "", "", errors.New("workspace root is empty")
@@ -389,43 +405,19 @@ func SafeReadWorkspaceFile(workspaceRoot, relOrAbsPath string, maxBytes int64) (
 		maxBytes = DefaultMaxFileBytes
 	}
 
-	absRoot, err := filepath.Abs(workspaceRoot)
-	if err != nil {
-		return "", "", fmt.Errorf("resolve workspace root: %w", err)
+	dec := mount.NewEngine(workspaceRoot).AuthorizePath(targetRaw, mount.OpRead, "code")
+	if !dec.Allowed {
+		return "", "", errors.New(dec.Reason)
 	}
-	realRoot := absRoot
-	if resolved, evalErr := filepath.EvalSymlinks(absRoot); evalErr == nil {
-		realRoot = resolved
-	}
-
-	var candidatePath string
-	if filepath.IsAbs(targetRaw) {
-		candidatePath = filepath.Clean(targetRaw)
-	} else {
-		candidatePath = filepath.Clean(filepath.Join(realRoot, targetRaw))
-	}
-
-	relCheck, err := filepath.Rel(realRoot, candidatePath)
-	if err != nil || relCheck == ".." || strings.HasPrefix(relCheck, ".."+string(filepath.Separator)) {
-		return "", "", fmt.Errorf("access denied: path %q escapes workspace root", relOrAbsPath)
-	}
-
-	realTarget, err := filepath.EvalSymlinks(candidatePath)
-	if err != nil {
-		return "", "", fmt.Errorf("resolve file path %q: %w", relOrAbsPath, err)
-	}
-
-	relReal, err := filepath.Rel(realRoot, realTarget)
-	if err != nil || relReal == ".." || strings.HasPrefix(relReal, ".."+string(filepath.Separator)) {
-		return "", "", fmt.Errorf("access denied: symlink %q points outside workspace root", relOrAbsPath)
-	}
-
-	cleanRel = filepath.ToSlash(relReal)
-	if isIgnoredFile(filepath.Base(cleanRel)) || cleanRel == ".tether" || strings.HasPrefix(cleanRel, ".tether/") {
+	cleanRel = dec.RelPath
+	if isIgnoredFile(filepath.Base(cleanRel)) {
 		return "", "", fmt.Errorf("access denied: reading internal substrate path %q is restricted", cleanRel)
 	}
+	if dec.IsDir {
+		return "", "", fmt.Errorf("path %q is a directory, not a regular file", cleanRel)
+	}
 
-	info, err := os.Stat(realTarget)
+	info, err := os.Stat(dec.CanonicalPath)
 	if err != nil {
 		return "", "", fmt.Errorf("stat %q: %w", cleanRel, err)
 	}
@@ -439,7 +431,7 @@ func SafeReadWorkspaceFile(workspaceRoot, relOrAbsPath string, maxBytes int64) (
 		return "", cleanRel, fmt.Errorf("file %q size (%d bytes) exceeds maximum allowed (%d bytes)", cleanRel, info.Size(), maxBytes)
 	}
 
-	f, err := os.Open(realTarget)
+	f, err := os.Open(dec.CanonicalPath)
 	if err != nil {
 		return "", cleanRel, fmt.Errorf("open %q: %w", cleanRel, err)
 	}

@@ -270,4 +270,27 @@ func TestIsNonCriticalToolAndWorkspaceBoundaries(t *testing.T) {
 	if ok, _ := IsNonCriticalTool("code", "read_file", "internal/tui/view.go", "", ws); !ok {
 		t.Errorf("expected read_file on normal file to be non-critical")
 	}
+
+	// Policy config files (.tetherignore/.gitignore) stay readable but NEVER auto-approved on writes;
+	// .tether/PLAN.md is writable ONLY in plan mode.
+	for _, cfg := range []string{".tetherignore", ".gitignore"} {
+		if risk, _ := ClassifyRisk("write_file", cfg); risk != RiskHigh {
+			t.Errorf("expected write_file(%s) RiskHigh, got %s", cfg, risk)
+		}
+		if ok, _ := IsNonCriticalTool("code", "write_file", cfg, "", ws); ok {
+			t.Errorf("expected %s write NOT auto-approved in code mode", cfg)
+		}
+		if ok, _ := IsNonCriticalTool("plan", "write_file", cfg, "", ws); ok {
+			t.Errorf("expected %s write NOT allowed in plan mode", cfg)
+		}
+		if ok, _ := IsNonCriticalTool("code", "read_file", cfg, "", ws); !ok {
+			t.Errorf("expected %s read allowed", cfg)
+		}
+	}
+	if ok, _ := IsNonCriticalTool("code", "write_file", ".tether/PLAN.md", "", ws); ok {
+		t.Errorf("expected .tether/PLAN.md write blocked in code mode")
+	}
+	if ok, _ := IsNonCriticalTool("plan", "write_file", ".tether/PLAN.md", "", ws); !ok {
+		t.Errorf("expected .tether/PLAN.md write auto-approved in plan mode")
+	}
 }

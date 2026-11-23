@@ -400,8 +400,8 @@ func TestConfigureAgyPermissions(t *testing.T) {
 			t.Fatalf("theme = %v, want %q", doc["theme"], "dark")
 		}
 		allow := permissionStrings(t, nestedMap(t, doc, "permissions"), "allow")
-		if len(allow) != 20 {
-			t.Fatalf("permissions.allow has %d entries, want 20: %v", len(allow), allow)
+		if len(allow) != 11 {
+			t.Fatalf("permissions.allow has %d entries, want 11: %v", len(allow), allow)
 		}
 	})
 
@@ -412,8 +412,8 @@ func TestConfigureAgyPermissions(t *testing.T) {
 			t.Fatalf("configureAgyPermissions: %v", err)
 		}
 		perms := nestedMap(t, readJSON(t, settingsPathFor(home)), "permissions")
-		if got := len(permissionStrings(t, perms, "allow")); got != 20 {
-			t.Fatalf("permissions.allow has %d entries, want 20", got)
+		if got := len(permissionStrings(t, perms, "allow")); got != 11 {
+			t.Fatalf("permissions.allow has %d entries, want 11", got)
 		}
 	})
 
@@ -502,19 +502,19 @@ func TestConfigureAgyPermissions(t *testing.T) {
 		if err := configureAgyPermissions(home); err != nil {
 			t.Fatalf("first configureAgyPermissions: %v", err)
 		}
-		if got := countTetherAllowEntries(nestedMap(t, readJSON(t, settingsPathFor(home)), "permissions")); got != 20 {
-			t.Fatalf("after first run: %d tether allow entries, want 20", got)
+		if got := countTetherAllowEntries(nestedMap(t, readJSON(t, settingsPathFor(home)), "permissions")); got != 11 {
+			t.Fatalf("after first run: %d tether allow entries, want 11", got)
 		}
 
 		if err := configureAgyPermissions(home); err != nil {
 			t.Fatalf("second configureAgyPermissions: %v", err)
 		}
 		perms := nestedMap(t, readJSON(t, settingsPathFor(home)), "permissions")
-		if got := countTetherAllowEntries(perms); got != 20 {
-			t.Fatalf("after second run: %d tether allow entries, want 20 (must be deduped)", got)
+		if got := countTetherAllowEntries(perms); got != 11 {
+			t.Fatalf("after second run: %d tether allow entries, want 11 (must be deduped)", got)
 		}
-		if got := len(permissionStrings(t, perms, "allow")); got != 20 {
-			t.Fatalf("after second run: allow list has %d entries, want 20", got)
+		if got := len(permissionStrings(t, perms, "allow")); got != 11 {
+			t.Fatalf("after second run: allow list has %d entries, want 11", got)
 		}
 
 		content, err := os.ReadFile(settingsPathFor(home))

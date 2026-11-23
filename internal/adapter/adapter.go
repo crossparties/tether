@@ -180,28 +180,19 @@ func configureAgyPermissions(home string) error {
 		perms["deny"] = newDeny
 	}
 
-	// 2. Add tether permissions to allow list
+	// 2. Add tether permissions to allow list (aligned with focused 10 core tools)
 	tetherTools := []string{
 		"mcp(tether/*)",
-		"mcp(tether/workspace_info)",
-		"mcp(tether/session_load)",
-		"mcp(tether/session_save)",
-		"mcp(tether/session_done)",
-		"mcp(tether/setting_set)",
-		"mcp(tether/decision_add)",
-		"mcp(tether/pattern_add)",
-		"mcp(tether/mode_set)",
-		"mcp(tether/mode_get)",
-		"mcp(tether/kb_index)",
+		"mcp(tether/read_file)",
+		"mcp(tether/write_file)",
+		"mcp(tether/edit_file)",
+		"mcp(tether/glob)",
+		"mcp(tether/grep)",
+		"mcp(tether/run_command)",
 		"mcp(tether/kb_search)",
-		"mcp(tether/kb_status)",
-		"mcp(tether/todo_add)",
-		"mcp(tether/todo_list)",
-		"mcp(tether/todo_complete)",
-		"mcp(tether/todo_remove)",
-		"mcp(tether/task_classify)",
-		"mcp(tether/files_modified)",
-		"mcp(tether/sql_query)",
+		"mcp(tether/todo_manage)",
+		"mcp(tether/mode_set)",
+		"mcp(tether/decision_add)",
 	}
 
 	allowMap := make(map[string]bool)

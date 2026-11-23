@@ -2,23 +2,31 @@ package mcp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/crossparties/tether/internal/core"
+	"github.com/crossparties/tether/internal/mount"
 )
 
 // Server implements MCP protocol over stdio
 type Server struct {
 	engine *core.Engine
+	mount  *mount.Engine
 
 	// Approval request identity. A run of blocked calls otherwise prints the
 	// same opening words and boilerplate every time, so the reader cannot tell
@@ -104,7 +112,53 @@ func (s *Server) AutoApprovePolicy() func(Decision) bool {
 }
 
 func NewServer(engine *core.Engine) *Server {
-	return &Server{engine: engine}
+	var m *mount.Engine
+	if engine != nil {
+		m = engine.Mount()
+	}
+	return &Server{engine: engine, mount: m}
+}
+
+// Mount returns the Server's attached Mount Engine.
+func (s *Server) Mount() *mount.Engine {
+	return s.mountEngine()
+}
+
+func (s *Server) mountEngine() *mount.Engine {
+	if s.mount != nil {
+		return s.mount
+	}
+	if s.engine != nil {
+		return s.engine.Mount()
+	}
+	return mount.NewEngine(".")
+}
+
+func (s *Server) workspace() string {
+	if s.engine != nil && s.engine.Workspace != "" {
+		return s.engine.Workspace
+	}
+	return "."
+}
+
+func (s *Server) mode() string {
+	if s.engine != nil {
+		return s.engine.GetMode()
+	}
+	return "code"
+}
+
+func (s *Server) shellAuthorizer() func(rawPath string, write bool) (bool, string) {
+	m := s.mountEngine()
+	mode := s.mode()
+	return func(rawPath string, write bool) (bool, string) {
+		op := mount.OpRead
+		if write {
+			op = mount.OpWrite
+		}
+		d := m.AuthorizePath(rawPath, op, mode)
+		return d.Allowed, d.Reason
+	}
 }
 
 // JSON-RPC types
@@ -291,53 +345,121 @@ func (s *Server) handleInitialize(req *Request) *Response {
 func (s *Server) handleToolsList(req *Request) *Response {
 	tools := []Tool{
 		{
-			Name:        "workspace_info",
-			Description: "Get current workspace path, tech stack, and project settings",
-			InputSchema: InputSchema{Type: "object"},
-		},
-		{
-			Name:        "session_load",
-			Description: "Load the active session context (recent history, decisions, patterns)",
+			Name:        "read_file",
+			Description: "Read workspace file contents with 1-based line numbers (optionally specify start_line and end_line).",
 			InputSchema: InputSchema{
 				Type: "object",
 				Properties: map[string]Property{
-					"limit": {Type: "integer", Description: "Max context entries to return (default 10)"},
+					"path":       {Type: "string", Description: "Relative or workspace-contained path of the file to read"},
+					"start_line": {Type: "integer", Description: "Optional 1-based start line"},
+					"end_line":   {Type: "integer", Description: "Optional 1-based end line"},
 				},
+				Required: []string{"path"},
 			},
 		},
 		{
-			Name:        "session_save",
-			Description: "Save a context entry to the current session",
+			Name:        "write_file",
+			Description: "Create or overwrite a file inside the workspace (enforces .tether/ignore, secret protection, and approval policy).",
 			InputSchema: InputSchema{
 				Type: "object",
 				Properties: map[string]Property{
-					"agent":   {Type: "string", Description: "Agent name that produced this entry (e.g., agy, claude, codex, cursor)"},
-					"role":    {Type: "string", Description: "Role: user|assistant|plan|decision"},
-					"content": {Type: "string", Description: "Content to save"},
+					"path":    {Type: "string", Description: "Relative or workspace-contained path of the file to write"},
+					"content": {Type: "string", Description: "Full content to write to the file"},
 				},
-				Required: []string{"role", "content"},
+				Required: []string{"path", "content"},
 			},
 		},
 		{
-			Name:        "session_done",
-			Description: "Mark the current session as completed",
-			InputSchema: InputSchema{Type: "object"},
-		},
-		{
-			Name:        "setting_set",
-			Description: "Set a project setting (persists across sessions)",
+			Name:        "edit_file",
+			Description: "Replace an exact target block in an existing workspace file with replacement text.",
 			InputSchema: InputSchema{
 				Type: "object",
 				Properties: map[string]Property{
-					"key":   {Type: "string", Description: "Setting key"},
-					"value": {Type: "string", Description: "Setting value"},
+					"path":        {Type: "string", Description: "Relative or workspace-contained path of the file to edit"},
+					"target":      {Type: "string", Description: "Exact string to find and replace"},
+					"replacement": {Type: "string", Description: "Replacement string"},
 				},
-				Required: []string{"key", "value"},
+				Required: []string{"path", "target", "replacement"},
+			},
+		},
+		{
+			Name:        "glob",
+			Description: "Find workspace files matching a glob pattern (e.g. '**/*.go', 'internal/*/*.go'), obeying .tether/ignore and secret boundaries.",
+			InputSchema: InputSchema{
+				Type: "object",
+				Properties: map[string]Property{
+					"pattern": {Type: "string", Description: "Glob pattern supporting *, **, and ?"},
+					"path":    {Type: "string", Description: "Optional subdirectory relative to workspace root"},
+				},
+				Required: []string{"pattern"},
+			},
+		},
+		{
+			Name:        "grep",
+			Description: "Search workspace file contents with Go regex or literal matching, returning path:line: content and obeying .tether/ignore.",
+			InputSchema: InputSchema{
+				Type: "object",
+				Properties: map[string]Property{
+					"pattern": {Type: "string", Description: "Go regular expression or literal text to search"},
+					"path":    {Type: "string", Description: "Optional file or subdirectory relative to workspace root"},
+					"glob":    {Type: "string", Description: "Optional filename/path filter (e.g. '*.go')"},
+					"literal": {Type: "boolean", Description: "Treat pattern as literal text instead of regex (default false)"},
+				},
+				Required: []string{"pattern"},
+			},
+		},
+		{
+			Name:        "run_command",
+			Description: "Execute a shell command in the workspace subject to shell safety guardrails, mode boundaries, and approval policy.",
+			InputSchema: InputSchema{
+				Type: "object",
+				Properties: map[string]Property{
+					"command": {Type: "string", Description: "Shell command to execute"},
+				},
+				Required: []string{"command"},
+			},
+		},
+		{
+			Name:        "kb_search",
+			Description: "Search the repository documentation knowledge base (.tether/cache.db FTS5 with BM25 ranking).",
+			InputSchema: InputSchema{
+				Type: "object",
+				Properties: map[string]Property{
+					"query": {Type: "string", Description: "Full-text search query"},
+					"limit": {Type: "integer", Description: "Max results (default 10)"},
+				},
+				Required: []string{"query"},
+			},
+		},
+		{
+			Name:        "todo_manage",
+			Description: "Manage session todos (add, list, complete, remove).",
+			InputSchema: InputSchema{
+				Type: "object",
+				Properties: map[string]Property{
+					"action":            {Type: "string", Description: "Action: add | list | complete | remove"},
+					"description":       {Type: "string", Description: "Task description (for action=add)"},
+					"details":           {Type: "string", Description: "Optional details (for action=add)"},
+					"id":                {Type: "integer", Description: "Todo ID (for action=complete|remove)"},
+					"include_completed": {Type: "boolean", Description: "Include completed todos (for action=list)"},
+				},
+				Required: []string{"action"},
+			},
+		},
+		{
+			Name:        "mode_set",
+			Description: "Set active governance mode (plan=read-only except plan artifacts, code=full workspace access).",
+			InputSchema: InputSchema{
+				Type: "object",
+				Properties: map[string]Property{
+					"mode": {Type: "string", Description: "Mode: plan | code"},
+				},
+				Required: []string{"mode"},
 			},
 		},
 		{
 			Name:        "decision_add",
-			Description: "Record an architecture/design decision",
+			Description: "Record an architecture or design decision into .tether/session.db.",
 			InputSchema: InputSchema{
 				Type: "object",
 				Properties: map[string]Property{
@@ -346,217 +468,6 @@ func (s *Server) handleToolsList(req *Request) *Response {
 					"reason":   {Type: "string", Description: "Why"},
 				},
 				Required: []string{"topic", "decision", "reason"},
-			},
-		},
-		{
-			Name:        "pattern_add",
-			Description: "Record a learned pattern (do or avoid)",
-			InputSchema: InputSchema{
-				Type: "object",
-				Properties: map[string]Property{
-					"type":        {Type: "string", Description: "Pattern type: do|avoid"},
-					"description": {Type: "string", Description: "Pattern description"},
-				},
-				Required: []string{"type", "description"},
-			},
-		},
-		{
-			Name:        "mode_set",
-			Description: "Set current mode (plan=read-only, code=full access)",
-			InputSchema: InputSchema{
-				Type: "object",
-				Properties: map[string]Property{
-					"mode": {Type: "string", Description: "Mode: plan|code"},
-				},
-				Required: []string{"mode"},
-			},
-		},
-		{
-			Name:        "mode_get",
-			Description: "Get current mode and whether writes are allowed",
-			InputSchema: InputSchema{Type: "object"},
-		},
-		{
-			Name:        "kb_index",
-			Description: "Index a file or directory into the knowledge base for full-text search",
-			InputSchema: InputSchema{
-				Type: "object",
-				Properties: map[string]Property{
-					"path":       {Type: "string", Description: "File or directory path to index"},
-					"extensions": {Type: "string", Description: "Comma-separated file extensions to include (e.g., 'go,js,py'). Empty = all files"},
-				},
-				Required: []string{"path"},
-			},
-		},
-		{
-			Name:        "kb_search",
-			Description: "Search the knowledge base using full-text search (BM25 ranking)",
-			InputSchema: InputSchema{
-				Type: "object",
-				Properties: map[string]Property{
-					"query": {Type: "string", Description: "Search query (supports AND, OR, NOT, phrase matching with quotes)"},
-					"limit": {Type: "integer", Description: "Max results (default 10)"},
-				},
-				Required: []string{"query"},
-			},
-		},
-		{
-			Name:        "kb_status",
-			Description: "Show knowledge base stats (indexed files and chunks)",
-			InputSchema: InputSchema{Type: "object"},
-		},
-		{
-			Name:        "todo_add",
-			Description: "Add a todo item to track tasks",
-			InputSchema: InputSchema{
-				Type: "object",
-				Properties: map[string]Property{
-					"description": {Type: "string", Description: "Task description"},
-					"details":     {Type: "string", Description: "Optional details about the task"},
-				},
-				Required: []string{"description"},
-			},
-		},
-		{
-			Name:        "todo_list",
-			Description: "List all todos (pending and optionally completed)",
-			InputSchema: InputSchema{
-				Type: "object",
-				Properties: map[string]Property{
-					"include_completed": {Type: "string", Description: "Include completed todos? 'true' or 'false' (default false)"},
-				},
-			},
-		},
-		{
-			Name:        "todo_complete",
-			Description: "Mark a todo as completed",
-			InputSchema: InputSchema{
-				Type: "object",
-				Properties: map[string]Property{
-					"id": {Type: "integer", Description: "Todo ID to mark complete"},
-				},
-				Required: []string{"id"},
-			},
-		},
-		{
-			Name:        "todo_remove",
-			Description: "Remove a todo item",
-			InputSchema: InputSchema{
-				Type: "object",
-				Properties: map[string]Property{
-					"id": {Type: "integer", Description: "Todo ID to remove"},
-				},
-				Required: []string{"id"},
-			},
-		},
-		{
-			Name:        "task_classify",
-			Description: "Classify a task to determine optimal execution mode: tether_direct | tether_review | tether_plan.",
-			InputSchema: InputSchema{
-				Type: "object",
-				Properties: map[string]Property{
-					"prompt": {Type: "string", Description: "The user's task description or request"},
-				},
-				Required: []string{"prompt"},
-			},
-		},
-		{
-			Name:        "files_modified",
-			Description: "List all files modified in this session (useful for cross-agent handoff context)",
-			InputSchema: InputSchema{Type: "object"},
-		},
-		{
-			Name:        "sql_query",
-			Description: "Directly execute SQL query against .tether/session.db (full access to sessions, session_context, project_settings, decisions, learned_patterns, todos, approval_grants). Returns results as JSON.",
-			InputSchema: InputSchema{
-				Type: "object",
-				Properties: map[string]Property{
-					"query": {Type: "string", Description: "SQL query to execute (e.g. 'SELECT * FROM sessions', 'SELECT * FROM decisions')"},
-				},
-				Required: []string{"query"},
-			},
-		},
-		{
-			Name:        "read_file",
-			Description: "Read file contents in the workspace (optionally specify start_line and end_line to save context tokens).",
-			InputSchema: InputSchema{
-				Type: "object",
-				Properties: map[string]Property{
-					"path":       {Type: "string", Description: "Relative or absolute path of the file to read"},
-					"start_line": {Type: "integer", Description: "Optional 1-based start line"},
-					"end_line":   {Type: "integer", Description: "Optional 1-based end line"},
-				},
-				Required: []string{"path"},
-			},
-		},
-		{
-			Name:        "approve_change",
-			Description: "Record the user's approval for a change the guard blocked. Nothing is written: repeat the original tool call afterwards. Use scope=\"all\" to approve every change under the given path until the grant expires.",
-			InputSchema: InputSchema{
-				Type: "object",
-				Properties: map[string]Property{
-					"path":  {Type: "string", Description: "Path or command exactly as shown in the approval request"},
-					"scope": {Type: "string", Description: "once (default) or all (every change under path, or every command with the prefix)"},
-					"kind":  {Type: "string", Description: "path (default), command, or command-prefix. Use command kinds for run_command; they never authorize file writes."},
-				},
-				Required: []string{"path"},
-			},
-		},
-		{
-			Name:        "reject_change",
-			Description: "Decline a change the guard blocked. Nothing is written; ask the user what they want instead.",
-			InputSchema: InputSchema{
-				Type: "object",
-				Properties: map[string]Property{
-					"path": {Type: "string", Description: "Path exactly as shown in the approval request"},
-				},
-				Required: []string{"path"},
-			},
-		},
-		{
-			Name:        "list_grants",
-			Description: "Show approval grants currently in effect for this session.",
-			InputSchema: InputSchema{Type: "object", Properties: map[string]Property{}},
-		},
-		{
-			Name:        "revoke_grants",
-			Description: "Clear every approval grant so each change asks again.",
-			InputSchema: InputSchema{Type: "object", Properties: map[string]Property{}},
-		},
-		{
-			Name:        "write_file",
-			Description: "Create or overwrite a file in the workspace. Requires user approval unless a grant covers the path; the blocked response contains the preview and the approve_change call to use.",
-			InputSchema: InputSchema{
-				Type: "object",
-				Properties: map[string]Property{
-					"path":    {Type: "string", Description: "Relative or absolute path of the file to write"},
-					"content": {Type: "string", Description: "Full content to write to the file"},
-				},
-				Required: []string{"path", "content"},
-			},
-		},
-		{
-			Name:        "edit_file",
-			Description: "Replace an exact target string in an existing file with replacement text. Requires user approval unless a grant covers the path.",
-			InputSchema: InputSchema{
-				Type: "object",
-				Properties: map[string]Property{
-					"path":        {Type: "string", Description: "Relative or absolute path of the file to edit"},
-					"target":      {Type: "string", Description: "Exact string to find and replace"},
-					"replacement": {Type: "string", Description: "Replacement string"},
-				},
-				Required: []string{"path", "target", "replacement"},
-			},
-		},
-		{
-			Name:        "run_command",
-			Description: "Execute a shell command in the workspace. Requires user approval, and is additionally subject to Plan vs Code mode and catastrophic command guardrails.",
-			InputSchema: InputSchema{
-				Type: "object",
-				Properties: map[string]Property{
-					"command": {Type: "string", Description: "Shell command to execute"},
-				},
-				Required: []string{"command"},
 			},
 		},
 	}
@@ -568,7 +479,7 @@ func (s *Server) handleToolsList(req *Request) *Response {
 	}
 }
 
-// ListTools returns the full list of registered Tether + workspace tools
+// ListTools returns the focused core workspace and substrate tools.
 func (s *Server) ListTools() []Tool {
 	resp := s.handleToolsList(&Request{JSONRPC: "2.0", ID: 1})
 	if resp == nil {
@@ -588,16 +499,42 @@ func (s *Server) CallTool(name string, args json.RawMessage) (string, bool) {
 		args = json.RawMessage(`{}`)
 	}
 
-	// Approval gate: every mutating tool must be authorized before it can
-	// touch the workspace. This is the single choke point that the MCP path
-	// previously lacked, which let writes bypass internal/hooks entirely.
-	if msg := s.requireApproval(name, args); msg != "" {
-		return msg, true
+	// Hard security boundaries & approval gate share one unified validation/preview pass
+	// so neither session-wide approvals nor grants can bypass mount/secret/shell rules.
+	if mut, secErr, paramErr := s.prepareMutation(name, args); secErr != "" {
+		return secErr, true
+	} else if paramErr != "" {
+		return paramErr, true
+	} else if mut != nil {
+		if msg := s.authorizeMutation(mut); msg != "" {
+			return msg, true
+		}
+		switch name {
+		case "write_file":
+			return s.execWriteFile(mut)
+		case "edit_file":
+			return s.execEditFile(mut)
+		case "run_command":
+			return s.execRunCommand(mut)
+		}
 	}
 
 	switch name {
-	case "workspace_info":
-		return s.toolWorkspaceInfo(), false
+	case "read_file":
+		return s.toolReadFile(args)
+	case "glob":
+		return s.toolGlob(args)
+	case "grep":
+		return s.toolGrep(args)
+	case "kb_search":
+		return s.toolKBSearch(args)
+	case "todo_manage":
+		return s.toolTodoManage(args)
+	case "mode_set":
+		return s.toolModeSet(args)
+	case "decision_add":
+		return s.toolDecisionAdd(args)
+	// Internal stdio approval protocol tools (used by `tether mcp` external clients & tests).
 	case "approve_change":
 		return s.toolApproveChange("approve", args), false
 	case "reject_change":
@@ -606,50 +543,6 @@ func (s *Server) CallTool(name string, args json.RawMessage) (string, bool) {
 		return s.toolListGrants(), false
 	case "revoke_grants":
 		return s.toolRevokeGrants(), false
-	case "session_load":
-		return s.toolSessionLoad(args), false
-	case "session_save":
-		return s.toolSessionSave(args)
-	case "session_done":
-		return s.toolSessionDone()
-	case "setting_set":
-		return s.toolSettingSet(args)
-	case "decision_add":
-		return s.toolDecisionAdd(args)
-	case "pattern_add":
-		return s.toolPatternAdd(args)
-	case "mode_set":
-		return s.toolModeSet(args)
-	case "mode_get":
-		return s.toolModeGet(), false
-	case "kb_index":
-		return s.toolKBIndex(args)
-	case "kb_search":
-		return s.toolKBSearch(args)
-	case "kb_status":
-		return s.toolKBStatus(), false
-	case "todo_add":
-		return s.toolTodoAdd(args)
-	case "todo_list":
-		return s.toolTodoList(args), false
-	case "todo_complete":
-		return s.toolTodoComplete(args)
-	case "todo_remove":
-		return s.toolTodoRemove(args)
-	case "task_classify":
-		return s.toolTaskClassify(args), false
-	case "files_modified":
-		return s.toolFilesModified(), false
-	case "sql_query":
-		return s.toolSQLQuery(args)
-	case "read_file":
-		return s.toolReadFile(args)
-	case "write_file":
-		return s.toolWriteFile(args)
-	case "edit_file":
-		return s.toolEditFile(args)
-	case "run_command":
-		return s.toolRunCommand(args)
 	default:
 		return fmt.Sprintf("unknown tool: %s", name), true
 	}
@@ -675,18 +568,6 @@ func (s *Server) handleToolsCall(req *Request) *Response {
 }
 
 // --- Tool Implementations ---
-
-func (s *Server) toolWorkspaceInfo() string {
-	settings, _ := s.engine.GetAllProjectSettings()
-	info := map[string]interface{}{
-		"workspace":  s.engine.Workspace,
-		"session_id": s.engine.SessionID,
-		"mode":       s.engine.GetMode(),
-		"settings":   settings,
-	}
-	out, _ := json.MarshalIndent(info, "", "  ")
-	return string(out)
-}
 
 // toolApproveChange records the user's decision for a blocked mutation.
 //
@@ -786,72 +667,6 @@ func (s *Server) toolRevokeGrants() string {
 	return fmt.Sprintf("Revoked %d approval grant(s). Every change will ask again.", n)
 }
 
-func (s *Server) toolSessionLoad(args json.RawMessage) string {
-	var params struct {
-		Limit int `json:"limit"`
-	}
-	if err := json.Unmarshal(args, &params); err != nil {
-		return "invalid params"
-	}
-	if params.Limit == 0 {
-		params.Limit = 10
-	}
-
-	context, _ := s.engine.GetRecentContext(params.Limit)
-	decisions, _ := s.engine.GetDecisions()
-	patterns, _ := s.engine.GetPatterns()
-	summary, _ := s.engine.GetSessionSummary()
-
-	result := map[string]interface{}{
-		"session_id": s.engine.SessionID,
-		"summary":    summary,
-		"context":    context,
-		"decisions":  decisions,
-		"patterns":   patterns,
-	}
-	out, _ := json.MarshalIndent(result, "", "  ")
-	return string(out)
-}
-
-func (s *Server) toolSessionSave(args json.RawMessage) (string, bool) {
-	var params struct {
-		Agent   string `json:"agent"`
-		Role    string `json:"role"`
-		Content string `json:"content"`
-	}
-	if err := json.Unmarshal(args, &params); err != nil {
-		return "invalid params", true
-	}
-	if params.Agent == "" {
-		params.Agent = "unknown"
-	}
-	if err := s.engine.AddContext(params.Agent, params.Role, params.Content); err != nil {
-		return err.Error(), true
-	}
-	return "saved", false
-}
-
-func (s *Server) toolSessionDone() (string, bool) {
-	if err := s.engine.CompleteSession(); err != nil {
-		return err.Error(), true
-	}
-	return "session marked completed", false
-}
-
-func (s *Server) toolSettingSet(args json.RawMessage) (string, bool) {
-	var params struct {
-		Key   string `json:"key"`
-		Value string `json:"value"`
-	}
-	if err := json.Unmarshal(args, &params); err != nil {
-		return "invalid params", true
-	}
-	if err := s.engine.SetProjectSetting(params.Key, params.Value); err != nil {
-		return err.Error(), true
-	}
-	return fmt.Sprintf("set %s = %s", params.Key, params.Value), false
-}
-
 func (s *Server) toolDecisionAdd(args json.RawMessage) (string, bool) {
 	var params struct {
 		Topic    string `json:"topic"`
@@ -861,24 +676,13 @@ func (s *Server) toolDecisionAdd(args json.RawMessage) (string, bool) {
 	if err := json.Unmarshal(args, &params); err != nil {
 		return "invalid params", true
 	}
+	if strings.TrimSpace(params.Topic) == "" || strings.TrimSpace(params.Decision) == "" {
+		return "invalid params: topic and decision required", true
+	}
 	if err := s.engine.AddDecision(params.Topic, params.Decision, params.Reason); err != nil {
 		return err.Error(), true
 	}
 	return "decision recorded", false
-}
-
-func (s *Server) toolPatternAdd(args json.RawMessage) (string, bool) {
-	var params struct {
-		Type        string `json:"type"`
-		Description string `json:"description"`
-	}
-	if err := json.Unmarshal(args, &params); err != nil {
-		return "invalid params", true
-	}
-	if err := s.engine.AddPattern(params.Type, params.Description); err != nil {
-		return err.Error(), true
-	}
-	return "pattern recorded", false
 }
 
 func (s *Server) toolModeSet(args json.RawMessage) (string, bool) {
@@ -891,70 +695,21 @@ func (s *Server) toolModeSet(args json.RawMessage) (string, bool) {
 	if params.Mode != "plan" && params.Mode != "code" {
 		return "mode must be 'plan' or 'code'", true
 	}
-	s.engine.SetMode(params.Mode)
+	if err := s.engine.SetMode(params.Mode); err != nil {
+		return err.Error(), true
+	}
 	return fmt.Sprintf("mode set to: %s", params.Mode), false
 }
 
-func (s *Server) toolModeGet() string {
-	info := map[string]interface{}{
-		"mode":          s.engine.GetMode(),
-		"write_allowed": s.engine.IsWriteAllowed(),
-	}
-	out, _ := json.Marshal(info)
-	return string(out)
-}
-
-// --- Knowledge Base Tools ---
-
-func (s *Server) toolKBIndex(args json.RawMessage) (string, bool) {
-	var params struct {
-		Path       string `json:"path"`
-		Extensions string `json:"extensions"`
-	}
-	if err := json.Unmarshal(args, &params); err != nil {
-		return "invalid params", true
-	}
-
-	// Resolve relative path
-	path := params.Path
-	if !strings.HasPrefix(path, "/") {
-		path = s.engine.Workspace + "/" + path
-	}
-
-	// Check if file or directory
-	info, err := os.Stat(path)
-	if err != nil {
-		return fmt.Sprintf("path not found: %s", path), true
-	}
-
-	if info.IsDir() {
-		var exts []string
-		if params.Extensions != "" {
-			exts = strings.Split(params.Extensions, ",")
-			for i := range exts {
-				exts[i] = strings.TrimSpace(exts[i])
-			}
-		}
-		count, err := s.engine.IndexDirectory(path, exts)
-		if err != nil {
-			return err.Error(), true
-		}
-		return fmt.Sprintf("indexed %d files from %s", count, path), false
-	}
-
-	if err := s.engine.IndexFile(path); err != nil {
-		return err.Error(), true
-	}
-	return fmt.Sprintf("indexed file: %s", path), false
-}
+// --- Knowledge Base Search ---
 
 func (s *Server) toolKBSearch(args json.RawMessage) (string, bool) {
 	var params struct {
 		Query string `json:"query"`
 		Limit int    `json:"limit"`
 	}
-	if err := json.Unmarshal(args, &params); err != nil {
-		return "invalid params", true
+	if err := json.Unmarshal(args, &params); err != nil || strings.TrimSpace(params.Query) == "" {
+		return "invalid params: query required", true
 	}
 
 	results, err := s.engine.SearchKB(params.Query, params.Limit)
@@ -970,155 +725,80 @@ func (s *Server) toolKBSearch(args json.RawMessage) (string, bool) {
 	return string(out), false
 }
 
-func (s *Server) toolKBStatus() string {
-	stats, _ := s.engine.KBStatus()
-	out, _ := json.MarshalIndent(stats, "", "  ")
-	return string(out)
-}
+// --- Consolidated Todo Management ---
 
-// --- Todo Tools ---
-
-func (s *Server) toolTodoAdd(args json.RawMessage) (string, bool) {
+func (s *Server) toolTodoManage(args json.RawMessage) (string, bool) {
 	var params struct {
-		Description string `json:"description"`
-		Details     string `json:"details"`
+		Action           string          `json:"action"`
+		Description      string          `json:"description"`
+		Details          string          `json:"details"`
+		ID               int             `json:"id"`
+		IncludeCompleted json.RawMessage `json:"include_completed"`
 	}
 	if err := json.Unmarshal(args, &params); err != nil {
 		return "invalid params", true
 	}
-
-	id, err := s.engine.AddTodo(params.Description, params.Details)
-	if err != nil {
-		return err.Error(), true
-	}
-	return fmt.Sprintf("todo #%d added: %s", id, params.Description), false
-}
-
-func (s *Server) toolTodoList(args json.RawMessage) string {
-	var params struct {
-		IncludeCompleted string `json:"include_completed"`
-	}
-	if err := json.Unmarshal(args, &params); err != nil {
-		return "error: failed to parse params: " + err.Error()
-	}
-
-	includeCompleted := params.IncludeCompleted == "true"
-	todos, _ := s.engine.ListTodos(includeCompleted)
-
-	if len(todos) == 0 {
-		return "no todos"
-	}
-
-	out, _ := json.MarshalIndent(todos, "", "  ")
-	return string(out)
-}
-
-func (s *Server) toolTodoComplete(args json.RawMessage) (string, bool) {
-	var params struct {
-		ID int `json:"id"`
-	}
-	if err := json.Unmarshal(args, &params); err != nil {
-		return "invalid params", true
-	}
-
-	if err := s.engine.CompleteTodo(params.ID); err != nil {
-		return err.Error(), true
-	}
-	return fmt.Sprintf("todo #%d completed", params.ID), false
-}
-
-func (s *Server) toolTodoRemove(args json.RawMessage) (string, bool) {
-	var params struct {
-		ID int `json:"id"`
-	}
-	if err := json.Unmarshal(args, &params); err != nil {
-		return "invalid params", true
-	}
-
-	if err := s.engine.RemoveTodo(params.ID); err != nil {
-		return err.Error(), true
-	}
-	return fmt.Sprintf("todo #%d removed", params.ID), false
-}
-
-func (s *Server) toolTaskClassify(args json.RawMessage) string {
-	var params struct {
-		Prompt string `json:"prompt"`
-	}
-	if err := json.Unmarshal(args, &params); err != nil {
-		return "invalid params"
-	}
-
-	mode := core.ClassifyTask(params.Prompt)
-	switch mode {
-	case "tether_plan":
-		return `{"mode":"tether_plan","reason":"Plan/spec trigger detected","action":"Switch to plan mode and produce design artifact in docs/"}`
-	case "tether_review":
-		return `{"mode":"tether_review","reason":"Audit/review task detected","action":"Read-only audit without mutations"}`
-	default:
-		return `{"mode":"tether_direct","reason":"Implementation task","action":"Direct coding and tool execution"}`
-	}
-}
-
-// toolFilesModified returns all files modified in this session
-func (s *Server) toolFilesModified() string {
-	entries, err := s.engine.GetRecentContext(100)
-	if err != nil {
-		return "error fetching context"
-	}
-
-	seen := make(map[string]bool)
-	var files []string
-	for _, e := range entries {
-		if e.Role == "file_modified" && !seen[e.Content] {
-			seen[e.Content] = true
-			files = append(files, e.Content)
+	switch strings.ToLower(strings.TrimSpace(params.Action)) {
+	case "add":
+		if strings.TrimSpace(params.Description) == "" {
+			return "invalid params: description required for action=add", true
 		}
+		id, err := s.engine.AddTodo(params.Description, params.Details)
+		if err != nil {
+			return err.Error(), true
+		}
+		return fmt.Sprintf("todo #%d added: %s", id, params.Description), false
+	case "list":
+		includeCompleted := false
+		if len(params.IncludeCompleted) > 0 {
+			var b bool
+			if err := json.Unmarshal(params.IncludeCompleted, &b); err == nil {
+				includeCompleted = b
+			} else {
+				var str string
+				if err := json.Unmarshal(params.IncludeCompleted, &str); err == nil {
+					includeCompleted = strings.EqualFold(strings.TrimSpace(str), "true")
+				}
+			}
+		}
+		todos, err := s.engine.ListTodos(includeCompleted)
+		if err != nil {
+			return err.Error(), true
+		}
+		if len(todos) == 0 {
+			return "no todos", false
+		}
+		out, _ := json.MarshalIndent(todos, "", "  ")
+		return string(out), false
+	case "complete":
+		if params.ID <= 0 {
+			return "invalid params: positive id required for action=complete", true
+		}
+		if err := s.engine.CompleteTodo(params.ID); err != nil {
+			return err.Error(), true
+		}
+		return fmt.Sprintf("todo #%d completed", params.ID), false
+	case "remove":
+		if params.ID <= 0 {
+			return "invalid params: positive id required for action=remove", true
+		}
+		if err := s.engine.RemoveTodo(params.ID); err != nil {
+			return err.Error(), true
+		}
+		return fmt.Sprintf("todo #%d removed", params.ID), false
+	default:
+		return fmt.Sprintf("invalid action %q (expected add | list | complete | remove)", params.Action), true
 	}
-
-	if len(files) == 0 {
-		return "no files modified in this session"
-	}
-
-	out, _ := json.MarshalIndent(map[string]interface{}{
-		"session_id":     s.engine.SessionID,
-		"files_modified": files,
-		"count":          len(files),
-	}, "", "  ")
-	return string(out)
-}
-
-func (s *Server) toolSQLQuery(args json.RawMessage) (string, bool) {
-	var params struct {
-		Query string `json:"query"`
-	}
-	if err := json.Unmarshal(args, &params); err != nil {
-		return "invalid params", true
-	}
-	if strings.TrimSpace(params.Query) == "" {
-		return "query cannot be empty", true
-	}
-
-	res, err := s.engine.ExecuteSQL(params.Query)
-	if err != nil {
-		return fmt.Sprintf("sql error: %v", err), true
-	}
-
-	out, err := json.MarshalIndent(res, "", "  ")
-	if err != nil {
-		return fmt.Sprintf("marshal error: %v", err), true
-	}
-	return string(out), false
 }
 
 // --- Workspace Primitives (for Micro-Harness & MCP) ---
 
-func (s *Server) resolvePath(p string) string {
-	if filepath.IsAbs(p) {
-		return filepath.Clean(p)
-	}
-	return filepath.Join(s.engine.Workspace, p)
-}
+const (
+	maxReadFileBytes = 1024 * 1024
+	maxReadOutputLen = 32768
+)
+
+var errStopWalk = errors.New("stop walk")
 
 func (s *Server) toolReadFile(args json.RawMessage) (string, bool) {
 	var params struct {
@@ -1126,94 +806,375 @@ func (s *Server) toolReadFile(args json.RawMessage) (string, bool) {
 		StartLine int    `json:"start_line"`
 		EndLine   int    `json:"end_line"`
 	}
-	if err := json.Unmarshal(args, &params); err != nil || params.Path == "" {
+	if err := json.Unmarshal(args, &params); err != nil || strings.TrimSpace(params.Path) == "" {
 		return "invalid params: path required", true
 	}
-	data, err := os.ReadFile(s.resolvePath(params.Path))
+
+	d := s.mountEngine().AuthorizePath(params.Path, mount.OpRead, s.mode())
+	if !d.Allowed {
+		return d.Reason, true
+	}
+	if d.IsDir {
+		return fmt.Sprintf("path %q is a directory, not a regular file", d.RelPath), true
+	}
+
+	info, err := os.Stat(d.CanonicalPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Sprintf("file not found: %s", d.RelPath), true
+		}
+		return err.Error(), true
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Sprintf("path %q is not a regular file", d.RelPath), true
+	}
+	if info.Size() > maxReadFileBytes {
+		return fmt.Sprintf("file %s is too large (%d bytes; max %d bytes) — use start_line/end_line or grep", d.RelPath, info.Size(), maxReadFileBytes), true
+	}
+
+	data, err := os.ReadFile(d.CanonicalPath)
 	if err != nil {
 		return err.Error(), true
 	}
+	sampleLen := len(data)
+	if sampleLen > 8192 {
+		sampleLen = 8192
+	}
+	if bytes.IndexByte(data[:sampleLen], 0) >= 0 {
+		return fmt.Sprintf("cannot read binary file: %s", d.RelPath), true
+	}
+
 	content := strings.ReplaceAll(string(data), "\r\n", "\n")
-	if params.StartLine > 0 || params.EndLine > 0 {
-		lines := strings.Split(content, "\n")
-		start := params.StartLine
-		if start < 1 {
-			start = 1
-		}
-		end := params.EndLine
-		if end <= 0 || end > len(lines) {
-			end = len(lines)
-		}
-		if start > len(lines) || start > end {
-			return fmt.Sprintf("invalid line range %d-%d (file has %d lines)", start, end, len(lines)), true
-		}
-		var b strings.Builder
-		for i := start - 1; i < end; i++ {
-			fmt.Fprintf(&b, "%d: %s\n", i+1, lines[i])
-		}
-		content = b.String()
+	if content == "" {
+		return "", false
 	}
-	if len(content) > 32768 {
-		return content[:32768] + "\n... [truncated at 32KB]", false
+
+	trimmed := strings.TrimSuffix(content, "\n")
+	lines := strings.Split(trimmed, "\n")
+
+	start := params.StartLine
+	if start < 1 {
+		start = 1
 	}
-	return content, false
+	end := params.EndLine
+	if end <= 0 || end > len(lines) {
+		end = len(lines)
+	}
+	if start > len(lines) || start > end {
+		return fmt.Sprintf("invalid line range %d-%d (file has %d lines)", start, end, len(lines)), true
+	}
+
+	var b strings.Builder
+	for i := start - 1; i < end; i++ {
+		line := fmt.Sprintf("%d: %s\n", i+1, lines[i])
+		if b.Len()+len(line) > maxReadOutputLen {
+			if b.Len() == 0 {
+				limit := maxReadOutputLen - len("\n... [line truncated at 32KB]\n")
+				prefix := truncateUTF8(line, limit)
+				b.WriteString(prefix)
+				b.WriteString("\n... [line truncated at 32KB]\n")
+			} else {
+				b.WriteString("... [truncated at 32KB]\n")
+			}
+			break
+		}
+		b.WriteString(line)
+	}
+	return b.String(), false
 }
 
-func (s *Server) toolWriteFile(args json.RawMessage) (string, bool) {
+func truncateUTF8(s string, maxBytes int) string {
+	if maxBytes <= 0 || len(s) == 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
+
+func (s *Server) execWriteFile(m *mutation) (string, bool) {
+	if err := os.MkdirAll(filepath.Dir(m.canonPath), 0755); err != nil {
+		return err.Error(), true
+	}
+	if err := os.WriteFile(m.canonPath, []byte(m.content), 0644); err != nil {
+		return err.Error(), true
+	}
+	if s.engine != nil {
+		_ = s.engine.IndexFile(m.canonPath)
+	}
+	return fmt.Sprintf("wrote %d bytes to %s%s", len(m.content), m.relPath, s.autoVerifyGo(m.canonPath)), false
+}
+
+func (s *Server) execEditFile(m *mutation) (string, bool) {
+	data, err := os.ReadFile(m.canonPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Sprintf("file not found: %s", m.relPath), true
+		}
+		return err.Error(), true
+	}
+	updated, tier, err := applyFuzzyEdit(string(data), m.target, m.replace)
+	if err != nil {
+		return err.Error(), true
+	}
+	if err := os.WriteFile(m.canonPath, []byte(updated), 0644); err != nil {
+		return err.Error(), true
+	}
+	if s.engine != nil {
+		_ = s.engine.IndexFile(m.canonPath)
+	}
+	return fmt.Sprintf("edited %s (match:%s)%s", m.relPath, tier, s.autoVerifyGo(m.canonPath)), false
+}
+
+func (s *Server) walkWorkspaceFiles(mountEng *mount.Engine, searchRoot, mode string, visit func(dec mount.Decision) bool) error {
+	ws := s.workspace()
+	return filepath.WalkDir(searchRoot, func(path string, d fs.DirEntry, werr error) error {
+		if werr != nil {
+			return nil
+		}
+		if d.Type()&fs.ModeSymlink != 0 {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() {
+			if path == searchRoot {
+				return nil
+			}
+			if d.Name() == ".git" || d.Name() == ".tether" {
+				return filepath.SkipDir
+			}
+			if relDir, _, _, err := mount.ResolveWithinWorkspace(path, ws); err == nil && relDir != "." {
+				if mountEng.ShouldSkipDir(relDir) {
+					return filepath.SkipDir
+				}
+			}
+			return nil
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		dec := mountEng.AuthorizePath(path, mount.OpRead, mode)
+		if !dec.Allowed || dec.IsDir {
+			return nil
+		}
+		if !visit(dec) {
+			return errStopWalk
+		}
+		return nil
+	})
+}
+
+func (s *Server) toolGlob(args json.RawMessage) (string, bool) {
 	var params struct {
+		Pattern string `json:"pattern"`
 		Path    string `json:"path"`
-		Content string `json:"content"`
 	}
-	if err := json.Unmarshal(args, &params); err != nil || params.Path == "" {
-		return "invalid params: path and content required", true
+	if err := json.Unmarshal(args, &params); err != nil || strings.TrimSpace(params.Pattern) == "" {
+		return "invalid params: pattern required", true
 	}
-	fullPath := s.resolvePath(params.Path)
-	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
-		return err.Error(), true
+	rawPattern := strings.TrimSpace(filepath.ToSlash(params.Pattern))
+	if strings.Contains(rawPattern, "..") || strings.HasPrefix(rawPattern, "/") {
+		return fmt.Sprintf("access denied: glob pattern %q escapes workspace root", params.Pattern), true
 	}
-	if err := os.WriteFile(fullPath, []byte(params.Content), 0644); err != nil {
-		return err.Error(), true
+	re, err := mount.CompileWorkspaceGlob(rawPattern)
+	if err != nil {
+		return fmt.Sprintf("invalid glob pattern: %v", err), true
 	}
-	_ = s.engine.IndexFile(fullPath)
-	return fmt.Sprintf("wrote %d bytes to %s%s", len(params.Content), params.Path, s.autoVerifyGo(fullPath)), false
+
+	mountEng := s.mountEngine()
+	searchRoot, baseRel, reason := s.resolveSearchRoot(params.Path, mountEng)
+	if reason != "" {
+		return reason, true
+	}
+
+	const maxMatches = 200
+	var matches []string
+	total := 0
+
+	walkErr := s.walkWorkspaceFiles(mountEng, searchRoot, s.mode(), func(dec mount.Decision) bool {
+		targetForMatch := dec.RelPath
+		if baseRel != "" {
+			targetForMatch = strings.TrimPrefix(dec.RelPath, baseRel+"/")
+		}
+		if re.MatchString(targetForMatch) || re.MatchString(dec.RelPath) {
+			total++
+			if len(matches) < maxMatches {
+				matches = append(matches, dec.RelPath)
+			}
+		}
+		return true
+	})
+	if walkErr != nil && !errors.Is(walkErr, errStopWalk) {
+		return walkErr.Error(), true
+	}
+	if len(matches) == 0 {
+		return "no files matched", false
+	}
+	sort.Strings(matches)
+	out := strings.Join(matches, "\n")
+	if total > maxMatches {
+		out += fmt.Sprintf("\n... (%d more matches omitted)", total-maxMatches)
+	}
+	return out, false
 }
 
-func (s *Server) toolEditFile(args json.RawMessage) (string, bool) {
+func (s *Server) toolGrep(args json.RawMessage) (string, bool) {
 	var params struct {
-		Path        string `json:"path"`
-		Target      string `json:"target"`
-		Replacement string `json:"replacement"`
+		Pattern string `json:"pattern"`
+		Query   string `json:"query"`
+		Path    string `json:"path"`
+		Glob    string `json:"glob"`
+		Literal bool   `json:"literal"`
 	}
-	if err := json.Unmarshal(args, &params); err != nil || params.Path == "" || params.Target == "" {
-		return "invalid params: path and target required", true
+	if err := json.Unmarshal(args, &params); err != nil {
+		return "invalid params", true
 	}
-	fullPath := s.resolvePath(params.Path)
-	data, err := os.ReadFile(fullPath)
-	if err != nil {
-		return err.Error(), true
+	pat := params.Pattern
+	if pat == "" {
+		pat = params.Query
 	}
-	updated, tier, err := applyFuzzyEdit(string(data), params.Target, params.Replacement)
-	if err != nil {
-		return err.Error(), true
+	if pat == "" {
+		return "invalid params: pattern required", true
 	}
-	if err := os.WriteFile(fullPath, []byte(updated), 0644); err != nil {
-		return err.Error(), true
+
+	var matcher *regexp.Regexp
+	if !params.Literal {
+		var rerr error
+		matcher, rerr = regexp.Compile(pat)
+		if rerr != nil {
+			return fmt.Sprintf("invalid regex: %v", rerr), true
+		}
 	}
-	_ = s.engine.IndexFile(fullPath)
-	return fmt.Sprintf("edited %s (match:%s)%s", params.Path, tier, s.autoVerifyGo(fullPath)), false
+
+	var fileFilter *regexp.Regexp
+	if g := strings.TrimSpace(filepath.ToSlash(params.Glob)); g != "" {
+		if !strings.Contains(g, "/") {
+			g = "**/" + g
+		}
+		var gerr error
+		fileFilter, gerr = mount.CompileWorkspaceGlob(g)
+		if gerr != nil {
+			return fmt.Sprintf("invalid glob filter: %v", gerr), true
+		}
+	}
+
+	mountEng := s.mountEngine()
+	mode := s.mode()
+	searchRoot, _, reason := s.resolveSearchRoot(params.Path, mountEng)
+	if reason != "" {
+		return reason, true
+	}
+
+	const maxLines = 100
+	var outLines []string
+	truncated := false
+
+	scanFile := func(canonPath, relPath string) {
+		if truncated {
+			return
+		}
+		if fileFilter != nil && !fileFilter.MatchString(relPath) {
+			return
+		}
+		info, err := os.Stat(canonPath)
+		if err != nil || !info.Mode().IsRegular() || info.Size() > 2*1024*1024 {
+			return
+		}
+		f, err := os.Open(canonPath)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+
+		var sample [512]byte
+		n, _ := f.Read(sample[:])
+		if bytes.IndexByte(sample[:n], 0) >= 0 {
+			return // skip binary files
+		}
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return
+		}
+
+		scanner := bufio.NewScanner(f)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		lineNo := 0
+		for scanner.Scan() {
+			lineNo++
+			text := scanner.Text()
+			matched := false
+			if params.Literal {
+				matched = strings.Contains(text, pat)
+			} else {
+				matched = matcher.MatchString(text)
+			}
+			if matched {
+				outLines = append(outLines, fmt.Sprintf("%s:%d: %s", relPath, lineNo, text))
+				if len(outLines) >= maxLines {
+					truncated = true
+					return
+				}
+			}
+		}
+		_ = scanner.Err()
+	}
+
+	walkErr := s.walkWorkspaceFiles(mountEng, searchRoot, mode, func(dec mount.Decision) bool {
+		scanFile(dec.CanonicalPath, dec.RelPath)
+		return !truncated
+	})
+	if walkErr != nil && !errors.Is(walkErr, errStopWalk) {
+		return walkErr.Error(), true
+	}
+
+	if len(outLines) == 0 {
+		return "no matches found", false
+	}
+	res := strings.Join(outLines, "\n")
+	if truncated {
+		res += fmt.Sprintf("\n... (truncated at %d matches)", maxLines)
+	}
+	return res, false
+}
+
+func (s *Server) resolveSearchRoot(rawPath string, mountEng *mount.Engine) (canonRoot, relPrefix, errReason string) {
+	trimmed := strings.TrimSpace(rawPath)
+	if trimmed == "" || trimmed == "." {
+		abs, err := filepath.Abs(s.workspace())
+		if err != nil {
+			return "", "", err.Error()
+		}
+		realRoot, err := mount.EvalSymlinksWithAncestor(abs)
+		if err != nil {
+			return "", "", err.Error()
+		}
+		return realRoot, "", ""
+	}
+	d := mountEng.AuthorizePath(trimmed, mount.OpRead, s.mode())
+	if !d.Allowed {
+		return "", "", d.Reason
+	}
+	return d.CanonicalPath, d.RelPath, ""
 }
 
 func (s *Server) autoVerifyGo(fullPath string) string {
 	if !strings.HasSuffix(fullPath, ".go") {
 		return ""
 	}
-	if _, err := os.Stat(filepath.Join(s.engine.Workspace, "go.mod")); err != nil {
+	ws := s.workspace()
+	if _, err := os.Stat(filepath.Join(ws, "go.mod")); err != nil {
 		return ""
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "go", "vet", "./...")
-	cmd.Dir = s.engine.Workspace
+	cmd.Dir = ws
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "\n⚠ go vet failed:\n" + strings.TrimSpace(string(out))
@@ -1355,17 +1316,11 @@ func leadingWhitespace(s string) string {
 	return s[:len(s)-len(trimmed)]
 }
 
-func (s *Server) toolRunCommand(args json.RawMessage) (string, bool) {
-	var params struct {
-		Command string `json:"command"`
-	}
-	if err := json.Unmarshal(args, &params); err != nil || strings.TrimSpace(params.Command) == "" {
-		return "invalid params: command required", true
-	}
+func (s *Server) execRunCommand(m *mutation) (string, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "sh", "-c", params.Command)
-	cmd.Dir = s.engine.Workspace
+	cmd := exec.CommandContext(ctx, "sh", "-c", m.command)
+	cmd.Dir = s.workspace()
 	out, err := cmd.CombinedOutput()
 	output := string(out)
 	if len(output) > 16384 {

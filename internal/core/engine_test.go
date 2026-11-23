@@ -133,7 +133,7 @@ func TestPatterns(t *testing.T) {
 func TestKBIndexAndSearch(t *testing.T) {
 	e := newTestEngine(t)
 
-	fpath := filepath.Join(t.TempDir(), "notes.txt")
+	fpath := filepath.Join(e.Workspace, "notes.txt")
 	if err := os.WriteFile(fpath, []byte("tether engine uses sqlite for persistent session storage"), 0644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
@@ -710,5 +710,78 @@ func TestIndexDirectoryTransactional(t *testing.T) {
 	hits, err := e.SearchKB("betaSignal", 5)
 	if err != nil || len(hits) != 1 {
 		t.Fatalf("SearchKB(betaSignal) = %+v, err=%v", hits, err)
+	}
+}
+
+func TestDetectProjectSettingsMultiStackAndReconcileKB(t *testing.T) {
+	ws := t.TempDir()
+	files := map[string]string{
+		"go.mod":           "module example.com/multi\ngo 1.26\n",
+		"web/package.json": `{"dependencies":{"svelte":"^5.0.0","typescript":"^5.5.0"},"scripts":{"build":"vite build","test":"vitest run","check":"svelte-check"}}`,
+		"pyproject.toml":   "[project]\nname='ml'\n",
+		"Cargo.toml":       "[package]\nname='fast'\n",
+		"README.md":        "# Public Guide\npublic_keyword\n",
+		"secret_doc.md":    "# Secret Doc\nsecret_keyword\n",
+		".env":             "TOKEN=never_index_this\n",
+	}
+	for rel, body := range files {
+		full := filepath.Join(ws, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	settings := DetectProjectSettings(ws)
+	for _, want := range []string{"go", "svelte", "python", "rust"} {
+		if !strings.Contains(settings["tech_stack"], want) {
+			t.Errorf("DetectProjectSettings tech_stack = %q, missing %q", settings["tech_stack"], want)
+		}
+	}
+	if settings["frontend_dir"] != "web" {
+		t.Errorf("frontend_dir = %q, want 'web'", settings["frontend_dir"])
+	}
+	if !strings.Contains(settings["check_cmd"], "go vet") || !strings.Contains(settings["check_cmd"], "cd web && npm run check") {
+		t.Errorf("unexpected multi-stack check_cmd (want unparenthesized cd): %q", settings["check_cmd"])
+	}
+
+	e, err := NewEngine(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	if err := e.CompleteTodo(99999); err == nil {
+		t.Errorf("expected CompleteTodo on nonexistent ID to return error")
+	}
+	if err := e.RemoveTodo(99999); err == nil {
+		t.Errorf("expected RemoveTodo on nonexistent ID to return error")
+	}
+
+	// Default IndexDirectory prioritizes markdown and skips .env
+	count, err := e.IndexDirectory(ws, nil)
+	if err != nil || count != 2 {
+		t.Fatalf("IndexDirectory(nil) = (%d, %v), want (2, nil)", count, err)
+	}
+	if err := e.IndexFile(filepath.Join(ws, ".env")); err == nil {
+		t.Fatal("expected IndexFile(.env) to be rejected")
+	}
+
+	// Tighten ignore via ReconcileKB
+	purged, err := e.ReconcileKB(func(rel string) bool {
+		return strings.HasSuffix(rel, "secret_doc.md")
+	})
+	if err != nil || purged != 1 {
+		t.Fatalf("ReconcileKB = (%d, %v), want (1, nil)", purged, err)
+	}
+	hits, err := e.SearchKB("secret_keyword", 5)
+	if err != nil || len(hits) != 0 {
+		t.Fatalf("expected 0 hits after ReconcileKB, got %+v (err=%v)", hits, err)
+	}
+	pubHits, err := e.SearchKB("public_keyword", 5)
+	if err != nil || len(pubHits) != 1 {
+		t.Fatalf("expected README.md to stay searchable, got %+v (err=%v)", pubHits, err)
 	}
 }
