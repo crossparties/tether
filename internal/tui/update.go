@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -74,8 +75,30 @@ func (m Model) Update(msg any) Model {
 			// Reasoning & intermediate prose end when tool calls begin; flush thought block.
 			m.flushReasoning(time.Now())
 			m.liveStream = 0
+			m.liveThought = 0
 			m.LiveStatus = "Running tools…"
 			m.Workers[0].Task = "Running tools…"
+		case "stream.retry_reset":
+			// Discard both flushed Thought and partial streamed content from the aborted attempt.
+			m.ReasoningBuf = ""
+			m.ReasoningStarted = time.Time{}
+			m.rollbackActiveStream()
+			m.LiveStatus = "Retrying stream…"
+			m.Workers[0].Task = "Retrying stream…"
+		case "keys.switched":
+			if m.Bridge != nil {
+				if m.Bridge.Provider != nil {
+					m.ProviderName = m.Bridge.Provider()
+				}
+				if m.Bridge.Model != nil {
+					m.ModelName = m.Bridge.Model()
+				}
+			}
+			m.Stream = append(m.Stream, StreamEntry{
+				Kind:  StreamSystemNotice,
+				Title: "🔑 Failover",
+				Body:  []string{ev.Text},
+			})
 		case "content":
 			m.flushReasoning(time.Now())
 			if m.liveStream == 0 {
@@ -98,6 +121,7 @@ func (m Model) Update(msg any) Model {
 	case AgentTurnDoneMsg:
 		if ev.WorkerID == "main" {
 			m.flushReasoning(time.Now())
+			m.liveThought = 0
 			m.LiveStatus = ""
 		}
 		// Finalize the live streamed block instead of appending a duplicate answer.
@@ -740,8 +764,8 @@ func (m Model) submitInput() Model {
 		return m
 	}
 
-	// If awaiting API key entry on first launch
-	if m.AwaitingKey && m.Bridge != nil && m.Bridge.SaveAPIKey != nil {
+	// If awaiting API key entry on first launch (skip slash commands like /key list, /provider)
+	if m.AwaitingKey && !strings.HasPrefix(raw, "/") && m.Bridge != nil && m.Bridge.SaveAPIKey != nil {
 		m.InputBuffer = ""
 		m.CursorPos = 0
 		if err := m.Bridge.SaveAPIKey(raw); err != nil {
@@ -852,24 +876,55 @@ func (m Model) submitInput() Model {
 		return m
 	}
 
-	// Handle /key <api-key>
-	if strings.HasPrefix(raw, "/key") {
+	// Handle /key <api-key|list|probe>
+	if raw == "/key" || strings.HasPrefix(raw, "/key ") {
 		arg := strings.TrimSpace(strings.TrimPrefix(raw, "/key"))
 		if arg == "" {
 			m.Stream = append(m.Stream, StreamEntry{
 				Kind:  StreamSystemNotice,
 				Title: "API key usage",
-				Body:  []string{"Usage: /key <api-key> to save credentials for the active provider."},
+				Body:  []string{"Usage: /key <api-key> | /key list | /key probe"},
+			})
+			return m
+		}
+		switch strings.ToLower(arg) {
+		case "list":
+			body := []string{fmt.Sprintf("Active provider: %s (%s)", m.ProviderName, m.ModelName)}
+			if m.Bridge != nil && m.Bridge.ListKeys != nil {
+				body = strings.Split(m.Bridge.ListKeys(), "\n")
+			}
+			m.Stream = append(m.Stream, StreamEntry{
+				Kind:  StreamSystemNotice,
+				Title: "🔑 API Key Pool",
+				Body:  body,
+			})
+			return m
+		case "probe":
+			body := []string{"Zero-token probe is unavailable without an active key pool."}
+			if m.Bridge != nil && m.Bridge.ProbeKeys != nil {
+				body = strings.Split(m.Bridge.ProbeKeys(context.Background()), "\n")
+			}
+			m.Stream = append(m.Stream, StreamEntry{
+				Kind:  StreamSystemNotice,
+				Title: "🩺 Key Probe",
+				Body:  body,
 			})
 			return m
 		}
 		if m.Bridge != nil && m.Bridge.SaveAPIKey != nil {
-			_ = m.Bridge.SaveAPIKey(arg)
+			if err := m.Bridge.SaveAPIKey(arg); err != nil {
+				m.Stream = append(m.Stream, StreamEntry{
+					Kind:  StreamSystemNotice,
+					Title: "✖ [API Key Error]",
+					Body:  []string{err.Error()},
+				})
+				return m
+			}
 		}
 		m.AwaitingKey = false
 		m.Stream = append(m.Stream, StreamEntry{
 			Kind:  StreamSystemNotice,
-			Title: "? API key",
+			Title: "🔑 API key saved",
 			Body:  []string{fmt.Sprintf("> Saved for %s", m.ProviderName)},
 		})
 		return m
@@ -1149,12 +1204,32 @@ func (m *Model) flushReasoning(now time.Time) {
 		m.Stream = append(m.Stream, StreamEntry{})
 		copy(m.Stream[pos+1:], m.Stream[pos:])
 		m.Stream[pos] = entry
+		m.liveThought = pos + 1
 		m.liveStream++
 	} else {
 		m.Stream = append(m.Stream, entry)
+		m.liveThought = len(m.Stream)
 	}
 	m.ReasoningBuf = ""
 	m.ReasoningStarted = time.Time{}
+}
+
+func (m *Model) rollbackActiveStream() {
+	var idxs []int
+	if m.liveStream > 0 && m.liveStream-1 < len(m.Stream) {
+		idxs = append(idxs, m.liveStream-1)
+	}
+	if m.liveThought > 0 && m.liveThought-1 < len(m.Stream) && m.liveThought != m.liveStream {
+		idxs = append(idxs, m.liveThought-1)
+	}
+	if len(idxs) == 2 && idxs[0] < idxs[1] {
+		idxs[0], idxs[1] = idxs[1], idxs[0]
+	}
+	for _, idx := range idxs {
+		m.Stream = append(m.Stream[:idx], m.Stream[idx+1:]...)
+	}
+	m.liveStream = 0
+	m.liveThought = 0
 }
 
 func firstMeaningfulLine(s string) string {

@@ -314,7 +314,7 @@ func TestPrintToolActionLabelsWrite(t *testing.T) {
 
 	var buf bytes.Buffer
 	r := &Runner{engine: e, cfg: Config{Out: &buf}}
-	r.printToolAction("write_file", map[string]interface{}{
+	r.printToolAction(&buf, "write_file", map[string]interface{}{
 		"path":    "internal/x.go",
 		"content": "package x\n",
 	})

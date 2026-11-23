@@ -102,6 +102,8 @@ type AgentBridge struct {
 	Branch         func() string
 	NeedsAPIKey    func() bool
 	SaveAPIKey     func(key string) error
+	ListKeys       func() string
+	ProbeKeys      func(ctx context.Context) string
 	ListModels     func() []PickerOption
 	SwitchModel    func(name string) (string, error)
 	ListProviders  func() []PickerOption
@@ -276,9 +278,10 @@ type Model struct {
 	// terminal's native text selection works, so the user can drag-select and copy.
 	MouseCapture bool
 
-	// liveStream is 1 + the index in Stream of the Main Agent block currently receiving
-	// streamed tokens (0 = none). The +1 keeps the zero value meaning "no live block".
-	liveStream int
+	// liveStream and liveThought are 1 + the indices in Stream of the Main Agent block
+	// and flushed thought block for the active attempt (0 = none).
+	liveStream  int
+	liveThought int
 
 	// Live faded reasoning & activity status (agy-style live preview while working)
 	ReasoningBuf     string

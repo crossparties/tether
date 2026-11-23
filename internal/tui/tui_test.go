@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -679,5 +681,102 @@ func TestIndexWorkspaceFilesExcludesSubstrateDBs(t *testing.T) {
 		if got[excluded] {
 			t.Errorf("expected %q to be excluded from @ file index, got %v", excluded, m.FileIndex)
 		}
+	}
+}
+
+func TestStreamRetryResetDiscardsPartialBufferAndKeysSwitchedUpdatesModel(t *testing.T) {
+	prov := "deepseek"
+	mod := "deepseek-chat"
+	m := NewModel(".")
+	m.ProviderName = prov
+	m.ModelName = mod
+	m.Bridge = &AgentBridge{
+		Provider: func() string { return prov },
+		Model:    func() string { return mod },
+	}
+	m = m.Update(WindowSizeMsg{Width: 100, Height: 28})
+	for _, r := range "check failover" {
+		m = m.Update(KeyMsg{Type: KeyRune, Rune: r})
+	}
+	m = m.Update(KeyMsg{Type: KeyEnter})
+
+	// Simulate reasoning -> content -> stream.retry_reset (must roll back BOTH flushed Thought and partial content).
+	m = m.Update(AgentDeltaMsg{Kind: "reasoning", Text: "aborted thought"})
+	if m.ReasoningBuf == "" {
+		t.Fatalf("expected active reasoning buffer")
+	}
+	m = m.Update(AgentDeltaMsg{Kind: "content", Text: "stale partial"})
+	if m.liveStream == 0 || m.liveThought == 0 {
+		t.Fatalf("expected both active liveStream and flushed liveThought, got stream=%d thought=%d", m.liveStream, m.liveThought)
+	}
+
+	// stream.retry_reset must discard BOTH the flushed Thought entry and partial content block.
+	m = m.Update(AgentDeltaMsg{Kind: "stream.retry_reset", Text: "idle timeout"})
+	if m.liveStream != 0 || m.liveThought != 0 || m.ReasoningBuf != "" {
+		t.Fatalf("expected liveStream=0, liveThought=0, empty ReasoningBuf after stream.retry_reset, got stream=%d thought=%d buf=%q", m.liveStream, m.liveThought, m.ReasoningBuf)
+	}
+	for _, entry := range m.Stream {
+		joined := strings.Join(entry.Body, "\n")
+		if strings.Contains(joined, "stale partial") || strings.Contains(joined, "aborted thought") {
+			t.Fatalf("aborted stream thought/content should have been rolled back on retry reset: %+v", entry)
+		}
+	}
+
+	// keys.switched updates active provider/model and appends failover notice.
+	prov = "openai"
+	mod = "gpt-4o"
+	m = m.Update(AgentDeltaMsg{Kind: "keys.switched", Text: "deepseek:ds-1 -> openai:oai-1"})
+	if m.ProviderName != "openai" || m.ModelName != "gpt-4o" {
+		t.Fatalf("expected provider/model refreshed to openai/gpt-4o, got %s/%s", m.ProviderName, m.ModelName)
+	}
+	m = m.Update(AgentDeltaMsg{Kind: "content", Text: "clean retry answer"})
+	m = m.Update(AgentTurnDoneMsg{WorkerID: "main", Answer: "clean retry answer", Elapsed: time.Second})
+	last := m.Stream[len(m.Stream)-1]
+	if strings.Join(last.Body, "") != "clean retry answer" {
+		t.Fatalf("expected clean retry answer in final block, got %+v", last)
+	}
+}
+
+func TestTUIKeyListProbeAndErrorSurfacingDoNotSaveLiterals(t *testing.T) {
+	var savedKeys []string
+	var saveErr error
+
+	m := NewModel(".")
+	m.AwaitingKey = true
+	m.Bridge = &AgentBridge{
+		SaveAPIKey: func(k string) error {
+			savedKeys = append(savedKeys, k)
+			return saveErr
+		},
+		ListKeys:  func() string { return " * ds-1 provider=deepseek prio=1 status=ok" },
+		ProbeKeys: func(_ context.Context) string { return " ✔ ds-1 (deepseek) status=200" },
+	}
+
+	// 1. /key list must NOT call SaveAPIKey("list").
+	m.InputBuffer = "/key list"
+	m = m.submitInput()
+	if len(savedKeys) != 0 {
+		t.Fatalf("/key list erroneously saved key: %v", savedKeys)
+	}
+	if !strings.Contains(strings.Join(m.Stream[len(m.Stream)-1].Body, "\n"), "ds-1") {
+		t.Fatalf("expected /key list output in stream, got: %+v", m.Stream[len(m.Stream)-1])
+	}
+
+	// 2. /key probe must NOT call SaveAPIKey("probe").
+	m.InputBuffer = "/key probe"
+	m = m.submitInput()
+	if len(savedKeys) != 0 {
+		t.Fatalf("/key probe erroneously saved key: %v", savedKeys)
+	}
+	if !strings.Contains(strings.Join(m.Stream[len(m.Stream)-1].Body, "\n"), "status=200") {
+		t.Fatalf("expected /key probe output in stream, got: %+v", m.Stream[len(m.Stream)-1])
+	}
+
+	// 3. SaveAPIKey error must surface visibly and preserve AwaitingKey=true.
+	saveErr = fmt.Errorf("disk permission denied")
+	m.InputBuffer = "/key sk-bad"
+	m = m.submitInput()
+	if !m.AwaitingKey || !strings.Contains(m.Stream[len(m.Stream)-1].Title, "API Key Error") {
+		t.Fatalf("expected visible SaveAPIKey error and AwaitingKey preserved, got awaiting=%v entry=%+v", m.AwaitingKey, m.Stream[len(m.Stream)-1])
 	}
 }

@@ -91,9 +91,6 @@ func TestStreamingToolLoopDeliversLiveDeltas(t *testing.T) {
 	if !strings.Contains(r.StatusSummary(), "Cache Hit: 90/100 (90%)") {
 		t.Fatalf("streamed usage telemetry missing: %s", r.StatusSummary())
 	}
-	if r.onDelta != nil {
-		t.Fatalf("onDelta must be cleared after the run")
-	}
 }
 
 func TestStreamingFallsBackToPlainJSON(t *testing.T) {

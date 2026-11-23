@@ -18,6 +18,7 @@ package harness
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -139,17 +140,31 @@ func init() {
 		},
 		{
 			Name: "key",
-			Args: "<api-key>",
-			Help: "save an API key for the active provider",
+			Args: "<api-key|list|probe>",
+			Help: "save, inspect, or probe API keys for the active provider",
 			Handler: func(r *Runner, args []string) bool {
-				if len(args) == 0 || args[0] == "" {
-					fmt.Fprintf(r.cfg.Out, "Usage: /key <api-key>  (saves to ~/.config/tether/credentials.json for %s)\n", r.cfg.Provider)
+				snap := r.snapshotCallConfig()
+				out := r.outWriter()
+				if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
+					fmt.Fprintf(out, "Usage: /key <api-key> | /key list | /key probe  (active provider: %s, pinned: %s)\n",
+						snap.provider, snap.pinnedKeyID)
 					return false
 				}
-				r.cfg.APIKey = args[0]
-				_ = SaveAPIKey(r.cfg.Provider, r.cfg.APIKey)
-				fmt.Fprintf(r.cfg.Out, "✓ API key saved for %s\n", r.cfg.Provider)
-				return false
+				switch strings.ToLower(strings.TrimSpace(args[0])) {
+				case "list":
+					fmt.Fprintln(out, r.ListKeysSummary())
+					return false
+				case "probe":
+					fmt.Fprintln(out, r.ProbeKeysSummary(context.Background()))
+					return false
+				default:
+					if err := r.SaveProviderKey(args[0]); err != nil {
+						fmt.Fprintf(out, "✖ %v\n", err)
+						return false
+					}
+					fmt.Fprintf(out, "✓ API key saved for %s (pinned: %s)\n", r.ProviderName(), r.PinnedKeyID())
+					return false
+				}
 			},
 		},
 		{
@@ -365,14 +380,12 @@ func chooseCommand(out io.Writer, scanner *bufio.Scanner) (string, bool) {
 
 // applyProvider updates the active provider, model, base URL, and stored key.
 func applyProvider(r *Runner, p string) {
-	r.cfg.Provider = p
-	preset := presets[p]
-	r.cfg.BaseURL = preset.BaseURL
-	r.cfg.Model = preset.DefaultModel
-	r.cfg.APIKey = loadSavedKey(p)
-	_ = r.engine.SetProjectSetting("provider", p)
-	_ = r.engine.SetProjectSetting("model", r.cfg.Model)
-	fmt.Fprintf(r.cfg.Out, "✓ Provider set to %s (%s)\n", r.cfg.Provider, r.cfg.Model)
+	prov, mod, err := r.SwitchProvider(p)
+	if err != nil {
+		fmt.Fprintf(r.cfg.Out, "✖ %v\n", err)
+		return
+	}
+	fmt.Fprintf(r.cfg.Out, "✓ Provider set to %s (%s)\n", prov, mod)
 }
 
 // modelsFor returns the curated model choices for a provider.

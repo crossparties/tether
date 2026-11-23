@@ -17,11 +17,14 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/crossparties/tether/internal/core"
 	"github.com/crossparties/tether/internal/mount"
 )
+
+const maxEditReflections = 3
 
 // Server implements MCP protocol over stdio
 type Server struct {
@@ -34,6 +37,7 @@ type Server struct {
 	mu           sync.Mutex
 	approvalSeq  int
 	approvalSeen map[string]bool
+	editMisses   map[string]int
 
 	// ask, when set, connects the approval gate to a human. The gate itself
 	// cannot ask: it only knows how to refuse. The interactive REPL installs an
@@ -846,6 +850,7 @@ func (s *Server) toolReadFile(args json.RawMessage) (string, bool) {
 
 	content := strings.ReplaceAll(string(data), "\r\n", "\n")
 	if content == "" {
+		s.resetEditMisses(d.CanonicalPath)
 		return "", false
 	}
 
@@ -880,6 +885,7 @@ func (s *Server) toolReadFile(args json.RawMessage) (string, bool) {
 		}
 		b.WriteString(line)
 	}
+	s.resetEditMisses(d.CanonicalPath)
 	return b.String(), false
 }
 
@@ -897,6 +903,25 @@ func truncateUTF8(s string, maxBytes int) string {
 	return s[:cut]
 }
 
+func (s *Server) resetEditMisses(canonPath string) {
+	if canonPath == "" {
+		return
+	}
+	s.mu.Lock()
+	delete(s.editMisses, canonPath)
+	s.mu.Unlock()
+}
+
+func (s *Server) recordEditMiss(canonPath string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.editMisses == nil {
+		s.editMisses = make(map[string]int)
+	}
+	s.editMisses[canonPath]++
+	return s.editMisses[canonPath]
+}
+
 func (s *Server) execWriteFile(m *mutation) (string, bool) {
 	if err := os.MkdirAll(filepath.Dir(m.canonPath), 0755); err != nil {
 		return err.Error(), true
@@ -904,10 +929,11 @@ func (s *Server) execWriteFile(m *mutation) (string, bool) {
 	if err := os.WriteFile(m.canonPath, []byte(m.content), 0644); err != nil {
 		return err.Error(), true
 	}
+	s.resetEditMisses(m.canonPath)
 	if s.engine != nil {
 		_ = s.engine.IndexFile(m.canonPath)
 	}
-	return fmt.Sprintf("wrote %d bytes to %s%s", len(m.content), m.relPath, s.autoVerifyGo(m.canonPath)), false
+	return fmt.Sprintf("wrote %d bytes to %s%s", len(m.content), m.relPath, s.autoVerify(m.canonPath)), false
 }
 
 func (s *Server) execEditFile(m *mutation) (string, bool) {
@@ -918,17 +944,35 @@ func (s *Server) execEditFile(m *mutation) (string, bool) {
 		}
 		return err.Error(), true
 	}
-	updated, tier, err := applyFuzzyEdit(string(data), m.target, m.replace)
+	updated, tier, suggestStart, suggestEnd, err := applyFuzzyEditWithHint(string(data), m.target, m.replace)
 	if err != nil {
+		misses := s.recordEditMiss(m.canonPath)
+		if misses >= maxEditReflections {
+			startLine, endLine := suggestStart, suggestEnd
+			if startLine <= 0 {
+				startLine = 1
+				endLine = 40
+			} else {
+				if startLine > 5 {
+					startLine -= 5
+				} else {
+					startLine = 1
+				}
+				endLine += 5
+			}
+			return fmt.Sprintf("max_reflections=%d reached for %s. Stop retrying blind edits and call read_file(path=%q, start_line=%d, end_line=%d) before retrying.\n%v",
+				maxEditReflections, m.relPath, m.relPath, startLine, endLine, err), true
+		}
 		return err.Error(), true
 	}
 	if err := os.WriteFile(m.canonPath, []byte(updated), 0644); err != nil {
 		return err.Error(), true
 	}
+	s.resetEditMisses(m.canonPath)
 	if s.engine != nil {
 		_ = s.engine.IndexFile(m.canonPath)
 	}
-	return fmt.Sprintf("edited %s (match:%s)%s", m.relPath, tier, s.autoVerifyGo(m.canonPath)), false
+	return fmt.Sprintf("edited %s (match:%s)%s", m.relPath, tier, s.autoVerify(m.canonPath)), false
 }
 
 func (s *Server) walkWorkspaceFiles(mountEng *mount.Engine, searchRoot, mode string, visit func(dec mount.Decision) bool) error {
@@ -1163,36 +1207,182 @@ func (s *Server) resolveSearchRoot(rawPath string, mountEng *mount.Engine) (cano
 	return d.CanonicalPath, d.RelPath, ""
 }
 
-func (s *Server) autoVerifyGo(fullPath string) string {
-	if !strings.HasSuffix(fullPath, ".go") {
-		return ""
-	}
+func (s *Server) autoVerify(fullPath string) string {
 	ws := s.workspace()
-	if _, err := os.Stat(filepath.Join(ws, "go.mod")); err != nil {
+	ext := strings.ToLower(filepath.Ext(fullPath))
+
+	var settings map[string]string
+	if s.engine != nil {
+		settings, _ = s.engine.GetAllProjectSettings()
+	}
+
+	switch ext {
+	case ".go":
+		if _, err := os.Stat(filepath.Join(ws, "go.mod")); err != nil {
+			return ""
+		}
+		if _, err := exec.LookPath("go"); err != nil {
+			return ""
+		}
+		return runAutoVerifyCmd(ws, "go vet", "go", "vet", "./...")
+
+	case ".ts", ".tsx", ".svelte", ".js", ".jsx":
+		return s.autoVerifyFrontend(ws, fullPath, settings)
+
+	case ".py":
+		if _, err := exec.LookPath("python3"); err != nil {
+			return ""
+		}
+		tmpOut := filepath.Join(os.TempDir(), fmt.Sprintf("tether-pyc-%d.pyc", time.Now().UnixNano()))
+		defer os.Remove(tmpOut)
+		return runAutoVerifyCmd(ws, "py_compile", "python3", "-B", "-c",
+			"import py_compile, sys; py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True)",
+			fullPath, tmpOut)
+
+	default:
 		return ""
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "vet", "./...")
-	cmd.Dir = ws
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return "\n⚠ go vet failed:\n" + strings.TrimSpace(string(out))
-	}
-	return " | ✓ go vet passed"
 }
 
-// applyFuzzyEdit implements a 3-Tier surgical matcher:
+func runAutoVerifyCmd(dir, label, bin string, args ...string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		detail := strings.TrimSpace(string(out))
+		if detail == "" {
+			detail = err.Error()
+		}
+		return fmt.Sprintf("\n⚠ %s failed:\n%s", label, detail)
+	}
+	return fmt.Sprintf(" | ✓ %s passed", label)
+}
+
+func (s *Server) autoVerifyFrontend(ws, fullPath string, settings map[string]string) string {
+	checkCmd := strings.TrimSpace(settings["check_cmd"])
+	frontendDir := strings.TrimSpace(settings["frontend_dir"])
+
+	// Walk && segments, tracking safe relative `cd <dir>` prefixes.
+	if checkCmd != "" {
+		curDir := ws
+		for _, rawSeg := range strings.Split(checkCmd, "&&") {
+			seg := strings.TrimSpace(rawSeg)
+			if seg == "" {
+				continue
+			}
+			fields := strings.Fields(seg)
+			if len(fields) == 2 && fields[0] == "cd" {
+				_, canon, _, err := mount.ResolveWithinWorkspace(fields[1], ws)
+				if err != nil {
+					return ""
+				}
+				curDir = canon
+				continue
+			}
+			if res, handled := tryRunFrontendCheck(curDir, fields); handled {
+				return res
+			}
+		}
+	}
+
+	// Fallback if check_cmd wasn't populated or didn't match a frontend dir directly.
+	candidateDir := ws
+	if frontendDir != "" {
+		if _, canon, _, err := mount.ResolveWithinWorkspace(frontendDir, ws); err == nil {
+			candidateDir = canon
+		}
+	} else if dir := filepath.Dir(fullPath); dir != "" {
+		if _, err := os.Stat(filepath.Join(dir, "package.json")); err == nil {
+			candidateDir = dir
+		}
+	}
+	if pkg, err := os.ReadFile(filepath.Join(candidateDir, "package.json")); err == nil && strings.Contains(string(pkg), `"check"`) {
+		if res, handled := tryRunFrontendCheck(candidateDir, []string{"npm", "run", "check"}); handled {
+			return res
+		}
+	}
+	if _, err := os.Stat(filepath.Join(candidateDir, "tsconfig.json")); err == nil {
+		if res, handled := tryRunFrontendCheck(candidateDir, []string{"tsc", "--noEmit"}); handled {
+			return res
+		}
+	}
+	return ""
+}
+
+func tryRunFrontendCheck(dir string, fields []string) (string, bool) {
+	if len(fields) == 0 {
+		return "", false
+	}
+	cmdStr := strings.Join(fields, " ")
+	hasNodeModules := func() bool {
+		fi, err := os.Stat(filepath.Join(dir, "node_modules"))
+		return err == nil && fi.IsDir()
+	}
+	hasAnyTool := func(names ...string) bool {
+		for _, n := range names {
+			if _, err := os.Stat(filepath.Join(dir, "node_modules", ".bin", n)); err == nil {
+				return true
+			}
+			if _, err := exec.LookPath(n); err == nil {
+				return true
+			}
+		}
+		return false
+	}
+
+	switch cmdStr {
+	case "npm run check":
+		if _, err := exec.LookPath("npm"); err != nil {
+			return "", false
+		}
+		pkg, err := os.ReadFile(filepath.Join(dir, "package.json"))
+		if err != nil || !strings.Contains(string(pkg), `"check"`) {
+			return "", false
+		}
+		if !hasNodeModules() && !hasAnyTool("svelte-check", "tsc") {
+			return "", false
+		}
+		return runAutoVerifyCmd(dir, "npm run check", "npm", "run", "check"), true
+
+	case "pnpm check", "pnpm run check":
+		if _, err := exec.LookPath("pnpm"); err != nil || (!hasNodeModules() && !hasAnyTool("svelte-check", "tsc")) {
+			return "", false
+		}
+		return runAutoVerifyCmd(dir, cmdStr, fields[0], fields[1:]...), true
+
+	case "bun run check":
+		if _, err := exec.LookPath("bun"); err != nil || (!hasNodeModules() && !hasAnyTool("svelte-check", "tsc")) {
+			return "", false
+		}
+		return runAutoVerifyCmd(dir, "bun run check", "bun", "run", "check"), true
+
+	case "npx --no-install tsc --noEmit", "tsc --noEmit":
+		localTsc := filepath.Join(dir, "node_modules", ".bin", "tsc")
+		if _, err := os.Stat(localTsc); err == nil {
+			return runAutoVerifyCmd(dir, "tsc --noEmit", localTsc, "--noEmit"), true
+		}
+		if _, err := exec.LookPath("tsc"); err == nil {
+			return runAutoVerifyCmd(dir, "tsc --noEmit", "tsc", "--noEmit"), true
+		}
+		return "", false
+	}
+	return "", false
+}
+
+// applyFuzzyEditWithHint implements a 3-Tier surgical matcher and returns a
+// 1-based line-range suggestion ("Did you mean (around lines X-Y)?") when unmatched:
 // Tier 1: Unique exact substring match (with ambiguity guard)
 // Tier 2: Unique CRLF-normalized match (with ambiguity guard)
 // Tier 3: Indentation & blank-line tolerant block match with proportional nested re-indentation
-func applyFuzzyEdit(content, target, replacement string) (string, string, error) {
+func applyFuzzyEditWithHint(content, target, replacement string) (string, string, int, int, error) {
 	// Tier 1: Exact match with ambiguity guard
 	if cnt := strings.Count(content, target); cnt > 0 {
 		if cnt > 1 {
-			return "", "", fmt.Errorf("ambiguous target: matched %d locations; include more surrounding lines", cnt)
+			return "", "", 0, 0, fmt.Errorf("ambiguous target: matched %d locations; include more surrounding lines", cnt)
 		}
-		return strings.Replace(content, target, replacement, 1), "exact", nil
+		return strings.Replace(content, target, replacement, 1), "exact", 0, 0, nil
 	}
 
 	normContent := strings.ReplaceAll(content, "\r\n", "\n")
@@ -1202,9 +1392,9 @@ func applyFuzzyEdit(content, target, replacement string) (string, string, error)
 	// Tier 2: CRLF-normalized match with ambiguity guard
 	if cnt := strings.Count(normContent, normTarget); cnt > 0 {
 		if cnt > 1 {
-			return "", "", fmt.Errorf("ambiguous target: matched %d locations; include more surrounding lines", cnt)
+			return "", "", 0, 0, fmt.Errorf("ambiguous target: matched %d locations; include more surrounding lines", cnt)
 		}
-		return strings.Replace(normContent, normTarget, normReplace, 1), "crlf-normalized", nil
+		return strings.Replace(normContent, normTarget, normReplace, 1), "crlf-normalized", 0, 0, nil
 	}
 
 	// Tier 3: Indentation & blank-line tolerant block match
@@ -1213,10 +1403,14 @@ func applyFuzzyEdit(content, target, replacement string) (string, string, error)
 
 	startIdx, endIdx, matchCount := findFuzzySpan(contentLines, targetLines)
 	if matchCount == 0 {
-		return "", "", fmt.Errorf("target string not found in file (even with fuzzy indentation/blank-line matching)")
+		sLine, eLine, didYouMean := buildDidYouMeanHint(contentLines, targetLines)
+		if didYouMean != "" {
+			return "", "", sLine, eLine, fmt.Errorf("target string not found in file (even with fuzzy indentation/blank-line matching)\n%s", didYouMean)
+		}
+		return "", "", 0, 0, fmt.Errorf("target string not found in file (even with fuzzy indentation/blank-line matching)")
 	}
 	if matchCount > 1 {
-		return "", "", fmt.Errorf("ambiguous target: matched %d locations; include more surrounding lines", matchCount)
+		return "", "", 0, 0, fmt.Errorf("ambiguous target: matched %d locations; include more surrounding lines", matchCount)
 	}
 
 	replaceLines := reindentReplacement(contentLines[startIdx:endIdx], targetLines, normReplace)
@@ -1225,7 +1419,149 @@ func applyFuzzyEdit(content, target, replacement string) (string, string, error)
 	resultLines = append(resultLines, contentLines[:startIdx]...)
 	resultLines = append(resultLines, replaceLines...)
 	resultLines = append(resultLines, contentLines[endIdx:]...)
-	return strings.Join(resultLines, "\n"), "fuzzy-indent", nil
+	return strings.Join(resultLines, "\n"), "fuzzy-indent", 0, 0, nil
+}
+
+func buildDidYouMeanHint(contentLines, targetLines []string) (int, int, string) {
+	if len(contentLines) == 0 || len(targetLines) == 0 {
+		return 0, 0, ""
+	}
+	var trimmedTarget []string
+	for _, tl := range targetLines {
+		if t := strings.TrimSpace(tl); t != "" {
+			trimmedTarget = append(trimmedTarget, t)
+		}
+	}
+	if len(trimmedTarget) == 0 {
+		return 0, 0, ""
+	}
+
+	targetBlock := strings.Join(trimmedTarget, "\n")
+	targetTok := tokenizeAlphaNum(targetBlock)
+	targetBg := charBigrams(targetBlock)
+
+	winLen := len(targetLines)
+	if winLen < 1 {
+		winLen = 1
+	}
+	if winLen > len(contentLines) {
+		winLen = len(contentLines)
+	}
+
+	bestScore := 0.0
+	bestStart, bestEnd := -1, -1
+
+	for i := 0; i <= len(contentLines)-winLen; i++ {
+		end := i + winLen
+		candBlock := strings.TrimSpace(strings.Join(contentLines[i:end], "\n"))
+		if candBlock == "" {
+			continue
+		}
+		score := similarityScorePrecomputed(targetTok, targetBg, candBlock)
+		if score > bestScore {
+			bestScore = score
+			bestStart = i
+			bestEnd = end
+		}
+	}
+
+	// Also check single-line match against the first non-empty target line in case target length shifted.
+	if winLen > 1 {
+		anchor := trimmedTarget[0]
+		anchorTok := tokenizeAlphaNum(anchor)
+		anchorBg := charBigrams(anchor)
+		for i, line := range contentLines {
+			t := strings.TrimSpace(line)
+			if t == "" {
+				continue
+			}
+			score := similarityScorePrecomputed(anchorTok, anchorBg, t) * 0.90
+			if score > bestScore {
+				bestScore = score
+				bestStart = i
+				bestEnd = i + winLen
+				if bestEnd > len(contentLines) {
+					bestEnd = len(contentLines)
+				}
+			}
+		}
+	}
+
+	if bestStart < 0 || bestScore < 0.20 {
+		return 0, 0, ""
+	}
+
+	// Cap snippet display to 12 lines so errors stay compact.
+	displayEnd := bestEnd
+	if displayEnd-bestStart > 12 {
+		displayEnd = bestStart + 12
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "Did you mean (around lines %d-%d)?", bestStart+1, displayEnd)
+	for i := bestStart; i < displayEnd; i++ {
+		fmt.Fprintf(&b, "\n%d: %s", i+1, contentLines[i])
+	}
+	return bestStart + 1, displayEnd, b.String()
+}
+
+func similarityScorePrecomputed(tokA, bgA map[string]bool, b string) float64 {
+	tokB := tokenizeAlphaNum(b)
+	tScore := diceSetScore(tokA, tokB)
+	bgScore := diceSetScore(bgA, charBigrams(b))
+	if len(tokA) == 0 && len(tokB) == 0 {
+		return bgScore
+	}
+	return 0.55*tScore + 0.45*bgScore
+}
+
+func tokenizeAlphaNum(s string) map[string]bool {
+	out := make(map[string]bool)
+	var cur strings.Builder
+	flush := func() {
+		if cur.Len() > 0 {
+			out[cur.String()] = true
+			cur.Reset()
+		}
+	}
+	for _, r := range strings.ToLower(s) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {
+			cur.WriteRune(r)
+		} else {
+			flush()
+		}
+	}
+	flush()
+	return out
+}
+
+func charBigrams(s string) map[string]bool {
+	compact := strings.Join(strings.Fields(strings.ToLower(s)), " ")
+	runes := []rune(compact)
+	out := make(map[string]bool)
+	if len(runes) < 2 {
+		if len(runes) == 1 {
+			out[string(runes)] = true
+		}
+		return out
+	}
+	for i := 0; i < len(runes)-1; i++ {
+		out[string(runes[i:i+2])] = true
+	}
+	return out
+}
+
+func diceSetScore(a, b map[string]bool) float64 {
+	if len(a) == 0 || len(b) == 0 {
+		return 0
+	}
+	inter := 0
+	for k := range a {
+		if b[k] {
+			inter++
+		}
+	}
+	return float64(2*inter) / float64(len(a)+len(b))
 }
 
 // findFuzzySpan locates [startIdx, endIdx) in contentLines matching non-empty trimmed targetLines,

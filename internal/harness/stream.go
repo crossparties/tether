@@ -9,22 +9,90 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 )
+
+const (
+	defaultStreamIdleTimeout = 45 * time.Second
+	maxAPIErrorBodyBytes     = 64 * 1024
+	maxAPICompletionBytes    = 10 * 1024 * 1024
+)
+
+type apiError struct {
+	StatusCode  int
+	RetryAfter  time.Duration
+	Body        string
+	IdleTimeout bool
+	Err         error
+}
+
+func (e *apiError) Error() string {
+	if e.Err != nil {
+		return e.Err.Error()
+	}
+	return fmt.Sprintf("API error (%d): %s", e.StatusCode, e.Body)
+}
+
+func (e *apiError) Unwrap() error {
+	return e.Err
+}
+
+type apiUsage struct {
+	cacheHit  int
+	cacheMiss int
+	ttft      time.Duration
+}
+
+func parseRetryAfter(val string) time.Duration {
+	s := strings.TrimSpace(val)
+	if s == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(s); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		d := time.Duration(secs) * time.Second
+		if d > maxRetryAfterHonored {
+			return maxRetryAfterHonored
+		}
+		return d
+	}
+	if t, err := http.ParseTime(s); err == nil {
+		d := time.Until(t)
+		if d <= 0 {
+			return 0
+		}
+		if d > maxRetryAfterHonored {
+			return maxRetryAfterHonored
+		}
+		return d
+	}
+	return 0
+}
+
+func emitDelta(onDelta func(kind, text string), kind, text string) {
+	if onDelta != nil {
+		onDelta(kind, text)
+	}
+}
 
 // RunWithOutputStream is RunWithOutput with live token streaming. onDelta receives
 // "content" and "reasoning" text deltas as the model produces them, and "endstep"
 // when a step finished with tool calls (so the UI can close the in-progress block).
 // Passing a nil onDelta behaves exactly like RunWithOutput.
 func (r *Runner) RunWithOutputStream(ctx context.Context, prompt string, out io.Writer, onDelta func(kind, text string)) (string, error) {
-	r.onDelta = onDelta
-	defer func() { r.onDelta = nil }()
-	return r.RunWithOutput(ctx, prompt, out)
+	return r.runWithOptions(ctx, prompt, out, onDelta)
 }
 
 type streamChunk struct {
 	Choices []struct {
-		Delta struct {
+		FinishReason string `json:"finish_reason"`
+		Delta        struct {
 			Content          string `json:"content"`
 			ReasoningContent string `json:"reasoning_content"`
 			ToolCalls        []struct {
@@ -47,46 +115,149 @@ type streamChunk struct {
 	} `json:"usage"`
 }
 
-// streamRequest performs one chat-completions call over SSE and assembles the same
-// chatMessage the buffered path returns (content, reasoning_content, tool_calls).
-// It uses a client without a total-body timeout: a long answer must not be cut at
-// 120s, and cancellation is carried by ctx instead.
-func (r *Runner) streamRequest(ctx context.Context, payload map[string]interface{}) (chatMessage, error) {
+func (r *Runner) doPostJSON(ctx context.Context, snap callSnapshot, targetURL string, payload map[string]any, acceptSSE bool) (*http.Response, error) {
 	reqBody, _ := json.Marshal(payload)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.cfg.BaseURL, bytes.NewReader(reqBody))
-	if err != nil {
-		return chatMessage{}, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "text/event-stream")
-	if r.cfg.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+r.cfg.APIKey)
+	reqCtx := ctx
+	var reqCancel context.CancelFunc
+	var hdrMu sync.Mutex
+	gotHeaders := false
+	hdrTimedOut := false
+	var hdrTimer *time.Timer
+
+	if acceptSSE {
+		reqCtx, reqCancel = context.WithCancel(ctx)
+		hdrTimer = time.AfterFunc(snap.idleTimeout, func() {
+			hdrMu.Lock()
+			if !gotHeaders {
+				hdrTimedOut = true
+				reqCancel()
+			}
+			hdrMu.Unlock()
+		})
 	}
 
-	client := &http.Client{Transport: r.client.Transport}
-	resp, err := client.Do(req)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, targetURL, bytes.NewReader(reqBody))
 	if err != nil {
-		return chatMessage{}, fmt.Errorf("API request failed: %w", err)
+		if hdrTimer != nil {
+			hdrTimer.Stop()
+		}
+		if reqCancel != nil {
+			reqCancel()
+		}
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if acceptSSE {
+		req.Header.Set("Accept", "text/event-stream")
+	}
+	if snap.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+snap.apiKey)
+	}
+
+	client := r.client
+	if acceptSSE {
+		var transport http.RoundTripper
+		if r.client != nil {
+			transport = r.client.Transport
+		}
+		client = &http.Client{Transport: transport}
+	}
+
+	resp, err := client.Do(req)
+	if hdrTimer != nil {
+		hdrMu.Lock()
+		gotHeaders = true
+		timedOutHdr := hdrTimedOut
+		hdrMu.Unlock()
+		hdrTimer.Stop()
+		if err != nil {
+			reqCancel()
+			if timedOutHdr && ctx.Err() == nil {
+				return nil, &apiError{
+					IdleTimeout: true,
+					Err:         fmt.Errorf("API stream header idle timeout after %s", snap.idleTimeout),
+				}
+			}
+		} else {
+			// Cancel derived context only after body is closed by wrapping resp.Body.
+			resp.Body = cancelOnCloseReadCloser{ReadCloser: resp.Body, cancel: reqCancel}
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("API request failed: %w", err)
+	}
+	return resp, nil
+}
+
+type cancelOnCloseReadCloser struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c cancelOnCloseReadCloser) Close() error {
+	err := c.ReadCloser.Close()
+	if c.cancel != nil {
+		c.cancel()
+	}
+	return err
+}
+
+func readAPIError(resp *http.Response) *apiError {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxAPIErrorBodyBytes))
+	return &apiError{
+		StatusCode: resp.StatusCode,
+		RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+		Body:       string(body),
+		Err:        fmt.Errorf("API error (%d): %s", resp.StatusCode, string(body)),
+	}
+}
+
+// streamRequest performs one chat-completions call over SSE and assembles the same
+// chatMessage the buffered path returns (content, reasoning_content, tool_calls).
+// It uses a per-chunk idle watchdog instead of a total-body timeout so long active
+// multi-minute streams continue while stalled streams abort and recover cleanly.
+func (r *Runner) streamRequest(ctx context.Context, snap callSnapshot, targetURL string, payload map[string]any, onDelta func(kind, text string)) (chatMessage, string, apiUsage, error) {
+	reqStart := time.Now()
+	resp, err := r.doPostJSON(ctx, snap, targetURL, payload, true)
+	if err != nil {
+		return chatMessage{}, "", apiUsage{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return chatMessage{}, fmt.Errorf("API error (%d): %s", resp.StatusCode, string(body))
+		return chatMessage{}, "", apiUsage{}, readAPIError(resp)
 	}
 
 	var content, reasoning, raw strings.Builder
 	calls := map[int]*toolCall{}
 	gotEvent := false
+	finishReason := ""
+	var usage apiUsage
+	var ttftRecorded bool
 	reader := bufio.NewReaderSize(resp.Body, 64*1024)
 
+	var chunkTimedOut atomic.Bool
+	gotDone := false
 	for {
+		if chunkTimedOut.Load() {
+			return chatMessage{}, "", apiUsage{}, &apiError{
+				IdleTimeout: true,
+				Err:         fmt.Errorf("API stream idle timeout after %s", snap.idleTimeout),
+			}
+		}
+		chunkTimer := time.AfterFunc(snap.idleTimeout, func() {
+			chunkTimedOut.Store(true)
+			_ = resp.Body.Close()
+		})
 		line, rerr := reader.ReadString('\n')
+		chunkTimer.Stop()
+
 		trimmed := strings.TrimSpace(line)
 		switch {
 		case strings.HasPrefix(trimmed, "data:"):
 			data := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
 			if data == "[DONE]" {
+				gotDone = true
 				rerr = io.EOF
 				break
 			}
@@ -95,24 +266,31 @@ func (r *Runner) streamRequest(ctx context.Context, payload map[string]interface
 				break
 			}
 			gotEvent = true
+			if !ttftRecorded {
+				ttftRecorded = true
+				usage.ttft = time.Since(reqStart)
+			}
 			if chunk.Usage != nil {
 				hit := chunk.Usage.PromptCacheHitTokens
 				if hit == 0 {
 					hit = chunk.Usage.PromptTokensDetails.CachedTokens
 				}
 				if hit > 0 || chunk.Usage.PromptCacheMissTokens > 0 {
-					r.lastCacheHitTokens = hit
-					r.lastCacheMissTokens = chunk.Usage.PromptCacheMissTokens
+					usage.cacheHit = hit
+					usage.cacheMiss = chunk.Usage.PromptCacheMissTokens
 				}
 			}
 			for _, ch := range chunk.Choices {
+				if ch.FinishReason != "" {
+					finishReason = ch.FinishReason
+				}
 				if ch.Delta.ReasoningContent != "" {
 					reasoning.WriteString(ch.Delta.ReasoningContent)
-					r.onDelta("reasoning", ch.Delta.ReasoningContent)
+					emitDelta(onDelta, "reasoning", ch.Delta.ReasoningContent)
 				}
 				if ch.Delta.Content != "" {
 					content.WriteString(ch.Delta.Content)
-					r.onDelta("content", ch.Delta.Content)
+					emitDelta(onDelta, "content", ch.Delta.Content)
 				}
 				for _, tc := range ch.Delta.ToolCalls {
 					cur := calls[tc.Index]
@@ -137,8 +315,17 @@ func (r *Runner) streamRequest(ctx context.Context, payload map[string]interface
 			raw.WriteString(line)
 		}
 		if rerr != nil {
+			if ctx.Err() != nil {
+				return chatMessage{}, "", apiUsage{}, fmt.Errorf("API stream interrupted: %w", rerr)
+			}
+			if !gotDone && chunkTimedOut.Load() {
+				return chatMessage{}, "", apiUsage{}, &apiError{
+					IdleTimeout: true,
+					Err:         fmt.Errorf("API stream idle timeout after %s", snap.idleTimeout),
+				}
+			}
 			if rerr != io.EOF {
-				return chatMessage{}, fmt.Errorf("API stream interrupted: %w", rerr)
+				return chatMessage{}, "", apiUsage{}, fmt.Errorf("API stream interrupted: %w", rerr)
 			}
 			break
 		}
@@ -146,9 +333,11 @@ func (r *Runner) streamRequest(ctx context.Context, payload map[string]interface
 
 	if !gotEvent {
 		if raw.Len() == 0 {
-			return chatMessage{}, fmt.Errorf("invalid API response: empty stream")
+			return chatMessage{}, "", apiUsage{}, fmt.Errorf("invalid API response: empty stream")
 		}
-		return r.parseBufferedCompletion([]byte(raw.String()))
+		msg, fr, u, perr := parseBufferedCompletion([]byte(raw.String()), onDelta)
+		u.ttft = time.Since(reqStart)
+		return msg, fr, u, perr
 	}
 
 	msg := chatMessage{Role: "assistant", Content: content.String(), ReasoningContent: reasoning.String()}
@@ -161,29 +350,45 @@ func (r *Runner) streamRequest(ctx context.Context, payload map[string]interface
 		for _, i := range idx {
 			msg.ToolCalls = append(msg.ToolCalls, *calls[i])
 		}
-		r.onDelta("endstep", "")
+		emitDelta(onDelta, "endstep", "")
 	}
-	return msg, nil
+	return msg, finishReason, usage, nil
 }
 
-// parseBufferedCompletion decodes a non-streamed chat-completions body, used when a
-// server answers a streaming request with plain JSON.
-func (r *Runner) parseBufferedCompletion(body []byte) (chatMessage, error) {
+// parseBufferedCompletion decodes a non-streamed chat-completions body, shared between
+// callAPI and SSE fallback when a server answers a streaming request with plain JSON.
+func parseBufferedCompletion(body []byte, onDelta func(kind, text string)) (chatMessage, string, apiUsage, error) {
 	var parsed struct {
 		Choices []struct {
-			Message chatMessage `json:"message"`
+			Message      chatMessage `json:"message"`
+			FinishReason string      `json:"finish_reason"`
 		} `json:"choices"`
+		Usage struct {
+			PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens"`
+			PromptCacheMissTokens int `json:"prompt_cache_miss_tokens"`
+			PromptTokensDetails   struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
+		} `json:"usage"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil || len(parsed.Choices) == 0 {
-		return chatMessage{}, fmt.Errorf("invalid API response: %s", string(body))
+		return chatMessage{}, "", apiUsage{}, fmt.Errorf("invalid API response: %s", string(body))
+	}
+	var usage apiUsage
+	hit := parsed.Usage.PromptCacheHitTokens
+	if hit == 0 {
+		hit = parsed.Usage.PromptTokensDetails.CachedTokens
+	}
+	if hit > 0 || parsed.Usage.PromptCacheMissTokens > 0 {
+		usage.cacheHit = hit
+		usage.cacheMiss = parsed.Usage.PromptCacheMissTokens
 	}
 	msg := parsed.Choices[0].Message
-	// Surface the whole answer as a single delta so the UI still shows it.
 	if msg.Content != "" {
-		r.onDelta("content", msg.Content)
+		emitDelta(onDelta, "content", msg.Content)
 	}
 	if len(msg.ToolCalls) > 0 {
-		r.onDelta("endstep", "")
+		emitDelta(onDelta, "endstep", "")
 	}
-	return msg, nil
+	return msg, parsed.Choices[0].FinishReason, usage, nil
 }

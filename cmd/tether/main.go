@@ -428,6 +428,9 @@ func runDoctor(workspace string, fix bool, out io.Writer) (passed, warnings, fai
 
 	home, _ := os.UserHomeDir()
 	credPath := filepath.Join(home, ".config", "tether", "credentials.json")
+	if envCfg := strings.TrimSpace(os.Getenv("TETHER_CONFIG_DIR")); envCfg != "" {
+		credPath = filepath.Join(filepath.Clean(envCfg), "credentials.json")
+	}
 
 	if fix {
 		fmt.Fprintln(out, ui.Title("[--fix] Applying Repairs"))
@@ -763,6 +766,8 @@ func buildTUIBridge(runner *harness.Runner, engine *core.Engine) *tui.AgentBridg
 		Branch:          func() string { return engine.Branch },
 		NeedsAPIKey:     runner.NeedsAPIKey,
 		SaveAPIKey:      runner.SaveProviderKey,
+		ListKeys:        runner.ListKeysSummary,
+		ProbeKeys:       runner.ProbeKeysSummary,
 		SwitchModel:     runner.SwitchModel,
 		SwitchProvider:  runner.SwitchProvider,
 		SwitchMode:      runner.SwitchMode,

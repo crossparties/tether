@@ -780,6 +780,92 @@ func (e *Engine) GetAllProjectSettings() (map[string]string, error) {
 	return settings, nil
 }
 
+// --- API Key Metadata (Non-Secret) & Session Key Pinning ---
+
+// APIKeyMeta holds non-secret telemetry and routing metrics for a configured API key.
+// Raw API keys MUST NEVER be stored in SQLite.
+type APIKeyMeta struct {
+	KeyID         string
+	Provider      string
+	Label         string
+	AvgTTFTMs     int64
+	ToolErrorRate float64
+	CacheHitRatio float64
+	UpdatedAt     string
+}
+
+func (e *Engine) UpsertAPIKeyMeta(m APIKeyMeta) error {
+	if e == nil || e.writeDB == nil || strings.TrimSpace(m.KeyID) == "" {
+		return nil
+	}
+	_, err := e.writeDB.Exec(`
+		INSERT INTO api_keys_meta (key_id, provider, label, avg_ttft_ms, tool_error_rate, cache_hit_ratio, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(key_id) DO UPDATE SET
+			provider = CASE WHEN excluded.provider <> '' THEN excluded.provider ELSE api_keys_meta.provider END,
+			label = CASE WHEN excluded.label <> '' THEN excluded.label ELSE api_keys_meta.label END,
+			avg_ttft_ms = excluded.avg_ttft_ms,
+			tool_error_rate = excluded.tool_error_rate,
+			cache_hit_ratio = excluded.cache_hit_ratio,
+			updated_at = CURRENT_TIMESTAMP
+	`, m.KeyID, m.Provider, m.Label, m.AvgTTFTMs, m.ToolErrorRate, m.CacheHitRatio)
+	return err
+}
+
+func (e *Engine) ListAPIKeysMeta() ([]APIKeyMeta, error) {
+	if e == nil || e.readDB == nil {
+		return nil, nil
+	}
+	rows, err := e.readDB.Query(`
+		SELECT key_id, provider, label, avg_ttft_ms, tool_error_rate, cache_hit_ratio, COALESCE(updated_at, '')
+		FROM api_keys_meta
+		ORDER BY key_id ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []APIKeyMeta
+	for rows.Next() {
+		var m APIKeyMeta
+		if err := rows.Scan(&m.KeyID, &m.Provider, &m.Label, &m.AvgTTFTMs, &m.ToolErrorRate, &m.CacheHitRatio, &m.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (e *Engine) GetPinnedKeyID() (string, error) {
+	if e == nil || e.readDB == nil || e.SessionID == "" {
+		return "", nil
+	}
+	var keyID string
+	err := e.readDB.QueryRow(`SELECT COALESCE(pinned_key_id, '') FROM conversation_threads WHERE id = ?`, e.SessionID).Scan(&keyID)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return keyID, err
+}
+
+func (e *Engine) SetPinnedKeyID(keyID string) error {
+	if e == nil || e.writeDB == nil || e.SessionID == "" {
+		return nil
+	}
+	_, err := e.writeDB.Exec(`
+		INSERT INTO conversation_threads (id, workspace, git_branch, mode, pinned_key_id, updated_at)
+		VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(id) DO UPDATE SET
+			pinned_key_id = excluded.pinned_key_id,
+			updated_at = CURRENT_TIMESTAMP
+	`, e.SessionID, e.Workspace, e.Branch, e.GetMode(), keyID)
+	return err
+}
+
 // --- Decisions ---
 
 func (e *Engine) AddDecision(topic, decision, reason string) error {
