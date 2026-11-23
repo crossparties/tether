@@ -780,3 +780,32 @@ func TestTUIKeyListProbeAndErrorSurfacingDoNotSaveLiterals(t *testing.T) {
 		t.Fatalf("expected visible SaveAPIKey error and AwaitingKey preserved, got awaiting=%v entry=%+v", m.AwaitingKey, m.Stream[len(m.Stream)-1])
 	}
 }
+
+func TestAsyncCompactQueuesWithoutBlockingUIThread(t *testing.T) {
+	syncCalls := 0
+	m := NewModel(".")
+	m.Bridge = &AgentBridge{
+		Compact: func(_ context.Context) (string, error) {
+			syncCalls++
+			return "Condensed 12 older events.", nil
+		},
+	}
+
+	m.InputBuffer = "/compact"
+	m = m.submitInput()
+	if !m.PendingCompact {
+		t.Fatalf("expected /compact to set PendingCompact=true")
+	}
+	if syncCalls != 0 {
+		t.Fatalf("expected /compact Update to NOT block synchronously calling Bridge.Compact, calls=%d", syncCalls)
+	}
+
+	m = m.Update(CompactDoneMsg{
+		Result:  "Condensed 12 older events.",
+		Elapsed: 250 * time.Millisecond,
+	})
+	last := m.Stream[len(m.Stream)-1]
+	if !strings.Contains(last.Title, "Episodic condensation") || !strings.Contains(strings.Join(last.Body, "\n"), "Condensed 12 older events") {
+		t.Fatalf("unexpected CompactDoneMsg stream entry: %+v", last)
+	}
+}

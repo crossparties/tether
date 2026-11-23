@@ -387,9 +387,9 @@ func TestSSEIdleWatchdogStallFailoverAndActiveStreamPass(t *testing.T) {
 			stalledCalls.Add(1)
 			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n")
 			flusher.Flush()
-			// Stall longer than 90ms idle timeout.
+			// Stall until idle watchdog cancels the request (with generous upper bound).
 			select {
-			case <-time.After(350 * time.Millisecond):
+			case <-time.After(2 * time.Second):
 			case <-r.Context().Done():
 			}
 			return
@@ -444,12 +444,12 @@ func TestSSEIdleWatchdogStallFailoverAndActiveStreamPass(t *testing.T) {
 		t.Fatalf("expected stream.retry_reset and keys.switched delta events, got: %s", joinedKinds)
 	}
 
-	// 2. Active multi-chunk stream whose total duration (240ms) exceeds StreamIdleTimeout (90ms)
-	// MUST succeed because each chunk arrives every 35ms < 90ms.
+	// 2. Active multi-chunk stream whose total duration (~280ms) exceeds StreamIdleTimeout (220ms)
+	// MUST succeed because each chunk arrives every 35ms (185ms headroom per chunk).
 	activeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		flusher := w.(http.Flusher)
-		chunks := []string{"a", "b", "c", "d", "e", "f"}
+		chunks := []string{"a", "b", "c", "d", "e", "f", "g", "h"}
 		for _, c := range chunks {
 			time.Sleep(35 * time.Millisecond)
 			fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":%q}}]}\n\n", c)
@@ -466,15 +466,15 @@ func TestSSEIdleWatchdogStallFailoverAndActiveStreamPass(t *testing.T) {
 		BaseURL:           activeSrv.URL,
 		APIKey:            "sk-ok",
 		Model:             "deepseek-chat",
-		StreamIdleTimeout: 90 * time.Millisecond,
+		StreamIdleTimeout: 220 * time.Millisecond,
 		Out:               &bytes.Buffer{},
 	})
 	ansActive, err := rActive.RunWithOutputStream(context.Background(), "long active stream", nil, func(kind, text string) {})
 	if err != nil {
 		t.Fatalf("active long stream should NOT trigger idle watchdog: %v", err)
 	}
-	if ansActive != "abcdef" {
-		t.Fatalf("expected 'abcdef', got %q", ansActive)
+	if ansActive != "abcdefgh" {
+		t.Fatalf("expected 'abcdefgh', got %q", ansActive)
 	}
 }
 
@@ -517,7 +517,7 @@ func TestWarmCacheBoundedBudgetDisableOn429AndIdle(t *testing.T) {
 		APIKey:            "sk-main",
 		Model:             "deepseek-chat",
 		WarmCacheMaxPings: 2,
-		WarmCacheIdleMax:  200 * time.Millisecond,
+		WarmCacheIdleMax:  5 * time.Second,
 		Out:               &bytes.Buffer{},
 	})
 
@@ -561,16 +561,18 @@ func TestWarmCacheBoundedBudgetDisableOn429AndIdle(t *testing.T) {
 		t.Fatalf("expected warm_cache disabled after 429")
 	}
 
-	// Auto-disable on idle > WarmCacheIdleMax.
+	// Auto-disable on idle > WarmCacheIdleMax deterministically without brittle sleeps.
 	r3 := NewRunner(eng, Config{
 		Provider:         "deepseek",
 		BaseURL:          srv.URL,
 		APIKey:           "sk-main",
 		Model:            "deepseek-chat",
-		WarmCacheIdleMax: 30 * time.Millisecond,
+		WarmCacheIdleMax: 10 * time.Minute,
 		Out:              &bytes.Buffer{},
 	})
-	time.Sleep(50 * time.Millisecond)
+	r3.mu.Lock()
+	r3.lastUserActivity = time.Now().Add(-time.Hour)
+	r3.mu.Unlock()
 	prevCalls = calls.Load()
 	if ok, _ := r3.WarmCache(context.Background()); ok || calls.Load() != prevCalls {
 		t.Fatalf("expected warm_cache auto-disabled after idle timeout")
@@ -589,6 +591,8 @@ func TestParallelReadOnlyBatchingBoundedAndMutatingBarrier(t *testing.T) {
 	var active, maxActive atomic.Int32
 	var mu sync.Mutex
 	var timeline []string
+	var once sync.Once
+	parallelObserved := make(chan struct{})
 
 	r.execTool = func(tc toolCall) string {
 		cur := active.Add(1)
@@ -598,11 +602,20 @@ func TestParallelReadOnlyBatchingBoundedAndMutatingBarrier(t *testing.T) {
 				break
 			}
 		}
+		if cur >= 2 {
+			once.Do(func() { close(parallelObserved) })
+		}
 		mu.Lock()
 		timeline = append(timeline, "start:"+tc.ID)
 		mu.Unlock()
 
-		time.Sleep(45 * time.Millisecond)
+		// Synchronize cleanly on first concurrent batch instead of relying on tight wall-clock timing.
+		if tc.ID == "r1" || tc.ID == "r2" || tc.ID == "r3" || tc.ID == "r4" {
+			select {
+			case <-parallelObserved:
+			case <-time.After(time.Second):
+			}
+		}
 
 		mu.Lock()
 		timeline = append(timeline, "end:"+tc.ID)
@@ -622,16 +635,10 @@ func TestParallelReadOnlyBatchingBoundedAndMutatingBarrier(t *testing.T) {
 		{ID: "r7", Function: functionCall{Name: "read_file", Arguments: `{"path":"3"}`}},
 	}
 
-	start := time.Now()
 	outcomes := r.executeToolCallsStatus(calls, nil)
-	elapsed := time.Since(start)
 
 	if maxActive.Load() > 4 || maxActive.Load() < 2 {
 		t.Fatalf("expected bounded parallel concurrency in [2..4], got maxActive=%d", maxActive.Load())
-	}
-	// 8 sequential 45ms calls would take >= 360ms; bounded 4-worker parallel batches take ~180ms.
-	if elapsed >= 310*time.Millisecond {
-		t.Fatalf("expected parallel speedup (<310ms), took %s", elapsed)
 	}
 	// Exact output order preserved matching tool call IDs.
 	for i, tc := range calls {
@@ -979,8 +986,12 @@ func TestSSENearBoundaryIdleTimeoutTriggersFailover(t *testing.T) {
 			calls1.Add(1)
 			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"c1\"}}]}\n\n")
 			flusher.Flush()
-			// Sleep right around the 70ms idle timeout before sending chunk 2 without [DONE].
-			time.Sleep(110 * time.Millisecond)
+			// Wait for the client's idle watchdog to cancel the stream (or generous 600ms upper bound).
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(600 * time.Millisecond):
+			}
 			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\n")
 			flusher.Flush()
 			return

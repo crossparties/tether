@@ -19,6 +19,8 @@ type Handler struct {
 	engine   *core.Engine
 	mount    *mount.Engine
 	snapshot *snapshot.Store
+	actorID  string
+	readOnly bool
 }
 
 func NewHandler(engine *core.Engine) *Handler {
@@ -35,17 +37,43 @@ func NewHandler(engine *core.Engine) *Handler {
 	}
 }
 
-func (h *Handler) mountEngine() *mount.Engine {
+// SetActorID configures the actor ("main" or Crew ID) for File Ownership Lease checks.
+func (h *Handler) SetActorID(actorID string) {
+	if h == nil {
+		return
+	}
+	h.actorID = strings.TrimSpace(actorID)
 	if h.mount != nil {
-		return h.mount
+		h.mount.SetActorID(h.actorID)
 	}
-	if h.engine != nil {
-		return h.engine.Mount()
+}
+
+// SetReadOnly locks the hook handler into read-only review mode regardless of DB mode.
+func (h *Handler) SetReadOnly(ro bool) {
+	if h != nil {
+		h.readOnly = ro
 	}
-	return mount.NewEngine(".")
+}
+
+func (h *Handler) mountEngine() *mount.Engine {
+	var m *mount.Engine
+	if h.mount != nil {
+		m = h.mount
+	} else if h.engine != nil {
+		m = h.engine.Mount()
+	} else {
+		m = mount.NewEngine(".")
+	}
+	if h.actorID != "" {
+		m.SetActorID(h.actorID)
+	}
+	return m
 }
 
 func (h *Handler) activeMode() string {
+	if h != nil && h.readOnly {
+		return "review"
+	}
 	if h.engine != nil {
 		return h.engine.GetMode()
 	}
@@ -351,6 +379,20 @@ func (h *Handler) handlePreToolUse(input HookInput) HookOutput {
 		ws = h.engine.Workspace
 	}
 	mode := h.activeMode()
+
+	if h.readOnly {
+		if isWriteTool(toolName) || toolName == "mode_set" || toolName == "decision_add" {
+			return HookOutput{Decision: "deny", Reason: "Tether Guard: read-only crew cannot mutate files or governance state."}
+		}
+		if toolName == "todo_manage" && !strings.EqualFold(strings.TrimSpace(input.ArgText("action")), "list") {
+			return HookOutput{Decision: "deny", Reason: "Tether Guard: read-only crew cannot mutate todos."}
+		}
+		if toolName == "run_command" || toolName == "bash" || toolName == "sh" || toolName == "shell" || toolName == "exec" {
+			if ok, _ := safety.IsReadOnlyCommand(command); !ok {
+				return HookOutput{Decision: "deny", Reason: "Tether Guard: read-only crew may only run strictly read-only commands."}
+			}
+		}
+	}
 
 	// 1. Catastrophic command, Point-2 shell guard & protected substrate protection
 	if toolName == "run_command" || toolName == "bash" || toolName == "sh" || toolName == "shell" || toolName == "exec" {

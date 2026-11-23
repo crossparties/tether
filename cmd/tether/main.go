@@ -715,6 +715,7 @@ func cmdRun(args []string) {
 	}
 
 	runner := harness.NewRunner(engine, cfg)
+	defer runner.CloseAllCrews()
 	prompt := strings.TrimSpace(strings.Join(promptParts, " "))
 	if prompt == "" {
 		if useTUI || (ui.IsTerminal(os.Stdin) && ui.IsTerminalFile(os.Stdout) && os.Getenv("TETHER_LEGACY_REPL") != "1") {
@@ -760,20 +761,31 @@ func cmdRun(args []string) {
 func buildTUIBridge(runner *harness.Runner, engine *core.Engine) *tui.AgentBridge {
 	runner.SetAutoApprovePolicy(runner.DefaultAutoApprovePolicy())
 	return &tui.AgentBridge{
-		Provider:        runner.ProviderName,
-		Model:           runner.ModelName,
-		Mode:            runner.ModeName,
-		Branch:          func() string { return engine.Branch },
-		NeedsAPIKey:     runner.NeedsAPIKey,
-		SaveAPIKey:      runner.SaveProviderKey,
-		ListKeys:        runner.ListKeysSummary,
-		ProbeKeys:       runner.ProbeKeysSummary,
-		SwitchModel:     runner.SwitchModel,
-		SwitchProvider:  runner.SwitchProvider,
-		SwitchMode:      runner.SwitchMode,
-		ClearHistory:    runner.ClearHistory,
-		Undo:            runner.UndoTurn,
-		StatusSummary:   runner.StatusSummary,
+		Provider:       runner.ProviderName,
+		Model:          runner.ModelName,
+		Mode:           runner.ModeName,
+		Branch:         func() string { return engine.Branch },
+		NeedsAPIKey:    runner.NeedsAPIKey,
+		SaveAPIKey:     runner.SaveProviderKey,
+		ListKeys:       runner.ListKeysSummary,
+		ProbeKeys:      runner.ProbeKeysSummary,
+		SwitchModel:    runner.SwitchModel,
+		SwitchProvider: runner.SwitchProvider,
+		SwitchMode:     runner.SwitchMode,
+		ClearHistory:   runner.ClearHistory,
+		Undo:           runner.UndoTurn,
+		StatusSummary:  runner.StatusSummary,
+		TokensSummary:  runner.TokensSummary,
+		Compact: func(ctx context.Context) (string, error) {
+			res, err := runner.CondenseHistory(ctx, true)
+			if err != nil {
+				return "", err
+			}
+			if !res.Condensed {
+				return "Conversation is already compact; nothing to condense.", nil
+			}
+			return fmt.Sprintf("Condensed %d older events into 5-slot summary (%d remaining).", res.CondensedCount, res.RemainingCount), nil
+		},
 		ExecuteCommand:  runner.ExecuteGatedCommand,
 		RunPrompt:       runner.RunWithOutput,
 		RunPromptStream: runner.RunWithOutputStream,
@@ -813,12 +825,15 @@ func buildTUIBridge(runner *harness.Runner, engine *core.Engine) *tui.AgentBridg
 				}
 				// Defense-in-depth: non-critical actions (read/validation shell,
 				// routine undoable workspace edits in CODE mode, plan artifacts
-				// in PLAN mode) never interrupt the user.
-				if ok, _ := safety.IsNonCriticalTool(mode, d.Tool, target, d.Command, ws); ok {
-					return mcp.VerdictOnce, true
+				// in PLAN mode) never interrupt the user unless ForceAsk is set
+				// (e.g. a delegate_critical=false Crew worker).
+				if !d.ForceAsk {
+					if ok, _ := safety.IsNonCriticalTool(mode, d.Tool, target, d.Command, ws); ok {
+						return mcp.VerdictOnce, true
+					}
 				}
 				risk, reason := safety.ClassifyRisk(d.Tool, target)
-				if risk == safety.RiskLow {
+				if !d.ForceAsk && risk == safety.RiskLow {
 					// e.g. temp/cache writes: not critical, no prompt.
 					return mcp.VerdictOnce, true
 				}

@@ -169,11 +169,35 @@ func init() {
 		},
 		{
 			Name: "status",
-			Help: "show workspace, session, mode, KB and provider",
+			Help: "show workspace, session, mode, KB, provider and cache telemetry",
 			Handler: func(r *Runner, _ []string) bool {
-				kbStats, _ := r.engine.KBStatus()
-				fmt.Fprintf(r.cfg.Out, "Workspace: %s | Session: %s | Mode: %s | KB: %d files | Provider: %s (%s)\n",
-					r.engine.Workspace, r.engine.SessionID, r.engine.GetMode(), kbStats.TotalFiles, r.cfg.Provider, r.cfg.Model)
+				fmt.Fprintln(r.cfg.Out, r.StatusSummary())
+				return false
+			},
+		},
+		{
+			Name: "tokens",
+			Help: "show per-usage_id context pressure and KV-cache hit ratios",
+			Handler: func(r *Runner, _ []string) bool {
+				fmt.Fprintln(r.cfg.Out, r.TokensSummary())
+				return false
+			},
+		},
+		{
+			Name: "compact",
+			Help: "condense older conversation history into a 5-slot episodic summary",
+			Handler: func(r *Runner, _ []string) bool {
+				res, err := r.CondenseHistory(r.sideChatCtx(), true)
+				if err != nil {
+					fmt.Fprintf(r.cfg.Out, "✖ [compact] %v\n", err)
+					return false
+				}
+				if !res.Condensed {
+					fmt.Fprintln(r.cfg.Out, "ℹ Conversation is already compact; nothing to condense.")
+					return false
+				}
+				fmt.Fprintf(r.cfg.Out, "✓ Condensed %d older events into 5-slot episodic summary (%d messages remaining).\n",
+					res.CondensedCount, res.RemainingCount)
 				return false
 			},
 		},
@@ -181,7 +205,7 @@ func init() {
 			Name: "clear",
 			Help: "clear conversation history (substrate memory kept)",
 			Handler: func(r *Runner, _ []string) bool {
-				r.history = nil
+				r.ClearHistory()
 				fmt.Fprintln(r.cfg.Out, "✓ Conversation history cleared (substrate memory in .tether/session.db retained).")
 				return false
 			},

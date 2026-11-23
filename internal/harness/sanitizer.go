@@ -28,16 +28,23 @@ func SanitizeMessages(messages []chatMessage, opts SanitizeOptions) []chatMessag
 
 	targetProv := strings.TrimSpace(opts.TargetProvider)
 	stripReasoning := !opts.PreserveReasoning && targetProv != "" && !strings.EqualFold(targetProv, "deepseek")
+	lastUserIdx := -1
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" {
+			lastUserIdx = i
+			break
+		}
+	}
 
 	// Pass 1 & 2: Copy messages, strip incompatible reasoning_content, drop empty assistant messages.
 	cleaned := make([]chatMessage, 0, len(messages))
-	for _, m := range messages {
+	for i, m := range messages {
 		cp := m
 		if len(m.ToolCalls) > 0 {
 			cp.ToolCalls = make([]toolCall, len(m.ToolCalls))
 			copy(cp.ToolCalls, m.ToolCalls)
 		}
-		if stripReasoning {
+		if stripReasoning || (!opts.PreserveReasoning && lastUserIdx >= 0 && i < lastUserIdx) {
 			cp.ReasoningContent = ""
 			cp.Prefix = false
 		}

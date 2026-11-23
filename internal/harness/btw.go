@@ -217,10 +217,17 @@ func (r *Runner) SwitchMode(mode string) error {
 	return r.engine.SetMode(mode)
 }
 
-// ClearHistory clears the in-memory conversation buffer while retaining .tether/session.db memory.
+// ClearHistory clears the in-memory conversation buffer and session cache head while retaining .tether/session.db memory.
 func (r *Runner) ClearHistory() {
 	r.mu.Lock()
 	r.history = nil
+	r.frozenSystemPrompt = ""
+	r.frozenTools = nil
+	r.baselineRepoMapFiles = nil
+	r.activeFileHashes = nil
+	r.lastPromptMode = ""
+	r.lastTodoDigest = ""
+	r.pendingTailNotices = nil
 	r.mu.Unlock()
 }
 
@@ -238,7 +245,17 @@ func (r *Runner) StatusSummary() string {
 	mod := r.cfg.Model
 	hits := r.lastCacheHitTokens
 	misses := r.lastCacheMissTokens
+	tracker := r.usageTracker
 	r.mu.RUnlock()
+
+	var pressurePct float64
+	if tracker != nil {
+		if mainMetrics, ok := tracker.Get("main"); ok && mainMetrics.Calls > 0 {
+			hits = mainMetrics.LastCacheHit
+			misses = mainMetrics.LastCacheMiss
+			pressurePct = mainMetrics.ContextPressure * 100.0
+		}
+	}
 
 	if r.engine == nil {
 		return fmt.Sprintf("Provider: %s (%s)", prov, mod)
@@ -253,6 +270,9 @@ func (r *Runner) StatusSummary() string {
 		}
 		cacheInfo = fmt.Sprintf(" | Cache Hit: %d/%d (%d%%)", hits, total, pct)
 	}
+	if pressurePct > 0 {
+		cacheInfo += fmt.Sprintf(" | Ctx: %.1f%%", pressurePct)
+	}
 	return fmt.Sprintf("Workspace: %s | Session: %s | Mode: %s | KB: %d files | Provider: %s (%s)%s",
 		r.engine.Workspace, r.engine.SessionID, r.engine.GetMode(), kbStats.TotalFiles, prov, mod, cacheInfo)
 }
@@ -261,6 +281,13 @@ func (r *Runner) StatusSummary() string {
 func (r *Runner) SetAskPolicy(fn func(mcp.Decision) (mcp.Verdict, bool)) {
 	if r.mcp != nil {
 		r.mcp.SetAskPolicy(fn)
+	}
+}
+
+// SetAskPolicyWithReason installs a custom interactive approval handler with explicit reject reason.
+func (r *Runner) SetAskPolicyWithReason(fn func(mcp.Decision) (mcp.Verdict, string, bool)) {
+	if r.mcp != nil {
+		r.mcp.SetAskPolicyWithReason(fn)
 	}
 }
 
@@ -300,27 +327,19 @@ func (r *Runner) DefaultAutoApprovePolicy() func(mcp.Decision) bool {
 // RunWithOutput executes a prompt while streaming intermediate tool logs to out.
 // It also expands any `@rel/path` file mentions inside the prompt using SafeReadWorkspaceFile.
 func (r *Runner) RunWithOutput(ctx context.Context, prompt string, out io.Writer) (string, error) {
-	expanded := r.expandAtMentions(prompt)
-	return r.runWithOptions(ctx, expanded, out, nil)
+	return r.runWithOptions(ctx, prompt, out, nil)
 }
 
+// expandAtMentions reads workspace @file mentions in isolation (used by /btw without touching activeFileHashes).
 func (r *Runner) expandAtMentions(prompt string) string {
-	if !strings.Contains(prompt, "@") || r.engine == nil || r.engine.Workspace == "" {
+	mentions := extractAtMentionPaths(prompt)
+	if len(mentions) == 0 || r.engine == nil || r.engine.Workspace == "" {
 		return prompt
 	}
-	words := strings.Fields(prompt)
+	mountEng := r.mountForRead()
 	var attachments []string
-	seen := map[string]bool{}
-	for _, w := range words {
-		if !strings.HasPrefix(w, "@") || len(w) <= 1 {
-			continue
-		}
-		rel := strings.TrimRight(strings.TrimPrefix(w, "@"), ",.;:!?)]}\"'")
-		if rel == "" || seen[rel] {
-			continue
-		}
-		if content, cleanRel, err := tetherctx.SafeReadWorkspaceFile(r.engine.Workspace, rel, 32*1024); err == nil {
-			seen[rel] = true
+	for _, rel := range mentions {
+		if content, cleanRel, err := tetherctx.SafeReadWorkspaceFileWithMount(mountEng, r.engine.Workspace, rel, 32*1024); err == nil {
 			attachments = append(attachments, fmt.Sprintf("<file path=%q>\n%s\n</file>", cleanRel, content))
 		}
 	}
@@ -330,11 +349,12 @@ func (r *Runner) expandAtMentions(prompt string) string {
 	return prompt + "\n\n[Attached Workspace Files via @mention]:\n" + strings.Join(attachments, "\n\n")
 }
 
-// RunSideChat executes an isolated `/btw <question>` turn (PRD §3.5).
-// It guarantees zero context pollution:
-//  1. It never reads or mutates r.history.
-//  2. It never records entries in .tether/session.db via r.engine.AddContext.
-//  3. It strips all mutative tools (only stateless Q&A is performed).
+// RunSideChat executes an isolated, context-aware `/btw <question>` turn.
+// It guarantees zero pollution to Main:
+//  1. Takes a read-only snapshot of Main history tail (never mutates r.history).
+//  2. Expands @file mentions safely via SafeReadWorkspaceFile / mount.AuthorizePath.
+//  3. Permits strictly read-only tools (read_file, glob, grep, kb_search) when tools exist, blocking mutations.
+//  4. Tags usage strictly under usage_id: "btw", isolated from "main" cache counters.
 func (r *Runner) RunSideChat(ctx context.Context, question string) (string, error) {
 	question = strings.TrimSpace(question)
 	if question == "" {
@@ -348,22 +368,182 @@ func (r *Runner) RunSideChat(ctx context.Context, question string) (string, erro
 	callCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 
-	messages := []chatMessage{
-		{
-			Role:    "system",
-			Content: "You are answering an isolated /btw side-chat question inside Tether. Be concise and technical. This conversation is ephemeral and does not modify the active workspace task.",
-		},
-		{
-			Role:    "user",
-			Content: question,
-		},
+	mainSnap := r.snapshotMainHistoryTail()
+	expandedQ := r.expandAtMentions(question)
+
+	var sysB strings.Builder
+	sysB.WriteString("You are answering an isolated, read-only /btw side-chat question inside Tether. Be concise and technical. Never modify files or state.")
+	if mainSnap != "" {
+		sysB.WriteString("\n\n<main_context_snapshot read_only=\"true\">\n")
+		sysB.WriteString(mainSnap)
+		sysB.WriteString("\n</main_context_snapshot>")
 	}
 
-	msg, _, err := r.callAPIWithFailover(callCtx, messages, nil, nil, nil)
-	if err != nil {
-		return "", err
+	messages := []chatMessage{
+		{Role: "system", Content: sysB.String()},
+		{Role: "user", Content: expandedQ},
 	}
-	return msg.Content, nil
+
+	readOnlyTools := r.btwReadOnlyTools(question, mainSnap)
+	const maxBtwSteps = 6
+	for step := 0; step < maxBtwSteps; step++ {
+		msg, _, err := r.callAPIWithFailoverUsageID(callCtx, "btw", messages, readOnlyTools, nil, nil)
+		if err != nil {
+			return "", err
+		}
+		if len(msg.ToolCalls) == 0 {
+			r.mu.Lock()
+			r.lastBtwQuestion = question
+			r.lastBtwAnswer = msg.Content
+			r.mu.Unlock()
+			return msg.Content, nil
+		}
+		messages = append(messages, msg)
+		for _, tc := range msg.ToolCalls {
+			if !isBtwAllowedTool(tc.Function.Name) {
+				messages = append(messages, chatMessage{
+					Role:       "tool",
+					ToolCallID: tc.ID,
+					Content:    fmt.Sprintf("DENIED BY TETHER GUARD: mutating/unsupported tool %q is strictly forbidden in /btw side-chat.", tc.Function.Name),
+				})
+				continue
+			}
+			out, _ := r.mcp.CallTool(tc.Function.Name, json.RawMessage(tc.Function.Arguments))
+			messages = append(messages, chatMessage{
+				Role:       "tool",
+				ToolCallID: tc.ID,
+				Content:    out,
+			})
+		}
+	}
+	return "", fmt.Errorf("/btw exceeded max read-only tool steps (%d)", maxBtwSteps)
+}
+
+func isBtwAllowedTool(name string) bool {
+	switch name {
+	case "read_file", "glob", "grep", "kb_search":
+		return true
+	}
+	return false
+}
+
+func (r *Runner) btwReadOnlyTools(question, mainSnap string) []openAITool {
+	if r.mcp == nil {
+		return nil
+	}
+	// Preserve lean payloads for simple stateless prompts unless context or workspace inspection is relevant.
+	if mainSnap == "" && !strings.Contains(question, "@") && !looksLikeCodeInspectionQuery(question) {
+		return nil
+	}
+	var tools []openAITool
+	for _, t := range r.mcp.ListTools() {
+		if isBtwAllowedTool(t.Name) {
+			tools = append(tools, toOpenAITool(t))
+		}
+	}
+	return tools
+}
+
+func looksLikeCodeInspectionQuery(q string) bool {
+	low := strings.ToLower(q)
+	for _, kw := range []string{"file", "read", "grep", "search", "code", "func", "where", "how does", "line"} {
+		if strings.Contains(low, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Runner) snapshotMainHistoryTail() string {
+	r.mu.RLock()
+	if len(r.history) <= 1 {
+		r.mu.RUnlock()
+		return ""
+	}
+	cp := make([]chatMessage, len(r.history))
+	copy(cp, r.history)
+	r.mu.RUnlock()
+
+	start := 1
+	if len(cp)-start > 8 {
+		start = len(cp) - 8
+	}
+	var b strings.Builder
+	for i := start; i < len(cp); i++ {
+		m := cp[i]
+		content := clipTextRunes(strings.TrimSpace(m.Content), 500)
+		if content == "" && len(m.ToolCalls) > 0 {
+			var names []string
+			for _, tc := range m.ToolCalls {
+				names = append(names, tc.Function.Name)
+			}
+			content = "tool_calls: " + strings.Join(names, ", ")
+		}
+		if content == "" {
+			continue
+		}
+		fmt.Fprintf(&b, "[%s] %s\n", m.Role, content)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// PromoteBtwToMain appends a /btw Q&A cleanly to the tail of Main's history (leaving
+// all prior messages 100% immutable so existing KV-cache prefixes stay valid).
+func (r *Runner) PromoteBtwToMain(question, answer string) error {
+	r.mu.Lock()
+	if strings.TrimSpace(question) == "" {
+		question = r.lastBtwQuestion
+	}
+	if strings.TrimSpace(answer) == "" {
+		answer = r.lastBtwAnswer
+	}
+	r.mu.Unlock()
+
+	if strings.TrimSpace(answer) == "" {
+		return fmt.Errorf("no /btw answer to promote")
+	}
+	if strings.TrimSpace(question) == "" {
+		question = "Side-chat context"
+	}
+
+	head, _ := r.ensureFrozenHead()
+
+	r.mu.Lock()
+	if len(r.history) == 0 {
+		r.history = []chatMessage{{Role: "system", Content: head}}
+	}
+	userMsg := chatMessage{Role: "user", Content: "[Promoted from /btw]\n" + question}
+	asstMsg := chatMessage{Role: "assistant", Content: answer}
+	r.history = append(r.history, userMsg, asstMsg)
+	r.mu.Unlock()
+
+	r.persistMessageEvent("user", "main", userMsg)
+	r.persistMessageEvent("assistant", "main", asstMsg)
+	return nil
+}
+
+// PinBtwAsDecision records a decision in .tether/session.db and queues a tail
+// reminder for Main without mutating messages[0].
+func (r *Runner) PinBtwAsDecision(topic, decision, reason string) error {
+	if r == nil || r.engine == nil {
+		return fmt.Errorf("runner has no active engine")
+	}
+	if strings.TrimSpace(topic) == "" {
+		topic = "btw"
+	}
+	if strings.TrimSpace(decision) == "" {
+		r.mu.RLock()
+		decision = r.lastBtwAnswer
+		r.mu.RUnlock()
+	}
+	if strings.TrimSpace(decision) == "" {
+		return fmt.Errorf("decision text required")
+	}
+	if err := r.engine.AddDecision(topic, decision, reason); err != nil {
+		return err
+	}
+	r.QueueTailNotice(fmt.Sprintf("Pinned decision from /btw [%s]: %s", topic, clipTextRunes(decision, 180)))
+	return nil
 }
 
 // ReadWorkspaceFile reads a file relative to the runner's workspace while

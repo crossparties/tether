@@ -153,19 +153,44 @@ func (s *Server) prepareMutation(tool string, args json.RawMessage) (mut *mutati
 // authorizeMutation checks the approval gate for a validated mutation. It returns
 // an empty string when execution may proceed, or the denial/approval message.
 func (s *Server) authorizeMutation(m *mutation) string {
-	if m == nil || s.approvesAll() {
+	if m == nil {
 		return ""
 	}
+	if s.IsReadOnly() {
+		if m.command != "" {
+			if ok, _ := safety.IsReadOnlyCommand(m.command); ok {
+				return ""
+			}
+		}
+		return fmt.Sprintf("Tether Guard: read-only crew cannot mutate via %s.", m.tool)
+	}
+	if s.approvesAll() {
+		return ""
+	}
+	dec := s.mutationDecision(m)
 
 	// Shell commands are authorized by command grants, never by path grants:
 	// saying "you may write in ./internal" must not imply "you may run rm there".
 	if m.command != "" {
+		if dec.ForceAsk {
+			if s.hasForceAskGrant(m) {
+				return ""
+			}
+			return s.gate(m)
+		}
 		if s.engine != nil {
 			if ok, err := s.engine.HasCommandGrant(m.command); err == nil && ok {
 				return ""
 			}
 		}
-		if auto := s.AutoApprovePolicy(); auto != nil && auto(m.decision()) {
+		if auto := s.AutoApprovePolicy(); auto != nil && auto(dec) {
+			return ""
+		}
+		return s.gate(m)
+	}
+
+	if dec.ForceAsk {
+		if s.hasForceAskGrant(m) {
 			return ""
 		}
 		return s.gate(m)
@@ -177,11 +202,73 @@ func (s *Server) authorizeMutation(m *mutation) string {
 		}
 	}
 
-	if auto := s.AutoApprovePolicy(); auto != nil && m.accessMode != mount.AccessGuarded && auto(m.decision()) {
+	if auto := s.AutoApprovePolicy(); auto != nil && m.accessMode != mount.AccessGuarded && auto(dec) {
 		return ""
 	}
 
 	return s.gate(m)
+}
+
+func (s *Server) recordForceAskGrant(key string) {
+	if !s.forcesAskWrites() || key == "" {
+		return
+	}
+	s.askMu.Lock()
+	if s.forceAskGrants == nil {
+		s.forceAskGrants = make(map[string]bool)
+	}
+	s.forceAskGrants[key] = true
+	s.askMu.Unlock()
+}
+
+func (s *Server) hasForceAskGrant(m *mutation) bool {
+	if m == nil {
+		return false
+	}
+	s.askMu.Lock()
+	defer s.askMu.Unlock()
+	if len(s.forceAskGrants) == 0 {
+		return false
+	}
+	if m.command != "" {
+		if s.forceAskGrants["cmd:"+m.command] {
+			return true
+		}
+		if prefix := commandPrefix(m.command); prefix != "" && s.forceAskGrants["cmd_prefix:"+prefix] {
+			return true
+		}
+		return false
+	}
+	if m.scope == "" {
+		return false
+	}
+	if s.forceAskGrants["path:"+m.scope] {
+		return true
+	}
+	cur := path.Dir(m.scope)
+	for cur != "" && cur != "." && cur != "/" {
+		if s.forceAskGrants["dir:"+cur] {
+			return true
+		}
+		next := path.Dir(cur)
+		if next == cur {
+			break
+		}
+		cur = next
+	}
+	return s.forceAskGrants["dir:."]
+}
+
+func (s *Server) mutationDecision(m *mutation) Decision {
+	dec := m.decision()
+	if s.forcesAskWrites() {
+		if m.command == "" {
+			dec.ForceAsk = true
+		} else if ok, _ := safety.IsReadOnlyCommand(m.command); !ok {
+			dec.ForceAsk = true
+		}
+	}
+	return dec
 }
 
 // gate turns a blocked mutation into a decision. When an interactive asker is
@@ -190,13 +277,18 @@ func (s *Server) authorizeMutation(m *mutation) string {
 // JSON-RPC, hooks, any non-interactive caller -- the request is refused with the
 // instructions it always carried, because there is nobody to ask.
 func (s *Server) gate(m *mutation) string {
+	if s.IsReadOnly() {
+		return fmt.Sprintf("Tether Guard: read-only crew cannot mutate via %s.", m.tool)
+	}
 	if s.approvesAll() {
 		// The user chose "approve everything": apply without asking.
 		return ""
 	}
-	if ask := s.AskPolicy(); ask != nil {
-		if v, ok := ask(m.decision()); ok {
-			return s.applyVerdict(m, v)
+	if ask := s.askPolicyWithReason(); ask != nil {
+		if v, reason, ok := ask(s.mutationDecision(m)); ok {
+			return s.applyVerdict(m, v, reason)
+		} else if strings.TrimSpace(reason) != "" {
+			return "Rejected by the user: " + strings.TrimSpace(reason) + ". Nothing was written. Do not retry the same change; ask the user what they would prefer instead."
 		}
 		return "Rejected by the user. Nothing was written. Do not retry the same change; " +
 			"ask the user what they would prefer instead."
@@ -231,7 +323,7 @@ func (m *mutation) decision() Decision {
 
 // applyVerdict records the user's answer as a grant and explains it in the
 // tool result, so the model knows the retry will go through.
-func (s *Server) applyVerdict(m *mutation, v Verdict) string {
+func (s *Server) applyVerdict(m *mutation, v Verdict, reason string) string {
 	switch v {
 	case VerdictSession:
 		// Blanket approval lives on the server, not in the asker: the real asker
@@ -245,6 +337,7 @@ func (s *Server) applyVerdict(m *mutation, v Verdict) string {
 	case VerdictFolder:
 		if m.command != "" {
 			prefix := commandPrefix(m.command)
+			s.recordForceAskGrant("cmd_prefix:" + prefix)
 			if err := s.engine.AddCommandGrant(prefix, true); err != nil {
 				return fmt.Sprintf("error recording approval: %v", err)
 			}
@@ -255,22 +348,29 @@ func (s *Server) applyVerdict(m *mutation, v Verdict) string {
 		if dir == "." || dir == "/" {
 			dir = m.scope
 		}
+		s.recordForceAskGrant("dir:" + dir)
 		if err := s.engine.AddApprovalGrant(dir, "path"); err != nil {
 			return fmt.Sprintf("error recording approval: %v", err)
 		}
 		return fmt.Sprintf("Approved: all changes under %q are allowed until %s (session-scoped).\nRepeat the original tool call to apply this change.",
 			dir, core.GrantExpiryHint())
 	case VerdictReject:
+		if strings.TrimSpace(reason) != "" {
+			return "Rejected by the user: " + strings.TrimSpace(reason) + ". Nothing was written. Do not retry the same change; " +
+				"ask the user what they would prefer instead."
+		}
 		return "Rejected by the user. Nothing was written. Do not retry the same change; " +
 			"ask the user what they would prefer instead."
 	default: // VerdictOnce
 		if m.command != "" {
+			s.recordForceAskGrant("cmd:" + m.command)
 			if err := s.engine.AddCommandGrant(m.command, false); err != nil {
 				return fmt.Sprintf("error recording approval: %v", err)
 			}
 			return fmt.Sprintf("Approved: %q may run until %s.\nRepeat the original tool call to run it.",
 				m.command, core.GrantExpiryHint())
 		}
+		s.recordForceAskGrant("path:" + m.scope)
 		if err := s.engine.AddApprovalGrant(m.scope, "path"); err != nil {
 			return fmt.Sprintf("error recording approval: %v", err)
 		}

@@ -82,6 +82,13 @@ type SideChatDoneMsg struct {
 	Elapsed  time.Duration
 }
 
+// CompactDoneMsg delivers the asynchronous `/compact` episodic condensation outcome.
+type CompactDoneMsg struct {
+	Result  string
+	Err     error
+	Elapsed time.Duration
+}
+
 // ApprovalGateMsg asks the TUI to display the Double-Bordered Approval Modal and send the user's verdict on ReplyCh.
 type ApprovalGateMsg struct {
 	Request ApprovalRequest
@@ -112,6 +119,8 @@ type AgentBridge struct {
 	ClearHistory   func()
 	Undo           func(turn string) string
 	StatusSummary  func() string
+	TokensSummary  func() string
+	Compact        func(ctx context.Context) (string, error)
 	ExecuteCommand func(ctx context.Context, cmdStr string) (string, error)
 	RunPrompt      func(ctx context.Context, prompt string, logOut io.Writer) (string, error)
 	// RunPromptStream is the streaming variant of RunPrompt; when set it is preferred so
@@ -211,6 +220,8 @@ func DefaultSlashCommands() []SlashCommandSpec {
 		{Command: "/plan", Description: "Lock repository into read-only PLAN mode", NeedsArg: false},
 		{Command: "/code", Description: "Unlock codebase mutations (CODE mode)", NeedsArg: false},
 		{Command: "/status", Description: "Show workspace, session, KB, and worker metrics", NeedsArg: false},
+		{Command: "/tokens", Description: "Show per-usage_id context pressure and cache hit ratios", NeedsArg: false},
+		{Command: "/compact", Description: "Condense older conversation history into a 5-slot episodic summary", NeedsArg: false},
 		{Command: "/undo", Description: "Restore file snapshots from the last turn", NeedsArg: false},
 		{Command: "/clear", Description: "Clear the conversation viewport buffer", NeedsArg: false},
 		{Command: "/help", Description: "Display keyboard shortcuts and command reference", NeedsArg: false},
@@ -267,12 +278,13 @@ type Model struct {
 	Quitting        bool
 
 	// Live Agent Bridge & Pending Async Dispatch Queue
-	Bridge        *AgentBridge
-	AwaitingKey   bool
-	PendingPrompt string
-	PendingBtw    string
-	PendingExec   string
-	PendingCopy   string // text queued for the system clipboard (OSC 52 + native helpers)
+	Bridge         *AgentBridge
+	AwaitingKey    bool
+	PendingPrompt  string
+	PendingBtw     string
+	PendingCompact bool
+	PendingExec    string
+	PendingCopy    string // text queued for the system clipboard (OSC 52 + native helpers)
 
 	// MouseCapture is true while the TUI owns the mouse wheel (scrolling). When false the
 	// terminal's native text selection works, so the user can drag-select and copy.

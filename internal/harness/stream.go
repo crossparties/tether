@@ -42,9 +42,56 @@ func (e *apiError) Unwrap() error {
 }
 
 type apiUsage struct {
-	cacheHit  int
-	cacheMiss int
-	ttft      time.Duration
+	promptTokens     int
+	completionTokens int
+	cacheHit         int
+	cacheMiss        int
+	ttft             time.Duration
+}
+
+type wireUsage struct {
+	PromptTokens             int `json:"prompt_tokens"`
+	CompletionTokens         int `json:"completion_tokens"`
+	InputTokens              int `json:"input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	PromptCacheHitTokens     int `json:"prompt_cache_hit_tokens"`
+	PromptCacheMissTokens    int `json:"prompt_cache_miss_tokens"`
+	PromptTokensDetails      struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+}
+
+func normalizeWireUsage(u wireUsage) apiUsage {
+	hit := u.PromptCacheHitTokens
+	if hit == 0 {
+		hit = u.PromptTokensDetails.CachedTokens
+	}
+	if hit == 0 {
+		hit = u.CacheReadInputTokens
+	}
+	prompt := u.PromptTokens
+	if prompt == 0 && u.InputTokens > 0 {
+		prompt = u.InputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens
+	}
+	if prompt == 0 && (hit > 0 || u.PromptCacheMissTokens > 0) {
+		prompt = hit + u.PromptCacheMissTokens
+	}
+	miss := u.PromptCacheMissTokens
+	if miss == 0 && prompt >= hit {
+		miss = prompt - hit
+	}
+	comp := u.CompletionTokens
+	if comp == 0 {
+		comp = u.OutputTokens
+	}
+	return apiUsage{
+		promptTokens:     prompt,
+		completionTokens: comp,
+		cacheHit:         hit,
+		cacheMiss:        miss,
+	}
 }
 
 func parseRetryAfter(val string) time.Duration {
@@ -106,13 +153,7 @@ type streamChunk struct {
 			} `json:"tool_calls"`
 		} `json:"delta"`
 	} `json:"choices"`
-	Usage *struct {
-		PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens"`
-		PromptCacheMissTokens int `json:"prompt_cache_miss_tokens"`
-		PromptTokensDetails   struct {
-			CachedTokens int `json:"cached_tokens"`
-		} `json:"prompt_tokens_details"`
-	} `json:"usage"`
+	Usage *wireUsage `json:"usage"`
 }
 
 func (r *Runner) doPostJSON(ctx context.Context, snap callSnapshot, targetURL string, payload map[string]any, acceptSSE bool) (*http.Response, error) {
@@ -271,13 +312,10 @@ func (r *Runner) streamRequest(ctx context.Context, snap callSnapshot, targetURL
 				usage.ttft = time.Since(reqStart)
 			}
 			if chunk.Usage != nil {
-				hit := chunk.Usage.PromptCacheHitTokens
-				if hit == 0 {
-					hit = chunk.Usage.PromptTokensDetails.CachedTokens
-				}
-				if hit > 0 || chunk.Usage.PromptCacheMissTokens > 0 {
-					usage.cacheHit = hit
-					usage.cacheMiss = chunk.Usage.PromptCacheMissTokens
+				u := normalizeWireUsage(*chunk.Usage)
+				if u.promptTokens > 0 || u.completionTokens > 0 || u.cacheHit > 0 || u.cacheMiss > 0 {
+					u.ttft = usage.ttft
+					usage = u
 				}
 			}
 			for _, ch := range chunk.Choices {
@@ -363,25 +401,14 @@ func parseBufferedCompletion(body []byte, onDelta func(kind, text string)) (chat
 			Message      chatMessage `json:"message"`
 			FinishReason string      `json:"finish_reason"`
 		} `json:"choices"`
-		Usage struct {
-			PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens"`
-			PromptCacheMissTokens int `json:"prompt_cache_miss_tokens"`
-			PromptTokensDetails   struct {
-				CachedTokens int `json:"cached_tokens"`
-			} `json:"prompt_tokens_details"`
-		} `json:"usage"`
+		Usage *wireUsage `json:"usage"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil || len(parsed.Choices) == 0 {
 		return chatMessage{}, "", apiUsage{}, fmt.Errorf("invalid API response: %s", string(body))
 	}
 	var usage apiUsage
-	hit := parsed.Usage.PromptCacheHitTokens
-	if hit == 0 {
-		hit = parsed.Usage.PromptTokensDetails.CachedTokens
-	}
-	if hit > 0 || parsed.Usage.PromptCacheMissTokens > 0 {
-		usage.cacheHit = hit
-		usage.cacheMiss = parsed.Usage.PromptCacheMissTokens
+	if parsed.Usage != nil {
+		usage = normalizeWireUsage(*parsed.Usage)
 	}
 	msg := parsed.Choices[0].Message
 	if msg.Content != "" {

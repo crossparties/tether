@@ -203,6 +203,23 @@ func (m Model) Update(msg any) Model {
 		m.StreamScroll = 0
 		return m
 
+	case CompactDoneMsg:
+		title := fmt.Sprintf("Episodic condensation · %.1fs", ev.Elapsed.Seconds())
+		var body []string
+		if ev.Err != nil {
+			body = strings.Split("Compact error: "+ev.Err.Error(), "\n")
+		} else {
+			body = strings.Split(strings.TrimSpace(ev.Result), "\n")
+		}
+		m.Stream = append(m.Stream, StreamEntry{
+			Kind:  StreamSystemNotice,
+			Title: title,
+			Body:  body,
+		})
+		m.LiveStatus = ""
+		m.StreamScroll = 0
+		return m
+
 	case ApprovalGateMsg:
 		req := ev.Request
 		req.SelectedOption = 0
@@ -1058,6 +1075,40 @@ func (m Model) submitInput() Model {
 			Kind:  StreamSystemNotice,
 			Title: "Workspace & session status",
 			Body:  strings.Split(summary, "\n"),
+		})
+		return m
+	}
+
+	// Handle /tokens
+	if raw == "/tokens" {
+		summary := "No token usage recorded yet."
+		if m.Bridge != nil && m.Bridge.TokensSummary != nil {
+			summary = m.Bridge.TokensSummary()
+		}
+		m.Stream = append(m.Stream, StreamEntry{
+			Kind:  StreamSystemNotice,
+			Title: "Token & cache metrics",
+			Body:  strings.Split(summary, "\n"),
+		})
+		return m
+	}
+
+	// Handle /compact asynchronously so UI input/frames never freeze during summarization.
+	if raw == "/compact" {
+		if m.Bridge == nil || m.Bridge.Compact == nil {
+			m.Stream = append(m.Stream, StreamEntry{
+				Kind:  StreamSystemNotice,
+				Title: "Episodic condensation",
+				Body:  []string{"Compaction is unavailable without an active harness."},
+			})
+			return m
+		}
+		m.PendingCompact = true
+		m.LiveStatus = "Compacting history…"
+		m.Stream = append(m.Stream, StreamEntry{
+			Kind:  StreamSystemNotice,
+			Title: "Episodic condensation",
+			Body:  []string{"Compacting older conversation turns in background…"},
 		})
 		return m
 	}

@@ -393,8 +393,15 @@ func ReplaceAtToken(input string, startByte, endByte int, relPath string) (newIn
 // SafeReadWorkspaceFile safely reads a file inside workspaceRoot, enforcing
 // mount.Engine AuthorizePath (lexical traversal, symlink escape blocking,
 // built-in secrets, and .tether/ignore), plus directory, binary, and size checks.
+// SafeReadWorkspaceFile reads a workspace file safely using an ephemeral mount engine.
 func SafeReadWorkspaceFile(workspaceRoot, relOrAbsPath string, maxBytes int64) (content string, cleanRel string, err error) {
-	if strings.TrimSpace(workspaceRoot) == "" {
+	return SafeReadWorkspaceFileWithMount(nil, workspaceRoot, relOrAbsPath, maxBytes)
+}
+
+// SafeReadWorkspaceFileWithMount reads a workspace file through the provided DB-bound
+// mount engine (or an ephemeral workspace engine when mountEngine is nil).
+func SafeReadWorkspaceFileWithMount(mountEngine *mount.Engine, workspaceRoot, relOrAbsPath string, maxBytes int64) (content string, cleanRel string, err error) {
+	if mountEngine == nil && strings.TrimSpace(workspaceRoot) == "" {
 		return "", "", errors.New("workspace root is empty")
 	}
 	targetRaw := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(relOrAbsPath), "@"))
@@ -405,7 +412,10 @@ func SafeReadWorkspaceFile(workspaceRoot, relOrAbsPath string, maxBytes int64) (
 		maxBytes = DefaultMaxFileBytes
 	}
 
-	dec := mount.NewEngine(workspaceRoot).AuthorizePath(targetRaw, mount.OpRead, "code")
+	if mountEngine == nil {
+		mountEngine = mount.NewEngine(workspaceRoot)
+	}
+	dec := mountEngine.AuthorizePath(targetRaw, mount.OpRead, "code")
 	if !dec.Allowed {
 		return "", "", errors.New(dec.Reason)
 	}

@@ -15,11 +15,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/crossparties/tether/internal/core"
 	"github.com/crossparties/tether/internal/hooks"
 	"github.com/crossparties/tether/internal/mcp"
+	"github.com/crossparties/tether/internal/safety"
 	"github.com/crossparties/tether/internal/snapshot"
 	"github.com/crossparties/tether/internal/ui"
 )
@@ -40,6 +42,9 @@ type Config struct {
 	APIKey            string
 	Model             string
 	MaxSteps          int
+	ContextWindow     int
+	CondenseRatio     float64
+	CondenseMaxEvents int
 	Out               io.Writer
 	StreamIdleTimeout time.Duration
 	WarmCacheInterval time.Duration
@@ -195,8 +200,30 @@ type Runner struct {
 	history   []chatMessage
 	agentType string
 
-	keyPool     *KeyPool
-	pinnedKeyID string
+	depth            int
+	crewID           string
+	usageID          string
+	threadID         string
+	turnSeq          atomic.Uint64
+	sameProviderCrew bool
+	readOnlyCrew     bool
+
+	// Immutable Tier 0-3 session head & frozen tool schema (KV-cache head).
+	frozenSystemPrompt   string
+	frozenTools          []openAITool
+	baselineRepoMapFiles map[string]bool
+	activeFileHashes     map[string]string
+	lastPromptMode       string
+	lastTodoDigest       string
+	pendingTailNotices   []string
+
+	keyPool      *KeyPool
+	pinnedKeyID  string
+	usageTracker *UsageTracker
+	crews        map[string]*crewHandle
+
+	lastBtwQuestion string
+	lastBtwAnswer   string
 
 	// DeepSeek Context Caching & TTFT metrics from the latest API call
 	lastTTFT            time.Duration
@@ -220,13 +247,27 @@ func NewRunner(engine *core.Engine, cfg Config) *Runner {
 	resolved := ResolveConfig(engine, cfg)
 	client := &http.Client{Timeout: 120 * time.Second}
 
+	mcpSrv := mcp.NewServer(engine)
+	mcpSrv.SetActorID("main")
+
+	threadID := ""
+	if engine != nil {
+		threadID = engine.SessionID
+		_, _ = engine.EnsureThread(threadID, "Main Thread")
+	}
+
 	r := &Runner{
 		engine:           engine,
 		hooks:            hooks.NewHandler(engine),
-		mcp:              mcp.NewServer(engine),
+		mcp:              mcpSrv,
 		cfg:              resolved,
 		client:           client,
 		agentType:        "main",
+		usageID:          "main",
+		threadID:         threadID,
+		usageTracker:     NewUsageTracker(),
+		activeFileHashes: make(map[string]string),
+		crews:            make(map[string]*crewHandle),
 		lastUserActivity: time.Now(),
 	}
 
@@ -333,7 +374,119 @@ func (r *Runner) snapshotCallConfig() callSnapshot {
 	}
 }
 
-func (r *Runner) recordCallUsage(u apiUsage) {
+func (r *Runner) effectiveThreadIDLocked() string {
+	if r.threadID != "" {
+		return r.threadID
+	}
+	if r.engine != nil {
+		return r.engine.SessionID
+	}
+	return ""
+}
+
+// ThreadID returns the active conversation thread ID.
+func (r *Runner) ThreadID() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.effectiveThreadIDLocked()
+}
+
+// SetThreadID switches the active thread ID without mutating history.
+func (r *Runner) SetThreadID(threadID string) {
+	r.mu.Lock()
+	r.threadID = strings.TrimSpace(threadID)
+	r.mu.Unlock()
+}
+
+// LoadThread loads persisted conversation events for threadID into r.history
+// while preserving the frozen Tier 0-3 session head.
+func (r *Runner) LoadThread(threadID string) error {
+	if r.engine == nil {
+		return fmt.Errorf("runner has no active engine")
+	}
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" {
+		return fmt.Errorf("thread_id required")
+	}
+	if _, err := r.engine.GetThread(threadID); err != nil {
+		return err
+	}
+	events, err := r.engine.ListThreadEventsForLoad(threadID, r.crewID, 500)
+	if err != nil {
+		return err
+	}
+
+	r.ClearHistory()
+	r.SetThreadID(threadID)
+	head, _ := r.ensureFrozenHead()
+
+	// Find the latest condensation event so we load the condensed summary + subsequent events.
+	startIdx := 0
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].Role == "condensation" {
+			startIdx = i
+			break
+		}
+	}
+
+	restored := []chatMessage{{Role: "system", Content: head}}
+	for _, ev := range events[startIdx:] {
+		if ev.Role == "condensation" {
+			var p struct {
+				Summary string `json:"summary"`
+			}
+			if json.Unmarshal([]byte(ev.PayloadJSON), &p) == nil && p.Summary != "" {
+				restored = append(restored, chatMessage{
+					Role:    "user",
+					Content: "[Episodic Condensation Summary]\n" + p.Summary,
+				})
+			}
+			continue
+		}
+		var msg chatMessage
+		if json.Unmarshal([]byte(ev.PayloadJSON), &msg) == nil && msg.Role != "" {
+			if len(restored) == 1 && msg.Role == "tool" {
+				continue
+			}
+			restored = append(restored, msg)
+		}
+	}
+	if len(restored) > 1 {
+		r.mu.Lock()
+		r.history = restored
+		r.mu.Unlock()
+	}
+	return nil
+}
+
+func (r *Runner) persistMessageEvent(role, usageID string, msg chatMessage) {
+	r.mu.RLock()
+	eng := r.engine
+	threadID := r.effectiveThreadIDLocked()
+	crewID := r.crewID
+	r.mu.RUnlock()
+	if eng == nil || threadID == "" {
+		return
+	}
+	if usageID == "" {
+		usageID = "main"
+	}
+	payload, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+	_, _ = eng.AppendThreadEvent(core.ConversationEvent{
+		ThreadID:    threadID,
+		CrewID:      crewID,
+		Role:        role,
+		UsageID:     usageID,
+		PayloadJSON: string(payload),
+		TokenEst:    EstimateMessagesTokens([]chatMessage{msg}),
+	})
+}
+
+func (r *Runner) recordCallUsageWithID(usageID string, u apiUsage) {
+	ctxWin := r.condenserConfig().ContextWindowTokens
 	r.mu.Lock()
 	if u.ttft > 0 {
 		r.lastTTFT = u.ttft
@@ -342,7 +495,12 @@ func (r *Runner) recordCallUsage(u apiUsage) {
 		r.lastCacheHitTokens = u.cacheHit
 		r.lastCacheMissTokens = u.cacheMiss
 	}
+	tracker := r.usageTracker
 	r.mu.Unlock()
+
+	if tracker != nil {
+		tracker.Record(usageID, u, ctxWin)
+	}
 }
 
 func (r *Runner) outWriter() io.Writer {
@@ -487,6 +645,9 @@ func (r *Runner) undoTo(turn string, out io.Writer) {
 	for _, path := range restored {
 		r.writef(out, "↩ restored %s\n", path)
 	}
+	if len(restored) > 0 {
+		r.QueueTailNotice(fmt.Sprintf("User ran /undo for turn %s; restored %d file(s): %s", turn, len(restored), strings.Join(restored, ", ")))
+	}
 	if err != nil {
 		r.writef(out, "⚠ Undo partially failed for turn %s: %v\n", ui.Bold(turn), err)
 		r.writef(out, "  Files listed above were restored; the rest were left untouched.\n\n")
@@ -519,7 +680,19 @@ func (r *Runner) ensureActiveKey(ctx context.Context) error {
 	return nil
 }
 
-// Run executes a prompt through PreInvocation -> LLM Tool Loop (PreToolUse -> CallTool -> PostToolUse)
+func (r *Runner) nextTurnID() string {
+	seq := r.turnSeq.Add(1)
+	ts := time.Now().UTC().Format("20060102T150405.000")
+	r.mu.RLock()
+	crewID := r.crewID
+	r.mu.RUnlock()
+	if crewID != "" {
+		return fmt.Sprintf("%s-%s-%d", crewID, ts, seq)
+	}
+	return fmt.Sprintf("turn-%s-%d", ts, seq)
+}
+
+// Run executes a prompt through the immutable Tier 0-3 + Append-Only LLM Tool Loop.
 func (r *Runner) Run(ctx context.Context, prompt string) (string, error) {
 	return r.runWithOptions(ctx, prompt, nil, nil)
 }
@@ -529,76 +702,83 @@ func (r *Runner) runWithOptions(ctx context.Context, prompt string, out io.Write
 		return "", err
 	}
 
+	turnID := r.nextTurnID()
+	head, apiTools := r.ensureFrozenHead()
+	userContent, staged := r.prepareTurnUserContent(prompt)
+
 	r.mu.Lock()
 	r.lastUserActivity = time.Now()
 	effectiveOut := out
 	if effectiveOut == nil {
 		effectiveOut = r.cfg.Out
 	}
-	agentType := r.agentType
 	maxSteps := r.cfg.MaxSteps
 	snapProv := r.cfg.Provider
+	crewID := r.crewID
+	usageID := r.usageID
+	if usageID == "" {
+		usageID = "main"
+	}
 	historyCopy := make([]chatMessage, len(r.history))
 	copy(historyCopy, r.history)
 	r.mu.Unlock()
 
-	// 1. PreInvocation Hook: surgical context injection & task mode classification
-	// Mark the turn boundary so PreToolUse can snapshot the pre-write state of
-	// each file.
-	_ = r.engine.SetProjectSetting("current_turn", time.Now().UTC().Format("20060102T150405.000000000"))
-
-	preInvIn, _ := json.Marshal(hooks.HookInput{Prompt: prompt, AgentType: agentType})
-	preInvRaw, _ := r.hooks.Handle("PreInvocation", bytes.NewReader(preInvIn))
-	var preInvOut hooks.HookOutput
-	_ = json.Unmarshal([]byte(preInvRaw), &preInvOut)
-
-	sysPrompt := "You are Tether, a local-first autonomous coding agent CLI. Be concise, direct, and technical. Avoid filler or repetitive preamble."
-	if len(preInvOut.InjectSteps) > 0 && preInvOut.InjectSteps[0].EphemeralMessage != "" {
-		sysPrompt += "\n\n" + preInvOut.InjectSteps[0].EphemeralMessage
+	if r.mcp != nil && r.engine != nil {
+		r.mcp.SetSnapshotContext(snapshot.New(r.engine.Workspace), turnID, crewID)
 	}
 
-	_ = r.engine.AddContext(snapProv, "user", prompt)
-
+	userMsg := chatMessage{Role: "user", Content: userContent}
 	var messages []chatMessage
 	if len(historyCopy) == 0 {
 		messages = []chatMessage{
-			{Role: "system", Content: sysPrompt},
-			{Role: "user", Content: prompt},
+			{Role: "system", Content: head},
+			userMsg,
 		}
 	} else {
-		messages = historyCopy
-		messages[0] = chatMessage{Role: "system", Content: sysPrompt}
-		// Strip prior-turn reasoning_content before starting a new user turn (DeepSeek API spec)
-		for i := range messages {
-			if messages[i].Role == "assistant" {
-				messages[i].ReasoningContent = ""
+		// Strict Append-Only: NEVER overwrite messages[0] or mutate prior history entries.
+		messages = append(historyCopy, userMsg)
+	}
+
+	if should, _ := r.ShouldCondense(messages); should {
+		if condensed, res, cerr := r.condenseMessages(ctx, messages, false); cerr == nil && res.Condensed {
+			messages = condensed
+			r.mu.Lock()
+			if len(messages) > 1 {
+				r.history = append([]chatMessage(nil), messages[:len(messages)-1]...)
 			}
+			r.invalidateCondensedFileHashesLocked(messages)
+			r.mu.Unlock()
 		}
-		messages = append(messages, chatMessage{Role: "user", Content: prompt})
 	}
 
-	var apiTools []openAITool
-	for _, t := range r.mcp.ListTools() {
-		apiTools = append(apiTools, openAITool{
-			Type: "function",
-			Function: openAIFunction{
-				Name:        t.Name,
-				Description: t.Description,
-				Parameters:  t.InputSchema,
-			},
-		})
-	}
-
-	keepTurns, maxRunes := r.compactionLimits()
 	var lastCallSig, lastErrSig, lastStepSig string
 	callStreak, errStreak, stepStreak := 0, 0, 0
+	step0Committed := false
 
-	// 2. Agentic Tool-Execution Loop
+	// 2. Agentic Tool-Execution Loop (strictly append-only; no per-step sliding compaction)
 	for step := 0; step < maxSteps; step++ {
-		messages = compactMessagesWithLimits(messages, keepTurns, maxRunes)
-		msg, finishReason, err := r.callAPIWithFailover(ctx, messages, apiTools, effectiveOut, onDelta)
+		if step > 0 {
+			if should, _ := r.ShouldCondense(messages); should {
+				if condensed, res, cerr := r.condenseMessages(ctx, messages, false); cerr == nil && res.Condensed {
+					messages = condensed
+					r.mu.Lock()
+					r.invalidateCondensedFileHashesLocked(messages)
+					r.mu.Unlock()
+				}
+			}
+		}
+
+		msg, finishReason, err := r.callAPIWithFailoverUsageID(ctx, usageID, messages, apiTools, effectiveOut, onDelta)
 		if err != nil {
 			return "", err
+		}
+		if !step0Committed {
+			step0Committed = true
+			r.commitTurnDelta(staged)
+			if r.engine != nil {
+				_ = r.engine.AddContext(snapProv, "user", prompt)
+			}
+			r.persistMessageEvent("user", usageID, userMsg)
 		}
 
 		// Handle finish_reason == "length" prose continuation on supported endpoints.
@@ -610,7 +790,7 @@ func (r *Runner) runWithOptions(ctx context.Context, prompt string, out io.Write
 					Content: msg.Content,
 					Prefix:  true,
 				})
-				nextMsg, nextFinish, cerr := r.callAPIWithFailover(ctx, contMsgs, apiTools, effectiveOut, onDelta)
+				nextMsg, nextFinish, cerr := r.callAPIWithFailoverUsageID(ctx, usageID, contMsgs, apiTools, effectiveOut, onDelta)
 				if cerr != nil {
 					return "", cerr
 				}
@@ -639,17 +819,16 @@ func (r *Runner) runWithOptions(ctx context.Context, prompt string, out io.Write
 			r.writef(effectiveOut, "\n%s\n", strings.TrimSpace(msg.Content))
 		}
 		messages = append(messages, msg)
+		r.persistMessageEvent("assistant", usageID, msg)
 
 		curSnap = r.snapshotCallConfig()
 		if len(msg.ToolCalls) == 0 {
-			sanitized := SanitizeMessages(compactMessagesWithLimits(messages, keepTurns, maxRunes), SanitizeOptions{
-				TargetProvider: curSnap.provider,
-				TargetModel:    curSnap.model,
-			})
 			r.mu.Lock()
-			r.history = sanitized
+			r.history = messages
 			r.mu.Unlock()
-			_ = r.engine.AddContext(curSnap.provider, "assistant", msg.Content)
+			if r.engine != nil {
+				_ = r.engine.AddContext(curSnap.provider, "assistant", msg.Content)
+			}
 			return msg.Content, nil
 		}
 
@@ -662,27 +841,31 @@ func (r *Runner) runWithOptions(ctx context.Context, prompt string, out io.Write
 				if msgRef.ToolCalls[i].ID == "" {
 					msgRef.ToolCalls[i].ID = fmt.Sprintf("call_trunc_%d_%d", step, i)
 				}
-				messages = append(messages, chatMessage{
+				toolMsg := chatMessage{
 					Role:       "tool",
 					ToolCallID: msgRef.ToolCalls[i].ID,
 					Content: fmt.Sprintf(
 						"TRUNCATED TOOL CALL (finish_reason=length) for %s: output hit max_tokens inside tool_calls arguments. Do NOT prefill partial JSON and do NOT repeat a monolithic payload; split into smaller incremental chunks and retry.",
 						msgRef.ToolCalls[i].Function.Name,
 					),
-				})
+				}
+				messages = append(messages, toolMsg)
+				r.persistMessageEvent("tool", usageID, toolMsg)
 			}
 			continue
 		}
 
-		outcomes := r.executeToolCallsStatus(msg.ToolCalls, effectiveOut)
+		outcomes := r.executeToolCallsStatusWithCtx(ctx, msg.ToolCalls, effectiveOut)
 		stepSigs := make([]string, len(msg.ToolCalls))
 		var stuckTool string
 		for i, tc := range msg.ToolCalls {
-			messages = append(messages, chatMessage{
+			toolMsg := chatMessage{
 				Role:       "tool",
 				ToolCallID: tc.ID,
 				Content:    outcomes[i].text,
-			})
+			}
+			messages = append(messages, toolMsg)
+			r.persistMessageEvent("tool", usageID, toolMsg)
 			sig := toolCallSignature(tc.Function.Name, tc.Function.Arguments, outcomes[i].text)
 			stepSigs[i] = sig
 			if sig == lastCallSig {
@@ -738,7 +921,9 @@ func (r *Runner) runWithOptions(ctx context.Context, prompt string, out io.Write
 	r.history = messages
 	prov := r.cfg.Provider
 	r.mu.Unlock()
-	_ = r.engine.AddContext(prov, "assistant", fmt.Sprintf("[paused after %d tool steps — type 'continue' to resume]", maxSteps))
+	if r.engine != nil {
+		_ = r.engine.AddContext(prov, "assistant", fmt.Sprintf("[paused after %d tool steps — type 'continue' to resume]", maxSteps))
+	}
 	return "", fmt.Errorf("paused after %d steps (type 'continue' or 'lanjutkan' to resume)", maxSteps)
 }
 
@@ -782,6 +967,10 @@ func isReadOnlyToolCall(tc toolCall) bool {
 // executeToolCallsStatus executes contiguous read-only tool calls concurrently (bounded <= 4)
 // while preserving exact output order and strictly serializing mutating tools.
 func (r *Runner) executeToolCallsStatus(calls []toolCall, out io.Writer) []toolOutcome {
+	return r.executeToolCallsStatusWithCtx(context.Background(), calls, out)
+}
+
+func (r *Runner) executeToolCallsStatusWithCtx(ctx context.Context, calls []toolCall, out io.Writer) []toolOutcome {
 	var execFn func(toolCall) toolOutcome
 	if r.execTool != nil {
 		execFn = func(tc toolCall) toolOutcome {
@@ -789,7 +978,7 @@ func (r *Runner) executeToolCallsStatus(calls []toolCall, out io.Writer) []toolO
 		}
 	} else {
 		execFn = func(tc toolCall) toolOutcome {
-			txt, isErr := r.executeGuardedToolStatus(tc, out)
+			txt, isErr := r.executeGuardedToolStatusWithCtx(ctx, tc, out)
 			return toolOutcome{text: txt, isErr: isErr}
 		}
 	}
@@ -825,30 +1014,16 @@ func (r *Runner) executeToolCallsStatus(calls []toolCall, out io.Writer) []toolO
 	return results
 }
 
-func (r *Runner) compactionLimits() (int, int) {
-	keepTurns := 2
-	maxRunes := 800
-	if r.engine != nil {
-		if v, err := r.engine.GetProjectSetting("keep_assistant_turns"); err == nil && v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 {
-				keepTurns = n
-			}
-		}
-		if v, err := r.engine.GetProjectSetting("max_stale_tool_runes"); err == nil && v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n >= 200 {
-				maxRunes = n
-			}
-		}
-	}
-	return keepTurns, maxRunes
-}
-
 func (r *Runner) executeGuardedTool(tc toolCall) string {
 	res, _ := r.executeGuardedToolStatus(tc, r.outWriter())
 	return res
 }
 
 func (r *Runner) executeGuardedToolStatus(tc toolCall, out io.Writer) (string, bool) {
+	return r.executeGuardedToolStatusWithCtx(context.Background(), tc, out)
+}
+
+func (r *Runner) executeGuardedToolStatusWithCtx(ctx context.Context, tc toolCall, out io.Writer) (string, bool) {
 	var argMap map[string]any
 	rawArgs := strings.TrimSpace(tc.Function.Arguments)
 	if rawArgs != "" && rawArgs != "{}" {
@@ -857,6 +1032,18 @@ func (r *Runner) executeGuardedToolStatus(tc toolCall, out io.Writer) (string, b
 			// so hallucinated/truncated JSON is immediately reported back for self-correction.
 			return fmt.Sprintf("invalid tool arguments JSON for %s: %v. Please retry with valid JSON.", tc.Function.Name, err), true
 		}
+	}
+
+	r.mu.RLock()
+	roCrew := r.readOnlyCrew
+	r.mu.RUnlock()
+	if roCrew && isMutatingRunnerTool(tc.Function.Name, argMap) {
+		return fmt.Sprintf("DENIED BY TETHER GUARD: read-only crew cannot invoke %s", tc.Function.Name), true
+	}
+
+	if isCrewToolName(tc.Function.Name) {
+		r.printToolAction(out, tc.Function.Name, argMap)
+		return r.executeCrewTool(ctx, tc.Function.Name, rawArgs)
 	}
 
 	r.mu.RLock()
@@ -897,6 +1084,22 @@ func (r *Runner) executeGuardedToolStatus(tc toolCall, out io.Writer) (string, b
 	// PostToolUse Auditor
 	_, _ = r.hooks.Handle("PostToolUse", mustJSONReader(hookIn))
 	return res, isErr
+}
+
+func isMutatingRunnerTool(name string, args map[string]any) bool {
+	switch name {
+	case "write_file", "edit_file", "mode_set", "decision_add":
+		return true
+	case "todo_manage":
+		action, _ := args["action"].(string)
+		return !strings.EqualFold(strings.TrimSpace(action), "list")
+	case "run_command":
+		cmd, _ := args["command"].(string)
+		ok, _ := safety.IsReadOnlyCommand(cmd)
+		return !ok
+	default:
+		return false
+	}
 }
 
 func (r *Runner) printToolAction(out io.Writer, name string, args map[string]any) {
@@ -1022,7 +1225,7 @@ func (r *Runner) keyLabel(pool *KeyPool, keyID, fallbackProvider string) string 
 	return fallbackProvider
 }
 
-func (r *Runner) callAPIWithFailover(ctx context.Context, messages []chatMessage, tools []openAITool, out io.Writer, onDelta func(kind, text string)) (chatMessage, string, error) {
+func (r *Runner) callAPIWithFailoverUsageID(ctx context.Context, usageID string, messages []chatMessage, tools []openAITool, out io.Writer, onDelta func(kind, text string)) (chatMessage, string, error) {
 	pool := r.KeyPool()
 	maxAttempts := 3
 	if pool != nil && pool.Len()+2 > maxAttempts {
@@ -1053,7 +1256,7 @@ func (r *Runner) callAPIWithFailover(ctx context.Context, messages []chatMessage
 			if usage.ttft <= 0 {
 				usage.ttft = time.Since(callStart)
 			}
-			r.recordCallUsage(usage)
+			r.recordCallUsageWithID(usageID, usage)
 			if pool != nil && curKeyID != "" {
 				pool.RecordSuccess(curKeyID, snap.provider, curLabel, usage.ttft, usage.cacheHit, usage.cacheMiss)
 			}
@@ -1149,9 +1352,10 @@ func (r *Runner) callAPIWithFailover(ctx context.Context, messages []chatMessage
 }
 
 func (r *Runner) prepareChatPayload(snap callSnapshot, messages []chatMessage, tools []openAITool, maxTokensOverride int, stream bool) (string, map[string]any) {
+	useCacheCtrl := SupportsCacheControl(snap.provider, snap.baseURL, snap.model)
 	payload := map[string]any{
 		"model":    snap.model,
-		"messages": messages,
+		"messages": buildWireMessages(messages, useCacheCtrl),
 	}
 	// DeepSeek API spec: omit "tools" completely when empty (sending "tools": null or [] is discouraged)
 	if len(tools) > 0 {
@@ -1366,6 +1570,7 @@ func (r *Runner) RunInteractive(ctx context.Context, in io.Reader) error {
 
 	stopWarm := r.StartWarmCacheLoop(ctx)
 	defer stopWarm()
+	defer r.CloseAllCrews()
 
 	// Connect the approval gate to this terminal. Without it a blocked write is
 	// only a message to the model, and the user is never asked. Hook and

@@ -421,6 +421,26 @@ func RunTUI(ctx context.Context, in *os.File, out io.Writer, workspace, mode, br
 				}(question)
 			}
 
+			// Dispatch asynchronous /compact episodic condensation if PendingCompact was queued
+			if m.PendingCompact && m.Bridge != nil && m.Bridge.Compact != nil {
+				m.PendingCompact = false
+				compactCtx, compactCancel := context.WithCancel(ctx)
+				activeMu.Lock()
+				activeCancels = append(activeCancels, compactCancel)
+				activeMu.Unlock()
+
+				go func() {
+					defer compactCancel()
+					start := time.Now()
+					res, cerr := m.Bridge.Compact(compactCtx)
+					msgCh <- CompactDoneMsg{
+						Result:  res,
+						Err:     cerr,
+						Elapsed: time.Since(start),
+					}
+				}()
+			}
+
 			// Dispatch asynchronous /exec command if PendingExec was queued
 			if m.PendingExec != "" && m.Bridge != nil && m.Bridge.ExecuteCommand != nil {
 				cmdStr := m.PendingExec

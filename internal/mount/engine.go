@@ -62,6 +62,9 @@ type Engine struct {
 	writeDB   *sql.DB
 
 	mu          sync.RWMutex
+	actorID     string
+	now         func() time.Time
+	leases      map[string]leaseEntry
 	builtin     []Rule
 	custom      []Rule
 	parseErrs   []error
@@ -286,8 +289,14 @@ func (e *Engine) GetMountedMode(relPath string) (AccessMode, bool) {
 // AuthorizePath is the single canonical gate for all path reads and writes.
 // It checks lexical containment, symlink canonicalization (including dangling
 // target ancestors), built-in secret rules, .tether/ignore rules, mounted_files
-// overrides, and governance mode ("code" | "plan" | "review").
+// overrides, governance mode ("code" | "plan" | "review"), and file ownership lease locks.
 func (e *Engine) AuthorizePath(rawPath string, op Operation, mode string) Decision {
+	return e.AuthorizePathForActor(rawPath, op, mode, e.ActorID())
+}
+
+// AuthorizePathForActor enforces AuthorizePath rules while attributing writes
+// to actorID ("main" or a specific Crew ID) for File Ownership Lease Lock checks.
+func (e *Engine) AuthorizePathForActor(rawPath string, op Operation, mode, actorID string) Decision {
 	e.reloadIfChanged()
 
 	trimmed := strings.TrimSpace(rawPath)
@@ -457,6 +466,17 @@ func (e *Engine) AuthorizePath(rawPath string, op Operation, mode string) Decisi
 					IsDir:         isDir,
 					Reason:        fmt.Sprintf("write denied: %q blocked in PLAN mode (allowed: .tether/PLAN.md, docs/, .agents/, *.plan.md)", relSlash),
 				}
+			}
+		}
+		if holder, exp, lerr := e.CheckLease(relSlash, actorID); lerr == nil && holder != "" {
+			return Decision{
+				Allowed:       false,
+				RelPath:       relSlash,
+				CanonicalPath: canonical,
+				AccessMode:    accessMode,
+				IsMissing:     isMissing,
+				IsDir:         isDir,
+				Reason:        fmt.Sprintf("write denied: %q is lease-locked by crew %q until %s", relSlash, holder, exp.Format(time.RFC3339)),
 			}
 		}
 	}

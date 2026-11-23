@@ -22,6 +22,8 @@ import (
 
 	"github.com/crossparties/tether/internal/core"
 	"github.com/crossparties/tether/internal/mount"
+	"github.com/crossparties/tether/internal/safety"
+	"github.com/crossparties/tether/internal/snapshot"
 )
 
 const maxEditReflections = 3
@@ -44,8 +46,9 @@ type Server struct {
 	// asker that reads the same input stream as the chat; hook and JSON-RPC
 	// callers leave it nil and keep the refuse-with-instructions behaviour. ok
 	// is false when the user cancelled, which is treated as a rejection.
-	askMu sync.Mutex
-	ask   func(Decision) (Verdict, bool)
+	askMu         sync.Mutex
+	ask           func(Decision) (Verdict, bool)
+	askWithReason func(Decision) (Verdict, string, bool)
 
 	// autoApprove, when set, permits matching non-critical mutations (e.g.
 	// read-only shell commands, test/build validation, or undoable routine
@@ -55,7 +58,16 @@ type Server struct {
 	// approveAll is set when the user chose to approve everything for the rest
 	// of the session. It is separate from ask because it must survive while the
 	// asker stays installed: replacing the asker would discard the real one.
-	approveAll bool
+	approveAll     bool
+	forceAskGrants map[string]bool
+
+	snapMu         sync.RWMutex
+	snapshotStore  *snapshot.Store
+	snapshotTurn   string
+	snapshotCrew   string
+	actorID        string
+	readOnly       bool
+	forceAskWrites bool
 }
 
 // Verdict is the user's answer to an approval request.
@@ -82,6 +94,7 @@ type Decision struct {
 	Label       string // one-line subject used in the heading
 	Preview     string // rendered diff (collapsed after maxDiffLines), or a description for commands
 	FullPreview string // untruncated diff for "View full diff"
+	ForceAsk    bool   // when true, callers must not auto-approve via non-critical/low-risk heuristics
 }
 
 // SetAskPolicy installs the interactive asker. Passing nil restores the
@@ -90,6 +103,23 @@ func (s *Server) SetAskPolicy(fn func(Decision) (Verdict, bool)) {
 	s.askMu.Lock()
 	defer s.askMu.Unlock()
 	s.ask = fn
+	s.askWithReason = nil
+}
+
+// SetAskPolicyWithReason installs an interactive asker that can also return an
+// explicit user rejection reason when rejecting a proposed mutation.
+func (s *Server) SetAskPolicyWithReason(fn func(Decision) (Verdict, string, bool)) {
+	s.askMu.Lock()
+	defer s.askMu.Unlock()
+	s.askWithReason = fn
+	if fn == nil {
+		s.ask = nil
+		return
+	}
+	s.ask = func(d Decision) (Verdict, bool) {
+		v, _, ok := fn(d)
+		return v, ok
+	}
 }
 
 // AskPolicy returns the installed asker, or nil.
@@ -97,6 +127,99 @@ func (s *Server) AskPolicy() func(Decision) (Verdict, bool) {
 	s.askMu.Lock()
 	defer s.askMu.Unlock()
 	return s.ask
+}
+
+// AskPolicyWithReason returns the installed reason-aware asker, or nil.
+func (s *Server) AskPolicyWithReason() func(Decision) (Verdict, string, bool) {
+	return s.askPolicyWithReason()
+}
+
+func (s *Server) askPolicyWithReason() func(Decision) (Verdict, string, bool) {
+	s.askMu.Lock()
+	defer s.askMu.Unlock()
+	if s.askWithReason != nil {
+		return s.askWithReason
+	}
+	if s.ask != nil {
+		fn := s.ask
+		return func(d Decision) (Verdict, string, bool) {
+			v, ok := fn(d)
+			return v, "", ok
+		}
+	}
+	return nil
+}
+
+// SetActorID configures the actor ("main" or Crew ID) enforced on lease-locked writes.
+func (s *Server) SetActorID(actorID string) {
+	s.snapMu.Lock()
+	s.actorID = strings.TrimSpace(actorID)
+	s.snapMu.Unlock()
+	if s.mount != nil {
+		s.mount.SetActorID(actorID)
+	}
+}
+
+// SetReadOnly locks the MCP server into read-only review mode regardless of DB grants.
+func (s *Server) SetReadOnly(ro bool) {
+	s.snapMu.Lock()
+	s.readOnly = ro
+	s.snapMu.Unlock()
+}
+
+// IsReadOnly reports whether the server is locked into read-only review mode.
+func (s *Server) IsReadOnly() bool {
+	s.snapMu.RLock()
+	ro := s.readOnly
+	s.snapMu.RUnlock()
+	return ro
+}
+
+// SetForceAskWrites ensures file writes and mutating shell commands bypass auto-approval heuristics.
+func (s *Server) SetForceAskWrites(force bool) {
+	s.snapMu.Lock()
+	s.forceAskWrites = force
+	s.snapMu.Unlock()
+}
+
+func (s *Server) forcesAskWrites() bool {
+	s.snapMu.RLock()
+	f := s.forceAskWrites
+	s.snapMu.RUnlock()
+	return f
+}
+
+// SetSnapshotContext binds the per-execution snapshot turn_id and optional crew_id
+// so write_file and edit_file capture pre-write state and PostHash automatically.
+func (s *Server) SetSnapshotContext(store *snapshot.Store, turnID, crewID string) {
+	s.snapMu.Lock()
+	s.snapshotStore = store
+	s.snapshotTurn = strings.TrimSpace(turnID)
+	s.snapshotCrew = strings.TrimSpace(crewID)
+	s.snapMu.Unlock()
+}
+
+func (s *Server) captureSnapshotBefore(canonPath string) {
+	s.snapMu.RLock()
+	store := s.snapshotStore
+	turn := s.snapshotTurn
+	crew := s.snapshotCrew
+	s.snapMu.RUnlock()
+	if store == nil || turn == "" || canonPath == "" {
+		return
+	}
+	_ = store.CaptureForCrew(turn, crew, canonPath)
+}
+
+func (s *Server) recordSnapshotAfter(canonPath string) {
+	s.snapMu.RLock()
+	store := s.snapshotStore
+	turn := s.snapshotTurn
+	s.snapMu.RUnlock()
+	if store == nil || turn == "" || canonPath == "" {
+		return
+	}
+	_ = store.RecordPostHash(turn, canonPath)
 }
 
 // SetAutoApprovePolicy installs a predicate that lets non-critical mutations
@@ -129,13 +252,21 @@ func (s *Server) Mount() *mount.Engine {
 }
 
 func (s *Server) mountEngine() *mount.Engine {
+	var m *mount.Engine
 	if s.mount != nil {
-		return s.mount
+		m = s.mount
+	} else if s.engine != nil {
+		m = s.engine.Mount()
+	} else {
+		m = mount.NewEngine(".")
 	}
-	if s.engine != nil {
-		return s.engine.Mount()
+	s.snapMu.RLock()
+	actorID := s.actorID
+	s.snapMu.RUnlock()
+	if actorID != "" {
+		m.SetActorID(actorID)
 	}
-	return mount.NewEngine(".")
+	return m
 }
 
 func (s *Server) workspace() string {
@@ -146,6 +277,9 @@ func (s *Server) workspace() string {
 }
 
 func (s *Server) mode() string {
+	if s.IsReadOnly() {
+		return "review"
+	}
 	if s.engine != nil {
 		return s.engine.GetMode()
 	}
@@ -502,6 +636,9 @@ func (s *Server) CallTool(name string, args json.RawMessage) (string, bool) {
 	if len(args) == 0 {
 		args = json.RawMessage(`{}`)
 	}
+	if s.IsReadOnly() && isMutatingMCPTool(name, args) {
+		return fmt.Sprintf("Tether Guard: read-only crew cannot invoke %s.", name), true
+	}
 
 	// Hard security boundaries & approval gate share one unified validation/preview pass
 	// so neither session-wide approvals nor grants can bypass mount/secret/shell rules.
@@ -549,6 +686,34 @@ func (s *Server) CallTool(name string, args json.RawMessage) (string, bool) {
 		return s.toolRevokeGrants(), false
 	default:
 		return fmt.Sprintf("unknown tool: %s", name), true
+	}
+}
+
+func isMutatingMCPTool(name string, args json.RawMessage) bool {
+	switch name {
+	case "write_file", "edit_file", "mode_set", "decision_add":
+		return true
+	case "todo_manage":
+		var payload struct {
+			Action string `json:"action"`
+		}
+		if len(args) > 0 && json.Unmarshal(args, &payload) == nil &&
+			strings.EqualFold(strings.TrimSpace(payload.Action), "list") {
+			return false
+		}
+		return true
+	case "run_command":
+		var payload struct {
+			Command string `json:"command"`
+		}
+		if len(args) > 0 && json.Unmarshal(args, &payload) == nil {
+			if ok, _ := safety.IsReadOnlyCommand(payload.Command); ok {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
 	}
 }
 
@@ -926,9 +1091,11 @@ func (s *Server) execWriteFile(m *mutation) (string, bool) {
 	if err := os.MkdirAll(filepath.Dir(m.canonPath), 0755); err != nil {
 		return err.Error(), true
 	}
+	s.captureSnapshotBefore(m.canonPath)
 	if err := os.WriteFile(m.canonPath, []byte(m.content), 0644); err != nil {
 		return err.Error(), true
 	}
+	s.recordSnapshotAfter(m.canonPath)
 	s.resetEditMisses(m.canonPath)
 	if s.engine != nil {
 		_ = s.engine.IndexFile(m.canonPath)
@@ -965,9 +1132,11 @@ func (s *Server) execEditFile(m *mutation) (string, bool) {
 		}
 		return err.Error(), true
 	}
+	s.captureSnapshotBefore(m.canonPath)
 	if err := os.WriteFile(m.canonPath, []byte(updated), 0644); err != nil {
 		return err.Error(), true
 	}
+	s.recordSnapshotAfter(m.canonPath)
 	s.resetEditMisses(m.canonPath)
 	if s.engine != nil {
 		_ = s.engine.IndexFile(m.canonPath)
