@@ -39,7 +39,7 @@ func startE2EServer(t *testing.T, dir string) *e2eServer {
 	t.Helper()
 
 	bin := filepath.Join(t.TempDir(), "tether-e2e")
-	build := exec.Command("go", "build", "-o", bin, "github.com/croosparties/tether/cmd/tether")
+	build := exec.Command("go", "build", "-o", bin, "github.com/crossparties/tether/cmd/tether")
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build tether: %v\n%s", err, out)
 	}

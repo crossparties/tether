@@ -10,9 +10,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/croosparties/tether/internal/core"
-	"github.com/croosparties/tether/internal/preview"
-	"github.com/croosparties/tether/internal/ui"
+	"github.com/crossparties/tether/internal/core"
+	"github.com/crossparties/tether/internal/preview"
+	"github.com/crossparties/tether/internal/ui"
 )
 
 // This file is the approval gate for the MCP path.

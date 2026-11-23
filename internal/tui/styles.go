@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/croosparties/tether/internal/ui"
+	"github.com/crossparties/tether/internal/ui"
 )
 
 // Catppuccin Mocha TrueColor Hex Tokens (PRD §4.1).

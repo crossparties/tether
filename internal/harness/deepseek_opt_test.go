@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/croosparties/tether/internal/core"
-	"github.com/croosparties/tether/internal/hooks"
+	"github.com/crossparties/tether/internal/core"
+	"github.com/crossparties/tether/internal/hooks"
 )
 
 func TestDeepSeekOptimizationAndTokenEfficiency(t *testing.T) {

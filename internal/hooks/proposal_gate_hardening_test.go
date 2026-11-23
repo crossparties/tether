@@ -16,7 +16,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/croosparties/tether/internal/core"
+	"github.com/crossparties/tether/internal/core"
 )
 
 // callTool sends a PreToolUse payload in the shape the guard actually reads

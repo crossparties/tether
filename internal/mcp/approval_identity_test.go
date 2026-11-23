@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/croosparties/tether/internal/preview"
+	"github.com/crossparties/tether/internal/preview"
 )
 
 // A run of blocked calls used to print the same opening words and the same

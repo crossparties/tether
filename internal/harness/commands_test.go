@@ -12,8 +12,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/croosparties/tether/internal/core"
-	"github.com/croosparties/tether/internal/mcp"
+	"github.com/crossparties/tether/internal/core"
+	"github.com/crossparties/tether/internal/mcp"
 )
 
 // legacyCommands is the exact set of branch heads the old switch handled,

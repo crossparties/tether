@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/croosparties/tether/internal/tui/views"
+	"github.com/crossparties/tether/internal/tui/views"
 )
 
 var brailleFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}

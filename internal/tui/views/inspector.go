@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/croosparties/tether/internal/ui"
+	"github.com/crossparties/tether/internal/ui"
 )
 
 // InspectorProps defines the state for the scrollable viewport inspector

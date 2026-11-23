@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/croosparties/tether/internal/ui"
+	"github.com/crossparties/tether/internal/ui"
 )
 
 // Install wires tether into the specified agent's configuration

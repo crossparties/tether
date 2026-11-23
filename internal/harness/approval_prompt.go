@@ -19,9 +19,9 @@ import (
 	"os"
 	"strings"
 
-	"github.com/croosparties/tether/internal/mcp"
-	"github.com/croosparties/tether/internal/safety"
-	"github.com/croosparties/tether/internal/ui"
+	"github.com/crossparties/tether/internal/mcp"
+	"github.com/crossparties/tether/internal/safety"
+	"github.com/crossparties/tether/internal/ui"
 )
 
 // approvalOption is one row of the approval menu.

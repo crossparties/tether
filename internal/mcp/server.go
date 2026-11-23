@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/croosparties/tether/internal/core"
+	"github.com/crossparties/tether/internal/core"
 )
 
 // Server implements MCP protocol over stdio

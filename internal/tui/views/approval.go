@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/croosparties/tether/internal/ui"
+	"github.com/crossparties/tether/internal/ui"
 )
 
 // ApprovalOptionIndex enumerates the 6 interactive choices in the Two-Tiered Approval Prompt.

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/croosparties/tether/internal/preview"
+	"github.com/crossparties/tether/internal/preview"
 )
 
 func callCommand(t *testing.T, s *Server, cmd string) string {

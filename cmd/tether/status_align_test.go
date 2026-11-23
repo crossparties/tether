@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/croosparties/tether/internal/ui"
+	"github.com/crossparties/tether/internal/ui"
 )
 
 // TestStatusBoxStaysAlignedWithColour is the regression guard for the status

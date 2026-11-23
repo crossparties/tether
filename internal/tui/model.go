@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/croosparties/tether/internal/tui/views"
+	"github.com/crossparties/tether/internal/tui/views"
 )
 
 // KeyType enumerates terminal key events processed by the TEA Update loop.

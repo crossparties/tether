@@ -13,8 +13,8 @@ import (
 	"unicode/utf8"
 	"unsafe"
 
-	"github.com/croosparties/tether/internal/tui/views"
-	"github.com/croosparties/tether/internal/ui"
+	"github.com/crossparties/tether/internal/tui/views"
+	"github.com/crossparties/tether/internal/ui"
 )
 
 // ParseKeyBytes translates raw terminal bytes read in raw mode into a KeyMsg.

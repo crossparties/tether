@@ -9,9 +9,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/croosparties/tether/internal/core"
-	"github.com/croosparties/tether/internal/safety"
-	"github.com/croosparties/tether/internal/snapshot"
+	"github.com/crossparties/tether/internal/core"
+	"github.com/crossparties/tether/internal/safety"
+	"github.com/crossparties/tether/internal/snapshot"
 )
 
 // Handler processes lifecycle hook events from agents

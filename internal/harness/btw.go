@@ -9,10 +9,10 @@ import (
 	"strings"
 	"time"
 
-	tetherctx "github.com/croosparties/tether/internal/context"
-	"github.com/croosparties/tether/internal/mcp"
-	"github.com/croosparties/tether/internal/safety"
-	"github.com/croosparties/tether/internal/ui"
+	tetherctx "github.com/crossparties/tether/internal/context"
+	"github.com/crossparties/tether/internal/mcp"
+	"github.com/crossparties/tether/internal/safety"
+	"github.com/crossparties/tether/internal/ui"
 )
 
 func (r *Runner) sideChatCtx() context.Context {

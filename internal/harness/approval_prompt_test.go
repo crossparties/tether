@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/croosparties/tether/internal/mcp"
+	"github.com/crossparties/tether/internal/mcp"
 )
 
 // These tests drive the asker through real piped input. They exist because the

@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/croosparties/tether/internal/core"
-	"github.com/croosparties/tether/internal/snapshot"
+	"github.com/crossparties/tether/internal/core"
+	"github.com/crossparties/tether/internal/snapshot"
 )
 
 func newTestEngine(t *testing.T) *core.Engine {

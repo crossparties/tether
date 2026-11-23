@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/croosparties/tether/internal/core"
+	"github.com/crossparties/tether/internal/core"
 )
 
 // Two sub-agents run in parallel; each must report its own start, tool steps and verdict

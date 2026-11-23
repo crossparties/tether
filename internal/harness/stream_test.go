@@ -10,7 +10,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/croosparties/tether/internal/core"
+	"github.com/crossparties/tether/internal/core"
 )
 
 func sse(w http.ResponseWriter, chunks ...string) {

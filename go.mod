@@ -1,4 +1,4 @@
-module github.com/croosparties/tether
+module github.com/crossparties/tether
 
 go 1.26.3
 

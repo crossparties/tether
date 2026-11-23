@@ -16,11 +16,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/croosparties/tether/internal/core"
-	"github.com/croosparties/tether/internal/hooks"
-	"github.com/croosparties/tether/internal/mcp"
-	"github.com/croosparties/tether/internal/snapshot"
-	"github.com/croosparties/tether/internal/ui"
+	"github.com/crossparties/tether/internal/core"
+	"github.com/crossparties/tether/internal/hooks"
+	"github.com/crossparties/tether/internal/mcp"
+	"github.com/crossparties/tether/internal/snapshot"
+	"github.com/crossparties/tether/internal/ui"
 )
 
 // Config holds Universal API Harness settings

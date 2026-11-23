@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/croosparties/tether/internal/tui/views"
-	"github.com/croosparties/tether/internal/ui"
+	"github.com/crossparties/tether/internal/tui/views"
+	"github.com/crossparties/tether/internal/ui"
 )
 
 // View renders the minimalist Antigravity-style (`agy`) 3-Zone Terminal Layout

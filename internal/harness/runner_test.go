@@ -11,9 +11,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/croosparties/tether/internal/core"
-	"github.com/croosparties/tether/internal/snapshot"
-	"github.com/croosparties/tether/internal/ui"
+	"github.com/crossparties/tether/internal/core"
+	"github.com/crossparties/tether/internal/snapshot"
+	"github.com/crossparties/tether/internal/ui"
 )
 
 func TestRunner_DeepSeekToolLoopAndPlanGuardrail(t *testing.T) {

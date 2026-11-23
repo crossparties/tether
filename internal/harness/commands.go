@@ -25,7 +25,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/croosparties/tether/internal/ui"
+	"github.com/crossparties/tether/internal/ui"
 )
 
 // command is one slash command. Handler receives the arguments after the

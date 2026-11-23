@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/croosparties/tether/internal/core"
+	"github.com/crossparties/tether/internal/core"
 )
 
 func newApprovalTestServer(t *testing.T) (*Server, string) {

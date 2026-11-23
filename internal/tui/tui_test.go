@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/croosparties/tether/internal/tui/views"
-	"github.com/croosparties/tether/internal/ui"
+	"github.com/crossparties/tether/internal/tui/views"
+	"github.com/crossparties/tether/internal/ui"
 )
 
 func TestLayoutGeometry80x24And120x40(t *testing.T) {

@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/croosparties/tether/internal/core"
-	"github.com/croosparties/tether/internal/ui"
+	"github.com/crossparties/tether/internal/core"
+	"github.com/crossparties/tether/internal/ui"
 )
 
 type subagentRun struct {

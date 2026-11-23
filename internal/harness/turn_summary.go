@@ -20,7 +20,7 @@ import (
 	"os/signal"
 	"time"
 
-	"github.com/croosparties/tether/internal/ui"
+	"github.com/crossparties/tether/internal/ui"
 )
 
 // turnResult is everything the caller needs to close a turn on screen.
