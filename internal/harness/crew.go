@@ -50,6 +50,7 @@ type crewHandle struct {
 	name       string
 	runner     *Runner
 	leaseFiles []string
+	cancel     context.CancelFunc
 	closed     bool
 	mu         sync.Mutex
 }
@@ -213,6 +214,11 @@ func (r *Runner) CreateCrew(ctx context.Context, req CrewCreateRequest) (CrewCre
 			}
 			return CrewCreateResult{}, err
 		}
+		r.emitCrewJSONEvent("lease.updated", map[string]any{
+			"crew_id": crewID,
+			"action":  "acquired",
+			"files":   req.LeaseFiles,
+		})
 	}
 
 	// Build isolated Crew Runner.
@@ -293,6 +299,9 @@ func (r *Runner) CreateCrew(ctx context.Context, req CrewCreateRequest) (CrewCre
 		usageTracker:         tracker,
 		lastUserActivity:     time.Now(),
 		baselineRepoMapFiles: mainBaselineCov,
+		onEvent: func(kind, detail string) {
+			r.notifyEvent(kind, detail)
+		},
 	}
 
 	if sameProvider {
@@ -334,6 +343,13 @@ func (r *Runner) CreateCrew(ctx context.Context, req CrewCreateRequest) (CrewCre
 	}
 	r.crews[crewID] = handle
 	r.mu.Unlock()
+
+	r.emitCrewJSONEvent("crew.status", map[string]any{
+		"crew_id":     crewID,
+		"name":        name,
+		"status":      "active",
+		"lease_files": req.LeaseFiles,
+	})
 
 	assignment := buildCrewAssignmentMessage(mountEng, ws, req, skillBody, skillPath)
 	initialPrompt := assignment + "\n\n" + task
@@ -387,7 +403,6 @@ func (r *Runner) MessageCrew(ctx context.Context, crewID, message string) (strin
 
 	out, err := r.runCrewTurnSafely(ctx, h, message)
 	if err != nil {
-		_ = r.abortCrew(h, err.Error())
 		return "", err
 	}
 	return out, nil
@@ -410,7 +425,11 @@ func (r *Runner) CloseCrew(crewID, summary string) error {
 	if h != nil {
 		h.mu.Lock()
 		h.closed = true
+		cancel := h.cancel
 		h.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
 	}
 
 	var relErr error
@@ -420,7 +439,39 @@ func (r *Runner) CloseCrew(crewID, summary string) error {
 			relErr = cerr
 		}
 	}
+	r.emitCrewJSONEvent("lease.updated", map[string]any{"crew_id": crewID, "action": "released"})
+	r.emitCrewJSONEvent("crew.status", map[string]any{"crew_id": crewID, "status": "closed", "summary": summary})
 	return relErr
+}
+
+// AbortCrew cancels any in-flight Crew turn, closes the Crew as aborted, and releases leases.
+func (r *Runner) AbortCrew(crewID, reason string) error {
+	if r == nil {
+		return nil
+	}
+	crewID = strings.TrimSpace(crewID)
+	if crewID == "" {
+		return fmt.Errorf("crew_id required")
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = "aborted by user"
+	}
+
+	r.mu.RLock()
+	h := r.crews[crewID]
+	r.mu.RUnlock()
+	if h != nil {
+		return r.abortCrew(h, reason)
+	}
+	if r.engine != nil {
+		_ = r.engine.Mount().ReleaseLeaseLock(crewID)
+		if err := r.engine.CloseCrewSession(crewID, "aborted", reason); err != nil {
+			return err
+		}
+	}
+	r.emitCrewJSONEvent("lease.updated", map[string]any{"crew_id": crewID, "action": "released"})
+	r.emitCrewJSONEvent("crew.status", map[string]any{"crew_id": crewID, "status": "aborted", "summary": reason})
+	return nil
 }
 
 // ForceReleaseCrewLease forcefully releases any lease lock held by crewID.
@@ -428,7 +479,11 @@ func (r *Runner) ForceReleaseCrewLease(crewID string) error {
 	if r == nil || r.engine == nil {
 		return nil
 	}
-	return r.engine.Mount().ReleaseLeaseLock(crewID)
+	err := r.engine.Mount().ReleaseLeaseLock(crewID)
+	if err == nil {
+		r.emitCrewJSONEvent("lease.updated", map[string]any{"crew_id": strings.TrimSpace(crewID), "action": "released"})
+	}
+	return err
 }
 
 // CloseAllCrews releases all active Crew lease locks held under this Runner.
@@ -448,16 +503,40 @@ func (r *Runner) CloseAllCrews() {
 }
 
 func (r *Runner) runCrewTurnSafely(ctx context.Context, h *crewHandle, prompt string) (out string, err error) {
+	crewCtx, cancel := context.WithCancel(ctx)
+	h.mu.Lock()
+	h.cancel = cancel
+	h.mu.Unlock()
+
 	// Guaranteed lease release if context is cancelled or a panic occurs inside a Crew turn.
 	defer func() {
+		ctxErr := crewCtx.Err()
+		cancel()
+		h.mu.Lock()
+		h.cancel = nil
+		h.mu.Unlock()
 		if rec := recover(); rec != nil {
 			err = fmt.Errorf("crew %s panicked: %v", h.id, rec)
 			_ = r.abortCrew(h, err.Error())
-		} else if ctx.Err() != nil && err != nil {
-			_ = r.abortCrew(h, ctx.Err().Error())
+		} else if ctxErr != nil && err != nil {
+			_ = r.abortCrew(h, ctxErr.Error())
 		}
 	}()
-	return h.runner.runWithOptions(ctx, prompt, r.outWriter(), nil)
+
+	var onDelta func(kind, text string)
+	if r.hasOnEvent() {
+		onDelta = func(kind, text string) {
+			if kind == "content" || kind == "reasoning" || kind == "endstep" {
+				r.emitCrewJSONEvent("crew.delta", map[string]any{
+					"crew_id": h.id,
+					"name":    h.name,
+					"kind":    kind,
+					"text":    text,
+				})
+			}
+		}
+	}
+	return h.runner.runWithOptions(crewCtx, prompt, r.outWriter(), onDelta)
 }
 
 func (r *Runner) abortCrew(h *crewHandle, reason string) error {
@@ -466,12 +545,30 @@ func (r *Runner) abortCrew(h *crewHandle, reason string) error {
 	}
 	h.mu.Lock()
 	h.closed = true
+	cancel := h.cancel
 	h.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	var closeErr error
 	if r.engine != nil {
 		_ = r.engine.Mount().ReleaseLeaseLock(h.id)
-		return r.engine.CloseCrewSession(h.id, "aborted", reason)
+		closeErr = r.engine.CloseCrewSession(h.id, "aborted", reason)
 	}
-	return nil
+	r.emitCrewJSONEvent("lease.updated", map[string]any{"crew_id": h.id, "action": "released"})
+	r.emitCrewJSONEvent("crew.status", map[string]any{"crew_id": h.id, "name": h.name, "status": "aborted", "summary": reason})
+	return closeErr
+}
+
+func (r *Runner) emitCrewJSONEvent(kind string, payload any) {
+	if !r.hasOnEvent() {
+		return
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	r.notifyEvent(kind, string(b))
 }
 
 func (r *Runner) inheritAskPolicy(dst *mcp.Server, readOnly, delegateCritical bool) {

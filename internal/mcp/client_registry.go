@@ -281,6 +281,9 @@ func ValidateServerName(name string) error {
 	if trimmed == "" {
 		return fmt.Errorf("server name cannot be empty")
 	}
+	if trimmed == "." || trimmed == ".." {
+		return fmt.Errorf("invalid server name %q: cannot be '.' or '..'", name)
+	}
 	if strings.HasPrefix(trimmed, "-") {
 		return fmt.Errorf("invalid server name %q: cannot start with '-'", name)
 	}

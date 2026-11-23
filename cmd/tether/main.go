@@ -13,6 +13,7 @@ import (
 
 	"github.com/crossparties/tether/internal/adapter"
 	"github.com/crossparties/tether/internal/core"
+	"github.com/crossparties/tether/internal/doctor"
 	"github.com/crossparties/tether/internal/harness"
 	"github.com/crossparties/tether/internal/hooks"
 	"github.com/crossparties/tether/internal/mcp"
@@ -33,8 +34,12 @@ func main() {
 	}
 
 	switch os.Args[1] {
+	case "setup":
+		cmdSetup(os.Args[2:])
 	case "init":
 		cmdInit()
+	case "web":
+		cmdWeb(os.Args[2:])
 	case "mcp":
 		cmdMCP(os.Args[2:])
 	case "hook":
@@ -103,6 +108,11 @@ func cmdInit() {
 		v := settings[k]
 		_ = engine.SetProjectSetting(k, v)
 		fmt.Printf("  %s detected %s: %s\n", ui.Dim("→"), ui.Bold(k), v)
+	}
+
+	if creds, cerr := harness.LoadAllCredentials(); cerr == nil && len(creds) == 0 {
+		fmt.Printf("  %s No global API keys found yet. Run %s or %s.\n",
+			ui.Dim("→"), ui.Bold("tether setup"), ui.Bold("tether web"))
 	}
 }
 
@@ -395,232 +405,9 @@ func cmdDoctor() {
 }
 
 func runDoctor(workspace string, fix bool, out io.Writer) (passed, warnings, failed int) {
-	fmt.Fprintln(out)
-	fmt.Fprintln(out, "  "+ui.Bold("╺┳╸┏━╸╺┳╸┓ ┏┓┏━╸┏━┓")+"   "+ui.Title("TETHER DOCTOR"))
-	fmt.Fprintln(out, "   "+ui.Dim("┃ ┣╸  ┃ ┣━┫┣╸ ┣┳┛")+"   "+ui.Dim("Environment & Substrate Diagnostic"))
-	if fix {
-		fmt.Fprintln(out, "   "+ui.Dim("╹ ┗━╸ ╹ ╹ ┗┗━╸╹┗━")+"   "+ui.Dim("Running substrate diagnostics with --fix..."))
-	} else {
-		fmt.Fprintln(out, "   "+ui.Dim("╹ ┗━╸ ╹ ╹ ┗┗━╸╹┗━")+"   "+ui.Dim("Read-only substrate check (pass --fix to repair)..."))
-	}
-	fmt.Fprintln(out)
-
-	home, _ := os.UserHomeDir()
-	credPath := filepath.Join(home, ".config", "tether", "credentials.json")
-	if envCfg := strings.TrimSpace(os.Getenv("TETHER_CONFIG_DIR")); envCfg != "" {
-		credPath = filepath.Join(filepath.Clean(envCfg), "credentials.json")
-	}
-
-	if fix {
-		fmt.Fprintln(out, ui.Title("[--fix] Applying Repairs"))
-		engine, err := core.NewEngine(workspace)
-		if err != nil {
-			fmt.Fprintln(out, doctorLine(ui.Error("✖"), "Substrate Repair:", fmt.Sprintf("Failed (%v)", err)))
-			failed++
-		} else {
-			_ = engine.EnsureGitignore()
-			if created, _, ierr := mount.InitIgnoreFile(workspace, engine.WriteDB()); ierr != nil {
-				fmt.Fprintln(out, doctorLine(ui.Warn("▲"), ".tether/ignore:", fmt.Sprintf("could not seed (%v)", ierr)))
-			} else if created {
-				fmt.Fprintln(out, doctorLine(ui.Success("✔"), ".tether/ignore:", "seeded default ignore rules"))
-			}
-			purged, _ := engine.ReconcileKB(nil)
-			indexed, _ := engine.IndexDirectory(workspace, nil)
-			fmt.Fprintln(out, doctorLine(ui.Success("✔"), "Substrate & Cache:", fmt.Sprintf(".tether/ initialized/repaired (purged %d stale, indexed %d docs)", purged, indexed)))
-			_ = engine.Close()
-		}
-
-		if info, serr := os.Stat(credPath); serr == nil && info.Mode().Perm()&0077 != 0 {
-			_ = os.Chmod(filepath.Dir(credPath), 0700)
-			if cerr := os.Chmod(credPath, 0600); cerr != nil {
-				fmt.Fprintln(out, doctorLine(ui.Warn("▲"), "Credentials Perms:", fmt.Sprintf("chmod 0600 failed: %v", cerr)))
-			} else {
-				fmt.Fprintln(out, doctorLine(ui.Success("✔"), "Credentials Perms:", "tightened ~/.config/tether/credentials.json to 0600"))
-			}
-		}
-		fmt.Fprintln(out)
-	}
-
-	// 1. Storage & SQLite (strictly read-only!)
-	fmt.Fprintln(out, ui.Title("[1/4] Core Substrate & Storage"))
-	legacyDBPath := filepath.Join(workspace, "session.db")
-	if _, err := os.Stat(legacyDBPath); err == nil {
-		fmt.Fprintln(out, doctorLine(ui.Warn("▲"), "Legacy Root DB:", "session.db found at repo root (run 'tether doctor --fix' to migrate to .tether/)"))
-		warnings++
-	}
-
-	dbPath := filepath.Join(workspace, ".tether", "session.db")
-	if _, err := os.Stat(dbPath); err == nil {
-		roDB, oerr := core.OpenReadOnlyDB(dbPath)
-		if oerr != nil {
-			fmt.Fprintln(out, doctorLine(ui.Error("✖"), "session.db:", fmt.Sprintf("failed read-only open (%v)", oerr)))
-			failed++
-		} else {
-			var userVer int
-			if qerr := roDB.QueryRow("PRAGMA user_version;").Scan(&userVer); qerr != nil {
-				fmt.Fprintln(out, doctorLine(ui.Error("✖"), "session.db:", fmt.Sprintf("read-only check failed (%v)", qerr)))
-				failed++
-			} else if userVer < core.SchemaVersion {
-				fmt.Fprintln(out, doctorLine(ui.Warn("▲"), "session.db:", fmt.Sprintf("Schema v%d < v%d (run 'tether doctor --fix' to upgrade)", userVer, core.SchemaVersion)))
-				warnings++
-			} else {
-				fmt.Fprintln(out, doctorLine(ui.Success("✔"), "session.db:", fmt.Sprintf("accessible (?mode=ro, Schema v%d)", userVer)))
-				passed++
-			}
-			_ = roDB.Close()
-		}
-	} else {
-		fmt.Fprintln(out, doctorLine(ui.Warn("▲"), "session.db:", ".tether/session.db not found (run 'tether init' or 'tether doctor --fix')"))
-		warnings++
-	}
-
-	cachePath := filepath.Join(workspace, ".tether", "cache.db")
-	if _, err := os.Stat(cachePath); err == nil {
-		roCache, oerr := core.OpenReadOnlyDB(cachePath)
-		if oerr != nil {
-			fmt.Fprintln(out, doctorLine(ui.Error("✖"), "cache.db:", fmt.Sprintf("failed read-only open (%v)", oerr)))
-			failed++
-		} else {
-			var files int
-			if qerr := roCache.QueryRow("SELECT COUNT(DISTINCT file_path) FROM kb_documents").Scan(&files); qerr != nil {
-				fmt.Fprintln(out, doctorLine(ui.Warn("▲"), "cache.db:", fmt.Sprintf("incomplete cache schema (%v)", qerr)))
-				warnings++
-			} else {
-				fmt.Fprintln(out, doctorLine(ui.Success("✔"), "cache.db:", fmt.Sprintf("accessible (?mode=ro, %d docs indexed)", files)))
-				passed++
-			}
-			_ = roCache.Close()
-		}
-	} else {
-		fmt.Fprintln(out, doctorLine(ui.Warn("▲"), "cache.db:", ".tether/cache.db not found (run 'tether doctor --fix')"))
-		warnings++
-	}
-
-	gitignorePath := filepath.Join(workspace, ".gitignore")
-	if content, err := os.ReadFile(gitignorePath); err == nil {
-		text := string(content)
-		hasAll := strings.Contains(text, ".tether/") ||
-			(strings.Contains(text, ".tether/session.db") && strings.Contains(text, ".tether/cache.db"))
-		if hasAll {
-			fmt.Fprintln(out, doctorLine(ui.Success("✔"), "Git Hygiene:", ".tether/ runtime files ignored in .gitignore"))
-			passed++
-		} else {
-			fmt.Fprintln(out, doctorLine(ui.Error("✖"), "Git Hygiene:", ".tether/session.db* or .tether/cache.db* missing from .gitignore!"))
-			failed++
-		}
-	} else {
-		fmt.Fprintln(out, doctorLine(ui.Warn("▲"), "Git Hygiene:", ".gitignore not found"))
-		warnings++
-	}
-
-	// 2. Mount Rules (.tether/ignore) & Credentials Security
-	fmt.Fprintln(out, "\n"+ui.Title("[2/4] Mount Rules & Credentials Security"))
-	srcPath, exists, rules, ruleErrs := mount.InspectIgnoreFile(workspace)
-	if !exists {
-		fmt.Fprintln(out, doctorLine(ui.Warn("▲"), "Ignore Rules:", ".tether/ignore not found (built-in secret protection still active; run 'tether init')"))
-		warnings++
-	} else if len(ruleErrs) > 0 {
-		for _, rerr := range ruleErrs {
-			fmt.Fprintln(out, doctorLine(ui.Error("✖"), "Ignore Syntax:", rerr.Error()))
-			failed++
-		}
-	} else {
-		relSrc := filepath.Base(srcPath)
-		if filepath.Base(filepath.Dir(srcPath)) == ".tether" {
-			relSrc = ".tether/" + relSrc
-		}
-		fmt.Fprintln(out, doctorLine(ui.Success("✔"), "Ignore Rules:", fmt.Sprintf("%s valid (%d custom + %d built-in rules)", relSrc, len(rules), len(mount.BuiltinSecretPatterns()))))
-		passed++
-	}
-
-	if info, err := os.Stat(credPath); err == nil {
-		perm := info.Mode().Perm()
-		if perm&0077 != 0 {
-			fmt.Fprintln(out, doctorLine(ui.Warn("▲"), "Credentials Perms:", fmt.Sprintf("~/.config/tether/credentials.json mode %04o is looser than 0600 (run 'tether doctor --fix')", perm)))
-			warnings++
-		} else {
-			fmt.Fprintln(out, doctorLine(ui.Success("✔"), "Credentials Perms:", fmt.Sprintf("~/.config/tether/credentials.json (%04o)", perm)))
-			passed++
-		}
-	} else {
-		fmt.Fprintln(out, doctorLine(ui.Dim("-"), "Credentials Perms:", ui.Dim("~/.config/tether/credentials.json not present")))
-	}
-
-	// 3. Agent Configurations
-	fmt.Fprintln(out, "\n"+ui.Title("[3/4] Agent Wiring & Hooks"))
-	agyHooksPath := filepath.Join(home, ".gemini", "config", "hooks.json")
-	if _, err := os.Stat(agyHooksPath); err == nil {
-		fmt.Fprintln(out, doctorLine(ui.Success("✔"), "Antigravity (agy):", "Configured in ~/.gemini/config/hooks.json"))
-		passed++
-	} else {
-		fmt.Fprintln(out, doctorLine(ui.Warn("▲"), "Antigravity (agy):", "not configured (run 'tether install agy')"))
-		warnings++
-	}
-
-	claudeConfigPath := filepath.Join(home, ".claude", "mcp_config.json")
-	if _, err := os.Stat(claudeConfigPath); err == nil {
-		fmt.Fprintln(out, doctorLine(ui.Success("✔"), "Claude Code:", "Configured in ~/.claude/mcp_config.json"))
-		passed++
-	} else {
-		fmt.Fprintln(out, doctorLine(ui.Dim("-"), "Claude Code:", ui.Dim("Not installed / config not found")))
-	}
-
-	mcpReg := mcp.NewClientRegistry(workspace)
-	if fix {
-		if fixed, rerr := mcpReg.RepairRawSecretLeaks(); rerr == nil && fixed > 0 {
-			fmt.Fprintln(out, doctorLine(ui.Success("✔"), "External MCP Secrets:", fmt.Sprintf("migrated %d inline secret(s) to 0600 credentials.json", fixed)))
-		}
-	}
-	extServers, extErr := mcpReg.ListServers()
-	if extErr != nil {
-		fmt.Fprintln(out, doctorLine(ui.Error("✖"), "External MCP:", extErr.Error()))
-		failed++
-	} else if len(extServers) == 0 {
-		fmt.Fprintln(out, doctorLine(ui.Dim("-"), "External MCP:", ui.Dim("none configured")))
-	} else {
-		enabledCnt := 0
-		for _, s := range extServers {
-			if s.Enabled {
-				enabledCnt++
-			}
-		}
-		if leaks, lerr := mcpReg.InspectRawSecretLeaks(); lerr == nil && len(leaks) > 0 {
-			fmt.Fprintln(out, doctorLine(ui.Warn("▲"), "External MCP:", fmt.Sprintf("%d configured (%d enabled) — raw secret(s) in mcp.json (%s); run 'tether doctor --fix'", len(extServers), enabledCnt, strings.Join(leaks, ", "))))
-			warnings++
-		} else {
-			fmt.Fprintln(out, doctorLine(ui.Success("✔"), "External MCP:", fmt.Sprintf("%d configured (%d enabled, %d draft)", len(extServers), enabledCnt, len(extServers)-enabledCnt)))
-			passed++
-		}
-	}
-
-	// 4. Protocol & Binary
-	fmt.Fprintln(out, "\n"+ui.Title("[4/4] Binary & Runtime Health"))
-	selfPath, err := os.Executable()
-	if err == nil {
-		fmt.Fprintln(out, doctorLine(ui.Success("✔"), "Binary Location:", ui.Path(selfPath)))
-		passed++
-	}
-	fmt.Fprintln(out, doctorLine(ui.Success("✔"), "Tether Version:", "v"+version))
-	passed++
-
-	fmt.Fprintln(out, "\n"+ui.Dim("───────────────────────────────────────────────────────────────────────────"))
-	fmt.Fprintf(out, "Diagnostic Summary: %s Passed, %s Warnings, %s Failed\n",
-		ui.Success(fmt.Sprintf("%d", passed)),
-		ui.Warn(fmt.Sprintf("%d", warnings)),
-		func() string {
-			if failed > 0 {
-				return ui.Error(fmt.Sprintf("%d", failed))
-			}
-			return ui.Dim("0")
-		}())
-	if failed > 0 || warnings > 0 {
-		fmt.Fprintln(out, "\n"+ui.Warn("🛠  Remediation: Run 'tether doctor --fix' or 'tether init' to repair missing/invalid items."))
-	} else {
-		fmt.Fprintln(out, ui.Success("✓ Substrate is healthy and ready for agent execution."))
-	}
-	fmt.Fprintln(out, ui.Dim("───────────────────────────────────────────────────────────────────────────"))
-	fmt.Fprintln(out)
-	return passed, warnings, failed
+	rep := doctor.Run(workspace, fix, version)
+	rep.Render(out)
+	return rep.Passed, rep.Warnings, rep.Failed
 }
 
 // fatalf prints a styled error to stderr and exits. Every command funnels its
@@ -638,12 +425,6 @@ func truncateStr(s string, maxLen int) string {
 		return string(runes[:maxLen-3]) + "..."
 	}
 	return s
-}
-
-// doctorLine renders one doctor row. The label is padded while still plain
-// text, before any styling, so colour codes never shift the value column.
-func doctorLine(mark, label, value string) string {
-	return fmt.Sprintf("  %s %s %s", mark, ui.Pad(label, 22), value)
 }
 
 // cmdInstall wires tether into the specified agent
@@ -893,7 +674,9 @@ func printUsage() {
 Usage:
   tether                   Start interactive AI coding session (Aider / Claude Code style)
   tether --model <model>   Start interactive session with specific model (e.g. deepseek-reasoner)
-  tether init              Initialize tether in current project
+  tether setup [--cli]     Stage 1 global setup: API key pool, 0-token probe, optional IDE MCP import
+  tether init              Stage 2 project setup: initialize .tether/, .tether/ignore, & multi-stack settings
+  tether web [--port N]    Start local authenticated Web UI server on 127.0.0.1 (--no-browser for SSH)
   tether status            Display real-time substrate dashboard & guardrail state
   tether mode [code|plan]  Inspect or switch active governance mode
   tether doctor [--fix]    Verify database, WAL, .tether/ignore, and credentials (read-only unless --fix)

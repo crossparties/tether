@@ -193,13 +193,17 @@ func (r *Runner) condenseMessages(ctx context.Context, messages []chatMessage, f
 	out = append(out, head, summaryMsg)
 	out = append(out, tailSpan...)
 
-	return out, CondenseResult{
+	res := CondenseResult{
 		Condensed:      true,
 		Reason:         reason,
 		CondensedCount: len(oldSpan),
 		RemainingCount: len(out),
 		Summary:        summary,
-	}, nil
+	}
+	if payload, merr := json.Marshal(res); merr == nil {
+		r.notifyEvent("condenser.ran", string(payload))
+	}
+	return out, res, nil
 }
 
 func isEpisodicSummaryMsg(m chatMessage) bool {

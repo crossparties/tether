@@ -875,7 +875,7 @@ func (e *Engine) AddDecision(topic, decision, reason string) error {
 }
 
 func (e *Engine) GetDecisions() ([]Decision, error) {
-	rows, err := e.readDB.Query(`SELECT topic, decision, reason, created_at FROM decisions ORDER BY created_at DESC`)
+	rows, err := e.readDB.Query(`SELECT id, topic, decision, reason, created_at FROM decisions ORDER BY created_at DESC, id DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -884,7 +884,7 @@ func (e *Engine) GetDecisions() ([]Decision, error) {
 	var decisions []Decision
 	for rows.Next() {
 		var d Decision
-		if err := rows.Scan(&d.Topic, &d.Decision, &d.Reason, &d.CreatedAt); err != nil {
+		if err := rows.Scan(&d.ID, &d.Topic, &d.Decision, &d.Reason, &d.CreatedAt); err != nil {
 			return nil, err
 		}
 		decisions = append(decisions, d)
@@ -893,6 +893,20 @@ func (e *Engine) GetDecisions() ([]Decision, error) {
 		return nil, err
 	}
 	return decisions, nil
+}
+
+func (e *Engine) DeleteDecision(id int64) error {
+	if e == nil || e.writeDB == nil {
+		return fmt.Errorf("engine is closed")
+	}
+	res, err := e.writeDB.Exec(`DELETE FROM decisions WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // InjectDecisions returns at most limit of the most recent decisions, newest
@@ -930,7 +944,7 @@ func (e *Engine) AddPattern(patternType, description string) error {
 }
 
 func (e *Engine) GetPatterns() ([]Pattern, error) {
-	rows, err := e.readDB.Query(`SELECT pattern_type, description, created_at FROM learned_patterns ORDER BY created_at DESC`)
+	rows, err := e.readDB.Query(`SELECT id, pattern_type, description, created_at FROM learned_patterns ORDER BY created_at DESC, id DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -939,7 +953,7 @@ func (e *Engine) GetPatterns() ([]Pattern, error) {
 	var patterns []Pattern
 	for rows.Next() {
 		var p Pattern
-		if err := rows.Scan(&p.Type, &p.Description, &p.CreatedAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.Type, &p.Description, &p.CreatedAt); err != nil {
 			return nil, err
 		}
 		patterns = append(patterns, p)
@@ -948,6 +962,20 @@ func (e *Engine) GetPatterns() ([]Pattern, error) {
 		return nil, err
 	}
 	return patterns, nil
+}
+
+func (e *Engine) DeletePattern(id int64) error {
+	if e == nil || e.writeDB == nil {
+		return fmt.Errorf("engine is closed")
+	}
+	res, err := e.writeDB.Exec(`DELETE FROM learned_patterns WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // InjectPatterns mirrors InjectDecisions: the prompt only carries the newest
@@ -1036,16 +1064,18 @@ type ContextEntry struct {
 }
 
 type Decision struct {
-	Topic     string
-	Decision  string
-	Reason    string
-	CreatedAt time.Time
+	ID        int64     `json:"id"`
+	Topic     string    `json:"topic"`
+	Decision  string    `json:"decision"`
+	Reason    string    `json:"reason"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 type Pattern struct {
-	Type        string
-	Description string
-	CreatedAt   time.Time
+	ID          int64     `json:"id"`
+	Type        string    `json:"type"`
+	Description string    `json:"description"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // --- Knowledge Base (.tether/cache.db) ---

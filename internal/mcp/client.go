@@ -437,18 +437,65 @@ func (m *ClientManager) TestServer(ctx context.Context, name string) (ServerTest
 	if !ok {
 		return ServerTestResult{}, fmt.Errorf("MCP server %q not found", name)
 	}
+	resolved, err := m.registry.ResolveRuntimeSecrets(srv)
+	if err != nil {
+		return ServerTestResult{
+			Name:      srv.Name,
+			Scope:     srv.Scope,
+			Transport: srv.Transport,
+			Preset:    srv.Preset,
+			Error:     err.Error(),
+		}, err
+	}
+	return m.testResolvedServer(ctx, srv, resolved)
+}
 
+// TestServerConfig tests an inline ExternalMCPConfig (unsaved draft or masked update)
+// without modifying mcp.json or credentials.json.
+func (m *ClientManager) TestServerConfig(ctx context.Context, cfg ExternalMCPConfig) (ServerTestResult, error) {
+	if m == nil {
+		return ServerTestResult{}, fmt.Errorf("external MCP manager is not initialized")
+	}
+	norm := cfg.Clone()
+	if strings.TrimSpace(norm.Name) == "" {
+		norm.Name = "draft"
+	}
+	if err := normalizeTransport(&norm); err != nil {
+		return ServerTestResult{Name: norm.Name, Error: err.Error()}, err
+	}
+	if err := normalizePreset(norm.Name, &norm); err != nil {
+		return ServerTestResult{Name: norm.Name, Error: err.Error()}, err
+	}
+	resolved := norm.Clone()
+	if m.registry != nil {
+		if existing, ok, err := m.registry.GetServer(norm.Name); err == nil && ok {
+			if existingResolved, rerr := m.registry.ResolveRuntimeSecrets(existing); rerr == nil {
+				for k, v := range resolved.Env {
+					if v == SecretMask || isSecretRef(v) {
+						if prev, okPrev := existingResolved.Env[k]; okPrev {
+							resolved.Env[k] = prev
+						}
+					}
+				}
+				for k, v := range resolved.Headers {
+					if v == SecretMask || isSecretRef(v) {
+						if prev, okPrev := existingResolved.Headers[k]; okPrev {
+							resolved.Headers[k] = prev
+						}
+					}
+				}
+			}
+		}
+	}
+	return m.testResolvedServer(ctx, norm, resolved)
+}
+
+func (m *ClientManager) testResolvedServer(ctx context.Context, srv, resolved ExternalMCPConfig) (ServerTestResult, error) {
 	res := ServerTestResult{
 		Name:      srv.Name,
 		Scope:     srv.Scope,
 		Transport: srv.Transport,
 		Preset:    srv.Preset,
-	}
-
-	resolved, err := m.registry.ResolveRuntimeSecrets(srv)
-	if err != nil {
-		res.Error = err.Error()
-		return res, err
 	}
 
 	start := time.Now()

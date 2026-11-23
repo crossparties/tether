@@ -185,10 +185,88 @@ func (s *Store) LoadIndex(turn string) (*Index, error) {
 	return s.load(turn)
 }
 
+// ListIndexes returns all recorded snapshot turn manifests ordered newest first.
+func (s *Store) ListIndexes() ([]Index, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	var out []Index
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		idx, err := s.load(entry.Name())
+		if err != nil || len(idx.Entries) == 0 {
+			continue
+		}
+		out = append(out, *idx)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].Created.Equal(out[j].Created) {
+			return out[i].Created.After(out[j].Created)
+		}
+		return out[i].Turn > out[j].Turn
+	})
+	return out, nil
+}
+
+// ReadBackup safely reads a stored snapshot backup file relative to the snapshot root.
+func (s *Store) ReadBackup(backupRel string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	p, err := s.safeBackupPath(backupRel)
+	if err != nil {
+		return "", err
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// CheckFileStatus compares a workspace file's current SHA-256 digest against expectedPostHash.
+func (s *Store) CheckFileStatus(relPath, expectedPostHash, workspace string) (modified bool, actualHash string) {
+	target, err := s.safeTargetPath(workspace, relPath)
+	if err != nil {
+		return false, ""
+	}
+	actual, err := fileSHA256(target)
+	if err != nil {
+		return false, ""
+	}
+	if expectedPostHash != "" && actual != expectedPostHash {
+		return true, actual
+	}
+	return false, actual
+}
+
 // Restore puts every file captured in the turn back to its snapshotted state
 // and reports the paths it touched, refusing to overwrite externally modified
 // files whose current disk hash differs from PostHash.
 func (s *Store) Restore(turn, workspace string) ([]string, error) {
+	results, err := s.RestoreTurn(turn, workspace, false)
+	var restored []string
+	for _, res := range results {
+		if res.Restored {
+			restored = append(restored, res.Path)
+		}
+	}
+	return restored, err
+}
+
+// RestoreTurn restores every file captured in turn, checking PostHash for
+// external modifications unless force is true.
+func (s *Store) RestoreTurn(turn, workspace string, force bool) ([]RestoreResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -200,14 +278,14 @@ func (s *Store) Restore(turn, workspace string) ([]string, error) {
 		return nil, nil
 	}
 
-	var restored []string
+	var results []RestoreResult
 	var failures []string
 	hasConflict := false
 
 	for _, e := range index.Entries {
-		res := s.restoreEntry(turn, e, e.PostHash, workspace, false)
+		res := s.restoreEntry(turn, e, e.PostHash, workspace, force)
+		results = append(results, res)
 		if res.Restored {
-			restored = append(restored, res.Path)
 			continue
 		}
 		if res.Conflict {
@@ -220,11 +298,11 @@ func (s *Store) Restore(turn, workspace string) ([]string, error) {
 
 	if len(failures) > 0 {
 		if hasConflict {
-			return restored, fmt.Errorf("%w: %s", ErrExternalModification, strings.Join(failures, "; "))
+			return results, fmt.Errorf("%w: %s", ErrExternalModification, strings.Join(failures, "; "))
 		}
-		return restored, fmt.Errorf("could not restore: %s", strings.Join(failures, "; "))
+		return results, fmt.Errorf("could not restore: %s", strings.Join(failures, "; "))
 	}
-	return restored, nil
+	return results, nil
 }
 
 // RestoreFile restores one file from turn, guarding against external modifications

@@ -580,3 +580,71 @@ func TestCreateCrewRejectsSkillSymlinkEscapeAndFocusIgnored(t *testing.T) {
 	}
 	_ = r.CloseCrew(safeRes.CrewID, "done")
 }
+
+func TestCrewTransientErrorPreservesSessionAndLease(t *testing.T) {
+	ws := t.TempDir()
+	target := filepath.Join(ws, "work.go")
+	if err := os.WriteFile(target, []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	eng, err := core.NewEngine(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	var mu sync.Mutex
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		mu.Lock()
+		calls++
+		c := calls
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		if c == 2 {
+			// Return a non-retryable 400 error on the follow-up MessageCrew turn.
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"transient bad turn"}}`))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": chatMessage{Role: "assistant", Content: "crew ok"}, "finish_reason": "stop"}},
+		})
+	}))
+	defer srv.Close()
+
+	r := NewRunner(eng, Config{Provider: "deepseek", Model: "deepseek-chat", BaseURL: srv.URL, APIKey: "sk-crew-transient", Out: &bytes.Buffer{}})
+	res, err := r.CreateCrew(context.Background(), CrewCreateRequest{
+		Name:       "transient-worker",
+		LeaseFiles: []string{"work.go"},
+		Task:       "Initialize work",
+	})
+	if err != nil {
+		t.Fatalf("CreateCrew: %v", err)
+	}
+
+	// Follow-up MessageCrew hits non-context API error -> MUST return err while preserving active session & lease!
+	if _, merr := r.MessageCrew(context.Background(), res.CrewID, "trigger transient error"); merr == nil {
+		t.Fatal("expected MessageCrew to return transient error")
+	}
+
+	cs, err := eng.GetCrewSession(res.CrewID)
+	if err != nil || cs.Status != "active" {
+		t.Fatalf("expected crew session to remain active after transient error, got %+v err=%v", cs, err)
+	}
+	leases, err := eng.Mount().ListActiveLeases()
+	if err != nil || len(leases) != 1 || leases[0].CrewID != res.CrewID {
+		t.Fatalf("expected crew lease to remain held after transient error, got %+v err=%v", leases, err)
+	}
+
+	// Subsequent MessageCrew succeeds cleanly and CloseCrew releases lease.
+	reply, err := r.MessageCrew(context.Background(), res.CrewID, "retry task")
+	if err != nil || reply != "crew ok" {
+		t.Fatalf("expected retry MessageCrew to succeed, got reply=%q err=%v", reply, err)
+	}
+	if err := r.CloseCrew(res.CrewID, "completed"); err != nil {
+		t.Fatalf("CloseCrew: %v", err)
+	}
+}

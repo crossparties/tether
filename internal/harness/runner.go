@@ -390,11 +390,108 @@ func (r *Runner) PinnedKeyID() string {
 	return r.pinnedKeyID
 }
 
+// Engine returns the Runner's attached substrate Engine.
+func (r *Runner) Engine() *core.Engine {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.engine
+}
+
+// ContextWindowTokens returns the active configured context window budget.
+func (r *Runner) ContextWindowTokens() int {
+	if r == nil {
+		return defaultContextWindowTokens
+	}
+	return r.condenserConfig().ContextWindowTokens
+}
+
+// ReloadKeyPool reloads credentials.json into the Runner's KeyPool and applies
+// an initial healthy key if the active key is unset or no longer present.
+func (r *Runner) ReloadKeyPool() error {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	pool := r.keyPool
+	eng := r.engine
+	client := r.client
+	prov := r.cfg.Provider
+	model := r.cfg.Model
+	if pool == nil {
+		pool = NewKeyPool(eng, client)
+		r.keyPool = pool
+	}
+	r.mu.Unlock()
+
+	if err := pool.ReloadFromDisk(); err != nil {
+		return err
+	}
+	if cand, ok := pool.SelectKey(context.Background(), prov, model); ok {
+		r.applyKeyCandidate(cand, false)
+	} else {
+		r.mu.Lock()
+		r.cfg.APIKey = loadSavedKey(prov)
+		r.mu.Unlock()
+	}
+	return nil
+}
+
+// ProviderPresetInfo exposes non-secret provider metadata and curated models.
+type ProviderPresetInfo struct {
+	Name         string      `json:"name"`
+	BaseURL      string      `json:"base_url"`
+	DefaultModel string      `json:"default_model"`
+	EnvKey       string      `json:"env_key,omitempty"`
+	Models       []ui.Choice `json:"models,omitempty"`
+}
+
+// ListProviderPresets returns all built-in provider presets in stable order.
+func ListProviderPresets() []ProviderPresetInfo {
+	names := providerNames()
+	out := make([]ProviderPresetInfo, 0, len(names))
+	for _, name := range names {
+		p := presets[name]
+		out = append(out, ProviderPresetInfo{
+			Name:         name,
+			BaseURL:      p.BaseURL,
+			DefaultModel: p.DefaultModel,
+			EnvKey:       p.EnvKey,
+			Models:       modelsFor(name),
+		})
+	}
+	return out
+}
+
 // SetOnEvent installs an optional structured event observer (e.g. for keys.switched, stream.retry_reset).
 func (r *Runner) SetOnEvent(fn func(kind, detail string)) {
 	r.mu.Lock()
 	r.onEvent = fn
 	r.mu.Unlock()
+}
+
+func (r *Runner) hasOnEvent() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.RLock()
+	ok := r.onEvent != nil
+	r.mu.RUnlock()
+	return ok
+}
+
+func (r *Runner) notifyEvent(kind, detail string) {
+	if r == nil {
+		return
+	}
+	r.mu.RLock()
+	cb := r.onEvent
+	r.mu.RUnlock()
+	if cb != nil {
+		cb(kind, detail)
+	}
 }
 
 func (r *Runner) snapshotCallConfig() callSnapshot {
