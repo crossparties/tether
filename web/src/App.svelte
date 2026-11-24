@@ -38,6 +38,11 @@
 
   const pressurePct = $derived(Math.round((app.tokens?.main?.context_pressure ?? 0) * 100));
   const cachePct = $derived(Math.round((app.tokens?.main?.cache_hit_ratio ?? 0) * 100));
+  const hasProviderReady = $derived(
+    (app.setupStatus?.has_global_keys ?? false) ||
+      (app.setupStatus?.keys?.length ?? 0) > 0 ||
+      (app.project?.provider || app.setupStatus?.active_provider) === 'ollama',
+  );
 </script>
 
 {#if app.bootstrapping}
@@ -73,10 +78,18 @@
           <option value="review">REVIEW</option>
         </select>
 
-        {#if app.project?.model || app.setupStatus?.active_model}
-          <span class="model-chip mono">
-            {app.project?.provider || app.setupStatus?.active_provider}/{app.project?.model || app.setupStatus?.active_model}
+        {#if hasProviderReady && (app.project?.model || app.setupStatus?.active_model)}
+          <span class="model-chip mono" title="Active AI Provider & Model">
+            ✓ {app.project?.provider || app.setupStatus?.active_provider}/{app.project?.model || app.setupStatus?.active_model}
           </span>
+        {:else}
+          <button
+            class="btn btn-sm btn-warn"
+            onclick={() => (app.activeView = 'setup')}
+            title="Belum ada API Key AI yang tersimpan — klik untuk buka Panduan Setup"
+          >
+            ⚠ Belum Ada API Key • Klik Setup
+          </button>
         {/if}
       </div>
 

@@ -16,6 +16,11 @@
 
   const activeCrews = $derived(app.crews.filter((c) => c.status === 'active'));
   const latestCrew = $derived(activeCrews[0] ?? app.crews[0] ?? null);
+  const hasProviderReady = $derived(
+    (app.setupStatus?.has_global_keys ?? false) ||
+      (app.setupStatus?.keys?.length ?? 0) > 0 ||
+      (app.project?.provider || app.setupStatus?.active_provider) === 'ollama',
+  );
 
   const fileMatches = $derived.by(() => {
     if (mentionQuery === null) return [];
@@ -172,11 +177,76 @@
       <div class="chat-feed pane-scroll" bind:this={feedEl}>
         {#if app.timeline.length === 0}
           <div class="empty-state welcome">
-            <strong>Tether v0.3.0 Ready</strong>
-            <p>
-              Mode: <span class="pill" class:pill-plan={app.mode === 'plan'} class:pill-rw={app.mode === 'code'}>{app.mode.toUpperCase()}</span>
-              • Reference workspace files with <code>@file</code>, run side-questions with <code>/btw</code>, or press <span class="kbd">Ctrl+K</span>.
+            <div class="welcome-head">
+              <span class="pill pill-main">Tether v0.3.0 Ready</span>
+              <span class="pill" class:pill-plan={app.mode === 'plan'} class:pill-rw={app.mode === 'code'}>
+                Mode: {app.mode.toUpperCase()}
+              </span>
+            </div>
+
+            {#if !(app.setupStatus?.has_global_keys) || !(app.setupStatus?.project_ready)}
+              <div class="setup-nudge">
+                <div>
+                  <strong>Setup Pertama Kali Belum Lengkap</strong>
+                  <p>Atur API Key AI (Stage 1) dan klik Initialize Project (Stage 2) terlebih dahulu.</p>
+                </div>
+                <button class="btn btn-sm btn-primary" onclick={() => (app.activeView = 'setup')}>
+                  Buka Panduan Setup →
+                </button>
+              </div>
+            {/if}
+
+            <p class="welcome-sub">
+              <strong>Pilih aksi pertama Anda</strong> (klik kartu di bawah untuk mengisi prompt otomatis, atau ketik <code>@</code> untuk melampirkan file):
             </p>
+
+            <div class="starter-grid">
+              <button
+                type="button"
+                class="starter-card"
+                onclick={() => {
+                  composer = 'Jelaskan arsitektur utama proyek ini berdasarkan RepoMap.';
+                }}
+              >
+                <strong>1. Pahami Arsitektur Proyek</strong>
+                <span>Analisis struktur kode lewat Pure-Go RepoMap tanpa boros token.</span>
+              </button>
+
+              <button
+                type="button"
+                class="starter-card"
+                onclick={() => {
+                  app.switchMode('plan');
+                  composer = 'Buatkan rencana implementasi bertahap di .tether/PLAN.md untuk ';
+                }}
+              >
+                <strong>2. Buat Rencana Fitur (Mode PLAN)</strong>
+                <span>Beralih ke mode PLAN (read-only) untuk merancang fitur dengan aman.</span>
+              </button>
+
+              <button
+                type="button"
+                class="starter-card"
+                onclick={() => {
+                  composer = composer ? `${composer} @` : '@';
+                  updateMention(composer);
+                }}
+              >
+                <strong>3. Lampirkan File (@file)</strong>
+                <span>Buka autocomplete file proyek (otomatis SHA-256 deduplication).</span>
+              </button>
+
+              <button
+                type="button"
+                class="starter-card"
+                onclick={() => {
+                  app.btwOpen = true;
+                }}
+              >
+                <strong>4. Tanya Sela (/btw Side-Chat)</strong>
+                <span>Tanya hal cepat dengan konteks penuh tanpa merusak KV Prompt Cache.</span>
+              </button>
+            </div>
           </div>
         {:else}
           {#each app.timeline as item (item.id)}
@@ -296,10 +366,15 @@
               {/if}
             </span>
             <div class="comp-btns">
+              {#if !hasProviderReady}
+                <button class="btn btn-sm btn-warn" onclick={() => (app.activeView = 'setup')}>
+                  ⚠ Setup API Key Dulu →
+                </button>
+              {/if}
               {#if app.turnActive}
                 <button class="btn btn-sm btn-danger" onclick={() => app.abortChat()}>Abort Turn</button>
               {/if}
-              <button class="btn btn-sm btn-primary" disabled={!composer.trim()} onclick={submitComposer}>
+              <button class="btn btn-sm btn-primary" disabled={!composer.trim() || !hasProviderReady} onclick={submitComposer}>
                 {app.turnActive ? 'Queue Follow-Up' : 'Send'}
               </button>
             </div>
@@ -400,6 +475,67 @@
   }
   .welcome {
     margin: auto 0;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 16px;
+    text-align: left;
+  }
+  .welcome-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .welcome-sub {
+    margin: 0;
+    font-size: 12.5px;
+    color: var(--subtext);
+  }
+  .setup-nudge {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    padding: 10px 12px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--main);
+    background: rgba(203, 166, 247, 0.12);
+    font-size: 12px;
+  }
+  .setup-nudge p {
+    margin: 2px 0 0;
+    color: var(--subtext);
+  }
+  .starter-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    gap: 8px;
+  }
+  .starter-card {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+    padding: 10px 12px;
+    border-radius: var(--radius-sm);
+    background: var(--mantle);
+    border: 1px solid var(--border-subtle);
+    color: var(--text);
+    text-align: left;
+    cursor: pointer;
+    font-size: 12px;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .starter-card:hover {
+    border-color: var(--main);
+    background: rgba(203, 166, 247, 0.09);
+  }
+  .starter-card span {
+    font-size: 11.5px;
+    color: var(--subtext);
+    line-height: 1.35;
   }
   .msg {
     padding: 10px 12px;
